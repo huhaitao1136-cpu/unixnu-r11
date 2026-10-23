@@ -56,7 +56,8 @@ archives = [
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
   "build-native-aes-bindings.py",
-  "build-arm-driver.py NativeSdhci",          # TODO: R11 是 eMMC 5.1，sheng 是 NativeUfs，需要新驱动
+  # NativeSdhci 上游不存在（UniXNU 只有 NativeUfs）；第一阶段启动不需要 eMMC，
+  # 后续要做 APFS 根卷时再自己实现 libNativeSdhci.a 并把它加回这里。
   "build-arm-driver.py NativeVirtioBlock",
   "build-arm-driver.py NativeRamBlock",
   "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
@@ -179,7 +180,6 @@ kernel_args = [
   "boot-progress=2",
   "-apfs_shared_datavolume",
   "offline-key-events=1",
-  "native-sdhci-root=1",               # 对应 CONFIG_XNU_NATIVE_SDHCI
   "r11-pmgr=2",
   "armcpu-diagnostics=1",
   "r11-disable-watchdogd=1",
