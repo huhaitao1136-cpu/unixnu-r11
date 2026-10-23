@@ -1,0 +1,240 @@
+# Board description of the OPPO R11 (r11, SDM660), read by the unixnu build driver.
+#
+# 结构照抄 src/UniXNU-sheng/board.toml（官方唯一 port），只改与设备相关的值。
+# 实测档案（地址表 / MPIDR / splash / 分区几何 / panel 名）见 docs/hw-r11.md。
+# 标 TODO 的必须来自 M0 取证（真机 GPT / stock dtsi / fastboot getvar），不要猜。
+
+[board]
+name = "r11"
+soc = "SDM660"
+description = "OPPO R11 (CPH1707)"
+kit = "r11"                        # package/ 在构建树里成为 kits/r11
+# 板级外设（实测，见 docs/hw-r11.md）：
+#   panel   qcom,mdss_dsi_oppo16051samsung_s6e3fa3_1080p_cmd  (Samsung AMOLED 1080p, cmd mode, single DSI)
+#   touch   Synaptics @ i2c@c175000 (0x0C175000), addr 0x20
+#   fuel    bq27541 @ i2c@c176000 0x55 ; charge MCU pic16f/stm8s 0x25/0x26
+#   audio   ak4376 @ i2c@c1b6000 0x10 ; tfa98xx 0x36 ; nfc nq 0x28
+#   console uart@c170000 (ttyMSM0) 未引出，日志走 GOP/legacy 显示
+
+# 目标 OS 镜像。直接复用 sheng 的 iPad7,1 / iPadOS 17.7.11：ADT 身份是伪装成参考机，
+# 与物理硬件无关。（iPadOS 17 支持 A10X，armv8.0 没问题。）
+[ipsw]
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+product = "iPad7,1"
+version = "17.7.11"
+build = "21H461"
+device_class = "j120ap"
+chip_id = 0x8011
+board_id = 12
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+
+[ipsw.sha256]
+"044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
+"044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+
+# userdata 分区几何：R11 GPT 里名为 userdata 的条目，lba_bytes 是逻辑块大小。
+# 取法（真机）：adb shell 'readlink /dev/block/by-name/userdata' 拿到 pN，
+# 再读 /sys/block/mmcblk0/mmcblk0pN/start 与 /size（512B 扇区），换算成 4096B LBA。
+# 实测（512B 扇区 10944512 – 122142686）换算到 4096B 单位，见 docs/hw-r11.md §6
+[userdata]
+first_lba = 0x14E000               # 1368064
+last_lba = 0xE8F7FA                # 15267834（末尾要给 GPT 备份表留位）
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[kernel]
+defconfig = "r11_defconfig"
+# 内核链接前按顺序执行的静态库脚本。sheng 专属的三条（platform-power / adreno / mobile-display）
+# 换成 R11 的；Adreno 512 先留空，等 eMMC + 显示通了再说。
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "build-arm-driver.py ArmDTPlatform",
+  "build-arm-driver.py ArmCpu",
+  "build-arm-driver.py NativeAES",
+  "build-native-aes-bindings.py",
+  "build-arm-driver.py NativeSdhci",          # TODO: R11 是 eMMC 5.1，sheng 是 NativeUfs，需要新驱动
+  "build-arm-driver.py NativeVirtioBlock",
+  "build-arm-driver.py NativeRamBlock",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
+  "build-native-virtio-bindings.py --component NativeVirtioBlock",
+  "build-mockfs-fixture.py",
+  "build-r11-platform-power.py",              # TODO: 照 build-sheng-platform-power.py 改 PM660/PM660L
+  "build-boot-progress.py",
+  "build-libpthread-kernel.py",
+  "build-native-legacy-display.py",           # 先走 GOP/legacy 显示，DSI 原生驱动后补
+]
+
+[kernel.prelink]
+tool = "kits/NativePrelink/emit_prelink.py"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+# 与 sheng 同一份 IPSW，所以 kernelcache 哈希相同；换 IPSW 必须重算
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
+slide = "-0x1000000"
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
+  "com.apple.driver.AppleARMPlatform",
+  "com.apple.driver.AppleARMWatchdogTimer",
+  "com.apple.driver.AppleAudioClockLibs",
+  "com.apple.driver.AppleEffaceableStorage",
+  "com.apple.driver.AppleIISController",
+  "com.apple.driver.AppleM2ScalerCSCDriver",
+  "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR",
+  "com.apple.driver.IODARTFamily",
+  "com.apple.filesystems.apfs",
+  "com.apple.iokit.CoreAnalyticsFamily",
+  "com.apple.iokit.IOAVFamily",
+  "com.apple.iokit.IOAudio2Family",
+  "com.apple.iokit.IOCECFamily",
+  "com.apple.iokit.IOCryptoAcceleratorFamily",
+  "com.apple.iokit.IOGPUFamily",
+  "com.apple.iokit.IOHDCPFamily",
+  "com.apple.iokit.IOMobileGraphicsFamily",
+  "com.apple.iokit.IOReportFamily",
+  "com.apple.iokit.IOSlowAdaptiveClockingFamily",
+  "com.apple.iokit.IOStorageFamily",
+  "com.apple.iokit.IOSurface",
+  "com.apple.kec.Libm",
+  "com.apple.kec.corecrypto",
+  "com.apple.kext.AppleMatch",
+  "com.apple.kext.CoreTrust",
+  "com.apple.security.AppleImage4",
+  "com.apple.security.sandbox",
+  "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOHIDEventDriver",
+]
+
+# uefi-r11 = Mu-Silicium 的 Platforms/Xiaomi/lavenderPkg（同为 SDM660）改板。
+# 参考：lavender.conf 的 TARGET_FD_BASE=0x9FC00000 / TARGET_FD_SIZE=0x00300000。
+[firmware]
+config = "r11"                                       # Resources/Configs/r11.conf
+dsc = "Platforms/OPPO/r11Pkg/r11.dsc"
+fd = "Build/r11Pkg/{target}_{toolchain}/FV/R11_UEFI.fd"   # EDK2 把 FD 名首字母大写了
+preflight = ["scripts/check-r11.py"]
+submodules = ["Common/Mu", "Common/Mu_OEM_Sample", "Common/Mu_Tiano_Plus", "Features/DFCI", "Silicon/Arm/Mu_Tiano"]
+patches = []   # 现版本 Resources/MuPatches 里没有 Gic-Spurious.patch
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/OPPO",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+  "{uefi}/Common/Mu_Tiano_Plus",
+  "{uefi}/Features/DFCI",
+  "{uefi}/Silicon/Arm/Mu_Tiano",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+]
+
+[firmware.defines]
+ENABLE_SECUREBOOT = "1"
+DEVICE_MODEL = "r11"
+# sdm660 的 GCD 不支持 HeapGuard/PageGuard 要的 0xFFFFFFFF 属性（PageAttributeToGodAttribute 报错），先关掉
+MEMORY_PROTECTION = "FALSE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "r11-research"
+
+# 负载卷：FAT，装 unixnu.toml + 内核 + ADT + trust cache
+[payload]
+volume = "R11ESP"
+# boot 分区只有 64 MiB（0x4000000），而负载是 boot.img 的 ramdisk：
+# header(4K) + kernel(BootShim+gzip FD ~4M) + dtb(~350K) 之后只剩 ~58 MiB。
+# 因此不能用 sheng 的 192；Data 种子必须走 packed 形式。
+size_mib = 48
+loader = "firmware"
+title = "Boot"
+dram_size = "0xFE4C0000"           # 实测：bank0 0x80000000+2GiB，bank1 0x100000000+0x7E4C0000，首尾相接
+skip_setup_tool = "scripts/seed-data-skip-setup.py"
+panic_screen = false   # 上游没有 patch-xnu-entry-probe.py，先关掉
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+  "8900d6a93d7a59ce1a872a5c081e559f4240a218f97e12d44d22dda46644d68f",
+]
+# 每个 sheng-* 参数背后都有一个 CONFIG_XNU_SHENG_* 开关；R11 改成 r11-* 并补同名开关。
+kernel_args = [
+  "-v",
+  "serial=3",
+  "debug=0x14e",
+  "kt_fixed_zones=120",
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",              # 无 UART，早期只能靠 GOP/legacy 显示看日志
+  "offline-legacy-unit-scale=2",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-hid-home=1",
+  "offline-hid-input=1",
+  "offline-legacy-phase=4",
+  "offline-mobile-graphics-client=1",
+  "offline-mobile-graphics-load=1",
+  "offline-apfs-load=1",
+  "boot-progress=2",
+  "-apfs_shared_datavolume",
+  "offline-key-events=1",
+  "native-sdhci-root=1",               # 对应 CONFIG_XNU_NATIVE_SDHCI
+  "r11-pmgr=2",
+  "armcpu-diagnostics=1",
+  "r11-disable-watchdogd=1",
+  "r11-lite=1",
+  "boot-ui-focus4=SpringBoard",
+  "r11-smp=1",
+  "r11-cpufreq=3",
+  "r11-touch=4",
+  "r11-aks=1",
+  "armcpu-spi-ipi=1",
+  "-no_slto_panic",
+  "ml-timeout-lock-panic-scale=40",
+  "r11-touch-hid=1",
+  "r11-data-persist=2",
+  "r11-staged-apps=1",
+  "r11-buttons=1",
+  "r11-backlight=1",
+  "r11-vsync=60",
+]
+
+# 签名文本修正（可达 /chosen/text-fixups）。sheng 的三条是 iPadOS 17.7.11 用户区专属，
+# 与硬件无关，先照搬；换 IPSW 版本必须重算。
+text_fixups = [
+  "dyld_shared_cache_arm64.15,421e8bc,28ad1bb0008544f9,c0035fd6008544f9",
+  "dyld_shared_cache_arm64.13,1b05bec,44008052,24008052",
+  "dyld_shared_cache_arm64.13,1b05b08,44008052,24008052",
+  "BTAudioHALPlugin,38bec,ffc300d1f44f01a9,000080d2c0035fd6",
+]
+
+# ADT 由脚本生成（Apple 私有节点编码，不是 dts）。
+# 直接 cp src/UniXNU-sheng/scripts/make-sheng-adt.py 改地址与 CPU 数。
+[payload.adt]
+tool = "scripts/make-r11-adt.py"
+chip_id = "207"                       # 与 sheng 一致（参考机 iPad7,1）
+owned_memory_size = "0x60000000"     # 1.5 GiB 起步；总量 3.98 GiB 还要留 UEFI / reserved，S5 阶段按 ioreg 调
+root_match_volume_uuid = "00000000-0000-0000-0000-000000000000"   # TODO：由 [userdata] 生成后回填
+cpu_regs = "0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"   # 实测 2 簇×4 核：cpu0-3=A53(part 0x801)，cpu4-7=gold(0x800)
+psci_method = "smc"
+packed_data_ramdisk = true
+persistent_data = true
+ipad_identity = true
+unique_chip_id = "required"           # 平台种子不进仓库
+
+# 实测自 OTA boot.img（docs/hw-r11.md §8.1）：header_version 0，地址是 base+offset 模型。
+[bootimg.image]
+base = 0x0
+kernel_offset = 0x8000
+ramdisk_offset = 0x1000000
+tags_offset = 0x100
+second_offset = 0xf00000
+pagesize = 4096
+header_version = 0
+
+# stock ABL 缺 splash 区会关屏，补一个（地址已实测）。
+
+# 注意：这里**不要**再补 /reserved-memory/splash_region。
+# R11 的 stock 设备树（uefi-r11/DeviceTree/r11.dtb）里已经有这个节点，
+# fdtput -c 会报 FDT_ERR_EXISTS。sheng 需要补是因为它的 DT 里没有。

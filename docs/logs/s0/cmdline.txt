@@ -1,0 +1,9 @@
+﻿adb : cat: /proc/cmdline: Permission denied
+At line:1 char:445
++ ... tf8 "$out\partitions.txt"; adb shell "cat /proc/cmdline" 2>&1 | 
+Out-F ...
++                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (cat: /proc/cmdline: Perm 
+   ission denied:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

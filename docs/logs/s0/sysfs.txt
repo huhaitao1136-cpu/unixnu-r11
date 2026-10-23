@@ -1,0 +1,55 @@
+﻿adb : ls: /sys/class/backlight: No such file or directory
+At line:1 char:526
++ ... dline.txt"; adb shell "ls /sys/class/backlight /sys/class/input 
+/sys/ ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~
+    + CategoryInfo          : NotSpecified: (ls: /sys/class/...le or  
+   directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+/sys/block:
+loop0
+loop1
+loop2
+loop3
+loop4
+loop5
+loop6
+loop7
+mmcblk0
+mmcblk0rpmb
+ram0
+ram1
+ram10
+ram11
+ram12
+ram13
+ram14
+ram15
+ram2
+ram3
+ram4
+ram5
+ram6
+ram7
+ram8
+ram9
+zram0
+
+/sys/class/input:
+event0
+event1
+event2
+event3
+event4
+event5
+event6
+input0
+input1
+input2
+input3
+input4
+input5
+input6
+mice

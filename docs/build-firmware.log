@@ -1,0 +1,9 @@
+unixnu: developed and tested on macOS only; the kernel step needs Xcode and --skip-setup needs hdiutil
+== submodules /root/src/UniXNU
+== tree /root/src/UniXNU/out/r11/tree
+== firmware: Mu-Silicium
+== firmware: initializing submodules of the Mu-Silicium checkout
++ git -C /root/src/Mu-Silicium submodule update --init --depth 1 -- Common/Mu Common/Mu_OEM_Sample Common/Mu_Tiano_Plus Features/DFCI Silicon/Arm/Mu_Tiano
++ python3 /root/src/UniXNU/out/r11/tree/scripts/check-r11.py
++ build -p Platforms/OPPO/r11Pkg/r11.dsc -a AARCH64 -b DEBUG -t CLANGDWARF -n 12 -D FD_BASE=0x9fc00000 -D FD_SIZE=0x300000 -D FD_BLOCKS=768 -D ENABLE_SECUREBOOT=1 -D DEVICE_MODEL=r11 -D MEMORY_PROTECTION=FALSE -D SHIP_MODE=FALSE -D BUILDID_STRING=r11-research
+== firmware: /root/src/Mu-Silicium/Build/r11Pkg/DEBUG_CLANGDWARF/FV/R11_UEFI.fd

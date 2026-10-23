@@ -1,0 +1,70 @@
+name: build-r11-xnu
+
+# 在 GitHub 的 macOS runner 上编译 XNU 内核并打包 UniXNU payload。
+# 产出：kernel.macho、kernel.macho.adt、payload.img（Artifacts 里下载）
+
+on:
+  workflow_dispatch:        # 手动触发（网页上点 Run workflow）
+
+jobs:
+  build:
+    runs-on: macos-14       # Apple Silicon + Xcode 15
+    timeout-minutes: 240
+
+    steps:
+      - name: 取出设备仓库（unixnu-r11）
+        uses: actions/checkout@v4
+        with:
+          path: device
+
+      - name: 取出 UniXNU 主仓库
+        run: git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
+
+      - name: 安装依赖
+        run: |
+          brew install cmake ninja unifdef lld || true
+          xcodebuild -version
+          clang --version | head -1
+
+      - name: 拉取 XNU 等源码
+        working-directory: UniXNU
+        run: ./unixnu fetch -D ../device
+
+      - name: 选择配置
+        working-directory: UniXNU
+        run: ./unixnu defconfig r11_defconfig -D ../device
+
+      - name: 编译内核（耗时最长）
+        working-directory: UniXNU
+        run: |
+          set -o pipefail
+          ./unixnu build -D ../device kernel package 2>&1 | tee /tmp/kernel.log | tail -50
+
+      - name: 打包 payload（需要设备唯一 ID）
+        working-directory: UniXNU
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          set -o pipefail
+          ./unixnu build -D ../device payload 2>&1 | tee /tmp/payload.log | tail -50
+
+      - name: 失败时也上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r11-logs
+          path: |
+            /tmp/kernel.log
+            /tmp/payload.log
+            UniXNU/out/r11/logs/**
+          if-no-files-found: ignore
+
+      - name: 上传内核与 payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: r11-boot-artifacts
+          path: |
+            UniXNU/out/r11/kernel/**
+            UniXNU/out/r11/payload/**
+            UniXNU/out/r11/boot/**
+          if-no-files-found: warn
