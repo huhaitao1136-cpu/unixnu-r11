@@ -40,6 +40,18 @@ jobs:
           set -o pipefail
           ./unixnu build -D ../device kernel package 2>&1 | tee /tmp/kernel.log | tail -50
 
+      - name: 诊断（失败时重跑内核构建，输出完整 stderr）
+        if: failure()
+        working-directory: UniXNU/out/r11/tree
+        continue-on-error: true
+        run: |
+          echo "==== 重跑 build-xnu-4k-baseline.sh，捕获完整输出 ===="
+          bash scripts/build-xnu-4k-baseline.sh > /tmp/diag.log 2>&1 || true
+          echo "---- 最后的错误相关行 ----"
+          grep -n -i -E 'error|undefined|no rule|not found|ld: |clang: ' /tmp/diag.log | tail -60 || true
+          echo "---- 末尾 120 行 ----"
+          tail -120 /tmp/diag.log || true
+
       - name: 打包 payload（需要设备唯一 ID）
         working-directory: UniXNU
         env:
@@ -56,6 +68,7 @@ jobs:
           path: |
             /tmp/kernel.log
             /tmp/payload.log
+            /tmp/diag.log
             UniXNU/out/r11/logs/**
           if-no-files-found: ignore
 

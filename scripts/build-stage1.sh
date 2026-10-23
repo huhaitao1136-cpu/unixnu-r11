@@ -198,6 +198,43 @@ print(f"==> BootShim.S: 已生成（涂屏标记={'开' if inserted else '关'}�
 PYEOF
 fi
 
+# ---------- 8.5) 装配构建树，并修补 DarwinBoot 的 INF ----------
+# DarwinBoot 的 Entry.S 需要 ArmPkg 的 AsmMacroLib.h，但它的 INF 里没有
+# ArmPkg/ArmPkg.dec，导致 -I 路径缺失。这里在装配好的 tree 里补上。
+echo "==> 装配构建树（unixnu tree）"
+( cd "$BASE" && ./unixnu tree -D "$UNX" ) >/dev/null 2>&1 || true
+
+# DarwinBoot 的 Entry.S 用的是新版 edk2 的头名 AsmMacroLib.h，
+# 这个 Mu 版本里叫 AsmMacroIoLibV8.h —— 改掉它。
+# DarwinBoot 的 Entry.S 用的是新版 edk2 的头名 AsmMacroLib.h，
+# 这个 Mu 版本里叫 AsmMacroIoLibV8.h。直接改子模块源文件（tree 每次装配都会重新链接它），
+# 同时把已经装配好的 tree 副本也改一遍。
+for DBDIR in "$BASE/drivers/DarwinBoot" "$BASE/out/r11/tree/drivers/DarwinBoot"; do
+  [[ -d "$DBDIR" ]] || continue
+  find "$DBDIR" -name '*.S' -type f 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|#include <AsmMacroLib.h>|#include <AsmMacroIoLibV8.h>|' "$f"
+  done
+  echo "  DarwinBoot: .S 头文件已适配（$DBDIR）"
+done
+
+DBINF="$BASE/out/r11/tree/drivers/DarwinBoot/DarwinBootPkg/Driver/DarwinBoot.inf"
+if [[ -f "$DBINF" ]] && ! grep -q 'ArmPkg/ArmPkg.dec' "$DBINF"; then
+  python3 - "$DBINF" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8", errors="replace").read()
+if "ArmPkg/ArmPkg.dec" in s:
+    raise SystemExit(0)
+m = re.search(r"(?m)^\[Packages\]\s*$", s)
+if m:
+    s = s[:m.end()] + "\n  ArmPkg/ArmPkg.dec" + s[m.end():]
+else:
+    s = s.rstrip() + "\n\n[Packages]\n  MdePkg/MdePkg.dec\n  ArmPkg/ArmPkg.dec\n"
+open(p, "w", encoding="utf-8").write(s)
+print("  DarwinBoot.inf: 已补 ArmPkg/ArmPkg.dec")
+PYEOF
+fi
+
 # ---------- 9) 编固件 ----------
 chmod +x "$BASE/unixnu"
 echo "==> unixnu build firmware ($TARGET)"
@@ -238,14 +275,22 @@ fi
 # ---------- 11) 打 boot.img ----------
 DTB="$UE/DeviceTree/r11.dtb"
 if [[ ! -f "$DTB" ]]; then DTB=""; fi
-echo "==> unixnu bootimg ${DTB:+--dtb $DTB}"
-if [[ -n "$DTB" ]]; then
-  ( cd "$BASE" && ./unixnu bootimg -D "$UNX" --uefi "$MU" --fd "$FD" --ramdisk none --dtb "$DTB" ) \
-    2>&1 | tee "$SELF/../docs/build-bootimg.log"
+
+# UniXNU payload（kernel.macho + unixnu.toml）由 "unixnu build payload" 产出。
+# 有就作为 ramdisk 打进 boot.img；没有就退回空 ramdisk（阶段 1/2 的验证模式）。
+PAYLOAD_IMG="$BASE/out/r11/payload/payload.img"
+RAMDISK_ARGS=(--ramdisk none)
+if [[ -f "$PAYLOAD_IMG" ]]; then
+  PAYLOAD_SIZE=$(stat -c%s "$PAYLOAD_IMG")
+  RAMDISK_ARGS=(--ramdisk "$PAYLOAD_IMG")
+  echo "==> 使用 payload 作为 ramdisk: $PAYLOAD_IMG ($PAYLOAD_SIZE B)"
 else
-  ( cd "$BASE" && ./unixnu bootimg -D "$UNX" --uefi "$MU" --fd "$FD" --ramdisk none ) \
-    2>&1 | tee "$SELF/../docs/build-bootimg.log"
+  echo "==> 没找到 payload.img，使用空 ramdisk"
 fi
+
+echo "==> unixnu bootimg ${DTB:+--dtb $DTB}"
+( cd "$BASE" && ./unixnu bootimg -D "$UNX" --uefi "$MU" --fd "$FD" "${RAMDISK_ARGS[@]}" ${DTB:+--dtb "$DTB"} ) \
+  2>&1 | tee "$SELF/../docs/build-bootimg.log"
 
 IMG="$BASE/out/r11/boot/boot.img"
 if [[ ! -f $IMG ]]; then
