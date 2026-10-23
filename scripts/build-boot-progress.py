@@ -31,7 +31,7 @@ while i < len(args):
     i += 1
 command += ['-DXNU_BOOT_PROGRESS=1', '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror',
             '-I', str(ROOT / '.cache/xnu-work/osfmk'),
-            '-I', str(ROOT / 'uefi-r11/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib')]
+            '-I', str(ROOT / 'package/bootprogress-include')]
 subprocess.run(command, cwd=record['directory'], check=True, timeout=90)
 (OUT / 'compile-command.json').write_text(json.dumps(command,indent=2)+'\n')
 fault_source = ROOT / 'kits/r11/BootFaultProbe.c'
