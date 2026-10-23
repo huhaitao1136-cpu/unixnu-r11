@@ -61,10 +61,12 @@ archives = [
   "build-arm-driver.py NativeVirtioBlock",
   "build-arm-driver.py NativeRamBlock",
   "build-mockfs-fixture.py",
-  "build-r11-platform-power.py",              # TODO: 照 build-sheng-platform-power.py 改 PM660/PM660L
+  # 需要参考内核候选（native-prelink），bring-up 阶段先移除：
+  # "build-r11-platform-power.py",              # TODO: 照 build-sheng-platform-power.py 改 PM660/PM660L
   "build-boot-progress.py",
   "build-libpthread-kernel.py",
-  "build-native-legacy-display.py",           # 先走 GOP/legacy 显示，DSI 原生驱动后补
+  # 需要参考内核候选（native-prelink），bring-up 阶段先移除：
+  # "build-native-legacy-display.py",           # 先走 GOP/legacy 显示，DSI 原生驱动后补
 ]
 
 [kernel.prelink]
