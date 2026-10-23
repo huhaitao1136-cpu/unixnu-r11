@@ -34,7 +34,7 @@ jobs:
 
       - name: 安装依赖
         run: |
-          brew install cmake ninja unifdef lld || true
+          brew install cmake ninja unifdef lld mtools || true
           xcodebuild -version
           clang --version | head -1
 
