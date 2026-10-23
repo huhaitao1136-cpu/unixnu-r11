@@ -58,10 +58,9 @@ archives = [
   "build-native-aes-bindings.py",
   # NativeSdhci 上游不存在（UniXNU 只有 NativeUfs）；第一阶段启动不需要 eMMC，
   # 后续要做 APFS 根卷时再自己实现 libNativeSdhci.a 并把它加回这里。
-  "build-arm-driver.py NativeVirtioBlock --verified-root",
+  "build-arm-driver.py NativeVirtioBlock",
   "build-arm-driver.py NativeRamBlock",
   "build-mockfs-fixture.py",
-  "build-verified-root-probe.py",
   "build-r11-platform-power.py",              # TODO: 照 build-sheng-platform-power.py 改 PM660/PM660L
   "build-boot-progress.py",
   "build-libpthread-kernel.py",
