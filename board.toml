@@ -60,7 +60,8 @@ archives = [
   # 后续要做 APFS 根卷时再自己实现 libNativeSdhci.a 并把它加回这里。
 # VIRTIO 归档已停用（R11 无 virtio）
   # "build-arm-driver.py NativeVirtioBlock",
-  "build-arm-driver.py NativeRamBlock",
+  # R11 第一阶段不启用块存储栈（依赖参考内核候选），改用 mockfs
+  # "build-arm-driver.py NativeRamBlock",
   # NativeUfs 会拖入 VerifiedRoot 资格化符号，改用 r11-stubs 桩
   # "build-arm-driver.py NativeUfs",   # 为 NativeRamBlock 的持久化层提供 _native_ufs_store_* 符号
   "build-mockfs-fixture.py",
