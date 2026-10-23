@@ -58,7 +58,8 @@ archives = [
   "build-native-aes-bindings.py",
   # NativeSdhci 上游不存在（UniXNU 只有 NativeUfs）；第一阶段启动不需要 eMMC，
   # 后续要做 APFS 根卷时再自己实现 libNativeSdhci.a 并把它加回这里。
-  "build-arm-driver.py NativeVirtioBlock",
+# VIRTIO 归档已停用（R11 无 virtio）
+  # "build-arm-driver.py NativeVirtioBlock",
   "build-arm-driver.py NativeRamBlock",
   "build-mockfs-fixture.py",
   # 需要参考内核候选（native-prelink），bring-up 阶段先移除：
