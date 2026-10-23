@@ -61,6 +61,7 @@ archives = [
 # VIRTIO 归档已停用（R11 无 virtio）
   # "build-arm-driver.py NativeVirtioBlock",
   "build-arm-driver.py NativeRamBlock",
+  "build-arm-driver.py NativeUfs",   # 为 NativeRamBlock 的持久化层提供 _native_ufs_store_* 符号
   "build-mockfs-fixture.py",
   # 需要参考内核候选（native-prelink），bring-up 阶段先移除：
   # "build-r11-platform-power.py",              # TODO: 照 build-sheng-platform-power.py 改 PM660/PM660L
