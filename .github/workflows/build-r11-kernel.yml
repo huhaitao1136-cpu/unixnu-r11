@@ -49,6 +49,17 @@ jobs:
         working-directory: UniXNU
         run: ./unixnu defconfig r11_defconfig -D ../device
 
+      - name: 编译 R11 桩归档（UFS 存储桩）
+        run: |
+          set -euo pipefail
+          STUB=UniXNU/out/r11/tree/build/r11-stubs
+          mkdir -p "$STUB"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang -target arm64-apple-ios17.0 -isysroot "$SDK" -O2 -nostdinc \
+            -I "$SDK/usr/include" -c device/package/r11-stubs/ufs-store-stubs.c -o "$STUB/ufs-store-stubs.o"
+          xcrun ar rcs "$STUB/libR11Stubs.a" "$STUB/ufs-store-stubs.o"
+          nm "$STUB/libR11Stubs.a" | head -8
+
       - name: 编译内核（耗时最长）
         working-directory: UniXNU
         run: |
