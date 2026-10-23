@@ -20,6 +20,18 @@ jobs:
       - name: 取出 UniXNU 主仓库
         run: git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
 
+      - name: 缓存源码与编译对象
+        uses: actions/cache@v4
+        with:
+          path: |
+            UniXNU/out/feeds
+            UniXNU/out/r11/tree/.cache
+            UniXNU/out/r11/tree/build
+          key: r11-${{ hashFiles('device/board.toml', 'device/configs/r11_defconfig', 'device/scripts/*.py') }}-${{ github.run_id }}
+          restore-keys: |
+            r11-${{ hashFiles('device/board.toml', 'device/configs/r11_defconfig', 'device/scripts/*.py') }}-
+            r11-
+
       - name: 安装依赖
         run: |
           brew install cmake ninja unifdef lld || true
@@ -29,6 +41,9 @@ jobs:
       - name: 拉取 XNU 等源码
         working-directory: UniXNU
         run: ./unixnu fetch -D ../device
+
+      - name: 预生成 DriverKit 头文件缓存（绕过 GitHub API 限流）
+        run: python3 device/scripts/preseed-driverkit.py UniXNU/out/r11/tree
 
       - name: 选择配置
         working-directory: UniXNU
