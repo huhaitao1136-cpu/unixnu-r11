@@ -217,6 +217,174 @@ for DBDIR in "$BASE/drivers/DarwinBoot" "$BASE/out/r11/tree/drivers/DarwinBoot";
   echo "  DarwinBoot: .S 头文件已适配（$DBDIR）"
 done
 
+# UniXNU 的 UniXNULib 用到 gFdtTableGuid，但 INF 的 [Packages] 里没有 EmbeddedPkg。
+# 给三个 UniXNU 模块统一补上（幂等）。
+for UINF in \
+  "$BASE/out/r11/tree/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf" \
+  "$BASE/out/r11/tree/package/UniXNUPkg/Application/UniXNU/UniXNU.inf" \
+  "$BASE/out/r11/tree/package/UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf"; do
+  [[ -f "$UINF" ]] || continue
+  # 先清掉历史注入的声明块（早期版本注入过 Mu 已声明的函数，会造成冲突）。
+  if [[ "$UINF" == *UniXNULib.inf ]]; then
+    UDIR0="$(dirname "$UINF")"
+    for SRC in "$UDIR0"/*.c; do
+      [[ -f "$SRC" ]] || continue
+      if grep -q 'R11FdtCompatDecls' "$SRC"; then
+        python3 - "$SRC" <<'PYCLEAN'
+import re, sys
+p = sys.argv[1]
+lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+out, skip = [], False
+decl = re.compile(r"^(UINT16|UINT32|UINT64|INT32|CONST CHAR8 \*|CONST VOID \*)\s+Fdt\w+\s*\(")
+for l in lines:
+    if l.startswith("/* R11FdtCompatDecls"):
+        skip = True
+        continue
+    if skip:
+        if decl.match(l):
+            continue
+        if l.strip() == "":
+            skip = False
+            continue
+        skip = False
+    out.append(l)
+open(p, "w", encoding="utf-8").write("\n".join(out) + "\n")
+print("  cleaned ->", p.split("/")[-1])
+PYCLEAN
+      fi
+    done
+  fi
+
+  # 本版 Mu 的 FdtLib.h 没有这些函数的声明（C99 不允许隐式声明），
+  # 在 UniXNULib 的源文件里补上原型 —— 实现由 R11FdtCompat 提供。
+  if [[ "$UINF" == *UniXNULib.inf ]]; then
+    UDIR="$(dirname "$UINF")"
+    for SRC in "$UDIR"/*.c; do
+      [[ -f "$SRC" ]] || continue
+      if ! grep -q 'R11FdtCompatDecls' "$SRC"; then
+        python3 - "$SRC" <<'PYDECL'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8", errors="replace").read()
+if "R11FdtCompatDecls" in s:
+    raise SystemExit(0)
+decls = ("\n/* R11FdtCompatDecls: Mu 的 FdtLib 缺这些函数，实现见 r11Pkg/Library/R11FdtCompat */\n"
+         "INT32       FdtOpenInto (VOID *Fdt, VOID *Buffer, INT32 BufferSize);\n"
+         "INT32       FdtPack (VOID *Fdt);\n"
+         "CONST CHAR8 *FdtStrerror (INT32 Err);\n"
+         "INT32       FdtOverlayApply (VOID *Fdt, CONST VOID *Overlay);\n"
+         "INT32       FdtTotalSize (CONST VOID *Fdt);\n"
+         "INT32       FdtPathOffset (CONST VOID *Fdt, CONST CHAR8 *Path);\n"
+         "INT32       FdtDelProp (VOID *Fdt, INT32 NodeOffset, CONST CHAR8 *Name);\n"
+         "INT32       FdtDelNode (VOID *Fdt, INT32 NodeOffset);\n")
+m = list(re.finditer(r"(?m)^#include .*$", s))
+if m:
+    at = m[-1].end()
+    s = s[:at] + "\n" + decls + s[at:]
+else:
+    s = decls + s
+open(p, "w", encoding="utf-8").write(s)
+print("  decls ->", p.split("/")[-1])
+PYDECL
+      fi
+    done
+  fi
+  # 第二批：FdtPathOffset / FdtDelProp / FdtDelNode（第一块标记存在时追加）
+  if [[ "$UINF" == *UniXNULib.inf ]]; then
+    UDIR2="$(dirname "$UINF")"
+    for SRC in "$UDIR2"/*.c; do
+      [[ -f "$SRC" ]] || continue
+      if ! grep -q 'FdtPathOffset (CONST VOID' "$SRC"; then
+        python3 - "$SRC" <<'PYDECL2'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8", errors="replace").read()
+if "FdtPathOffset (CONST VOID" in s:
+    raise SystemExit(0)
+decls = ("\n/* R11FdtCompatDecls2 */\n"
+         "INT32       FdtPathOffset (CONST VOID *Fdt, CONST CHAR8 *Path);\n"
+         "INT32       FdtDelProp (VOID *Fdt, INT32 NodeOffset, CONST CHAR8 *Name);\n"
+         "INT32       FdtDelNode (VOID *Fdt, INT32 NodeOffset);\n")
+m = list(re.finditer(r"(?m)^#include .*$", s))
+if m:
+    at = m[-1].end()
+    s = s[:at] + "\n" + decls + s[at:]
+else:
+    s = decls + s
+open(p, "w", encoding="utf-8").write(s)
+print("  decls2 ->", p.split("/")[-1])
+PYDECL2
+      fi
+    done
+  fi
+  # 第三批：FdtGetProp
+  if [[ "$UINF" == *UniXNULib.inf ]]; then
+    UDIR3="$(dirname "$UINF")"
+    for SRC in "$UDIR3"/*.c; do
+      [[ -f "$SRC" ]] || continue
+      if ! grep -q 'FdtGetProp (CONST VOID' "$SRC"; then
+        python3 - "$SRC" <<'PYDECL3'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8", errors="replace").read()
+if "FdtGetProp (CONST VOID" in s:
+    raise SystemExit(0)
+decls = ("\n/* R11FdtCompatDecls3 */\n"
+         "CONST VOID *FdtGetProp (CONST VOID *Fdt, INT32 NodeOffset, CONST CHAR8 *Name, INT32 *Length);\n")
+m = list(re.finditer(r"(?m)^#include .*$", s))
+at = m[-1].end() if m else 0
+s = s[:at] + "\n" + decls + s[at:]
+open(p, "w", encoding="utf-8").write(s)
+print("  decls3 ->", p.split("/")[-1])
+PYDECL3
+      fi
+    done
+  fi
+  # UniXNULib 还需要 R11FdtCompatLib（Mu 的 FdtLib 缺 5 个函数）
+  if [[ "$UINF" == *UniXNULib.inf ]] && ! grep -q 'R11FdtCompatLib' "$UINF"; then
+    python3 - "$UINF" <<'PYLIB'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8", errors="replace").read()
+if "R11FdtCompatLib" in s:
+    raise SystemExit(0)
+m = re.search(r"(?m)^\[LibraryClasses\]\s*$", s)
+if m:
+    s = s[:m.end()] + "\n  R11FdtCompatLib" + s[m.end():]
+else:
+    s = s.rstrip() + "\n\n[LibraryClasses]\n  R11FdtCompatLib\n"
+open(p, "w", encoding="utf-8").write(s)
+print("  library: R11FdtCompatLib ->", p.split("/")[-1])
+PYLIB
+  fi
+  if ! grep -q 'EmbeddedPkg/EmbeddedPkg.dec' "$UINF"; then
+    python3 - "$UINF" <<'PYINF'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8", errors="replace").read()
+if "EmbeddedPkg/EmbeddedPkg.dec" in s:
+    raise SystemExit(0)
+m = re.search(r"(?m)^\[Packages\]\s*$", s)
+if m:
+    s = s[:m.end()] + "\n  EmbeddedPkg/EmbeddedPkg.dec" + s[m.end():]
+else:
+    s = s.rstrip() + "\n\n[Packages]\n  MdePkg/MdePkg.dec\n  EmbeddedPkg/EmbeddedPkg.dec\n"
+open(p, "w", encoding="utf-8").write(s)
+print("  patched", p.split("/")[-1])
+PYINF
+  fi
+done
+
+# UniXNULog 的级别与 DxeCore 的 INFO 撞车，把 UniXNU 的日志抬到 ERROR，
+# 这样配合全局掩码 0x80000000 就只剩 UNIXNU: 行。
+# UniXNU 源码补丁（日志走 ConOut、跳过 ConnectAll/Watchdog、分步标记）
+python3 "$SELF/patch-unixnu.py" "$BASE/out/r11/tree/package" || echo "   !! patch-unixnu 失败"
+
+UDEC="$BASE/out/r11/tree/package/UniXNUPkg/UniXNUPkg.dec"
+if [[ -f "$UDEC" ]]; then
+  sed -i "s/0x00000040/0x80000000/" "$UDEC"
+fi
+
 DBINF="$BASE/out/r11/tree/drivers/DarwinBoot/DarwinBootPkg/Driver/DarwinBoot.inf"
 if [[ -f "$DBINF" ]] && ! grep -q 'ArmPkg/ArmPkg.dec' "$DBINF"; then
   python3 - "$DBINF" <<'PYEOF'
@@ -279,11 +447,36 @@ if [[ ! -f "$DTB" ]]; then DTB=""; fi
 # UniXNU payload（kernel.macho + unixnu.toml）由 "unixnu build payload" 产出。
 # 有就作为 ramdisk 打进 boot.img；没有就退回空 ramdisk（阶段 1/2 的验证模式）。
 PAYLOAD_IMG="$BASE/out/r11/payload/payload.img"
+PAYLOAD_LZ="$PAYLOAD_IMG.lzma"
 RAMDISK_ARGS=(--ramdisk none)
 if [[ -f "$PAYLOAD_IMG" ]]; then
-  PAYLOAD_SIZE=$(stat -c%s "$PAYLOAD_IMG")
-  RAMDISK_ARGS=(--ramdisk "$PAYLOAD_IMG")
-  echo "==> 使用 payload 作为 ramdisk: $PAYLOAD_IMG ($PAYLOAD_SIZE B)"
+  # R11 的 ABL 对 ramdisk 有 32 MiB 上限，而 payload 有 ~56 MiB。
+  # 压缩成 LZMA-Alone（固件用 LzmaCustomDecompressLib 解压），约 10-15 MB。
+  # 方案 A：把编好的 UniXNU.efi 放进卷里（\EFI\BOOT\BOOTAA64.EFI），
+  # 固件按文件路径加载它，而不是从 FV 里取 PE32 缓冲区。
+  UAPP_EFI="$MU/Build/r11Pkg/DEBUG_CLANGDWARF/AARCH64/UniXNUPkg/Application/UniXNU/UniXNU/OUTPUT/UniXNU.efi"
+  if [[ -f "$UAPP_EFI" ]]; then
+    echo "==> 把 UniXNU.efi 写入 payload 卷"
+    python3 "$SELF/embed-unixnu-app.py" "$PAYLOAD_IMG" "$UAPP_EFI" \
+      || echo "   !! 写入失败（继续，固件会退回 FV 加载）"
+  else
+    echo "   !! 没找到 $UAPP_EFI（固件将退回 FV 加载）"
+  fi
+
+  echo "==> 压缩 payload（LZMA）"
+  python3 - "$PAYLOAD_IMG" "$PAYLOAD_LZ" <<'PYLZ'
+import lzma, sys
+data = open(sys.argv[1], 'rb').read()
+packed = bytearray(lzma.compress(data, format=lzma.FORMAT_ALONE, preset=6))
+# Python 把"解压后大小"写成 0xFFFFFFFFFFFFFFFF（未知）；
+# EDK2 的 LzmaDecompress 需要真实长度，回填进去。
+packed[5:13] = len(data).to_bytes(8, 'little')
+open(sys.argv[2], 'wb').write(packed)
+print(f'    payload {len(data)} B -> {len(packed)} B (LZMA)')
+if len(packed) > 32 * 1024 * 1024:
+    raise SystemExit('!! 压缩后仍超过 ramdisk 的 32 MiB 上限')
+PYLZ
+  RAMDISK_ARGS=(--ramdisk "$PAYLOAD_LZ")
 else
   echo "==> 没找到 payload.img，使用空 ramdisk"
 fi
@@ -291,6 +484,7 @@ fi
 echo "==> unixnu bootimg ${DTB:+--dtb $DTB}"
 ( cd "$BASE" && ./unixnu bootimg -D "$UNX" --uefi "$MU" --fd "$FD" "${RAMDISK_ARGS[@]}" ${DTB:+--dtb "$DTB"} ) \
   2>&1 | tee "$SELF/../docs/build-bootimg.log"
+
 
 IMG="$BASE/out/r11/boot/boot.img"
 if [[ ! -f $IMG ]]; then

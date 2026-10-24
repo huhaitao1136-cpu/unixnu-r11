@@ -18,7 +18,7 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DRAM_BASE = 0x80000000
+DRAM_BASE = 0x80000000   # 可用 --dram-base 覆盖（QEMU virt 是 0x40000000）
 ARMIO_BASE = 0x17000000          # 覆盖 GIC 的 APSS 外设窗口（R11: GICD 0x17A00000 / GICR 0x17B00000）
 GIC_DIST = 0x17A00000
 GIC_DIST_SIZE = 0x10000
@@ -93,7 +93,11 @@ def main():
     parser.add_argument('--gpu-addon', action='store_true', help='Zeroed GpuAddon sidecar handoff placeholder (the loader fills in kernel.macho.gpuaddon)')
     parser.add_argument('--text-fixup', action='append', default=[],
                         help='/chosen/text-fixups entry <file name>,<file offset>,<original>,<replacement> for the kernel\'s signed-text fixups')
+    parser.add_argument('--dram-base', type=lambda v: int(v, 0), default=0x80000000,
+                        help='DRAM 基址（QEMU virt 用 0x40000000）')
     args = parser.parse_args()
+    global DRAM_BASE
+    DRAM_BASE = args.dram_base
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
     if args.unique_chip_id is not None and not (0 < args.unique_chip_id < 1 << 64 and 0 < args.chip_id < 1 << 32):
@@ -166,7 +170,9 @@ def main():
                                  ([('GpuAddon', bytes(16))] if args.gpu_addon else [])),
               # Read by the original AppleImage4 at start-up; present and empty here.
               node('manifest-properties')]),
-        node('cpus', children=cpus),
+        # AppleARMCPU::_validateConfiguration() 要求：不用 AIC IPI 时必须显式声明，
+        # 否则它会要求每个 CPU 都有 interrupts / function-ipi_dispatch 等属性并 panic。
+        node('cpus', [('no-aic-ipi-required', struct.pack('<I', 1))], children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # Suspend/resume is not implemented for this board. Use the original
         # root-domain policy input rather than allowing the CPU to park forever.

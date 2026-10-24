@@ -78,13 +78,19 @@ jobs:
           echo "---- 末尾 120 行 ----"
           tail -120 /tmp/diag.log || true
 
-      - name: 打包 payload（需要设备唯一 ID）
+      - name: 生成最小 Data 种子（APFS，跳过 Setup）
+  working-directory: device
+  run: |
+    bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log | tail -30
+    ls -l "$RUNNER_TEMP/seed.dbr"
+
+- name: 打包 payload（需要设备唯一 ID）
         working-directory: UniXNU
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
           set -o pipefail
-          ./unixnu build -D ../device payload 2>&1 | tee /tmp/payload.log | tail -50
+          ./unixnu build -D ../device payload --data-ramdisk "$RUNNER_TEMP/seed.dbr" --skip-setup 2>&1 | tee /tmp/payload.log | tail -50
 
       - name: 失败时也上传日志
         if: always()
