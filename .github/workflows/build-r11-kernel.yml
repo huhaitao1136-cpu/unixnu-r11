@@ -79,12 +79,12 @@ jobs:
           tail -120 /tmp/diag.log || true
 
       - name: 生成最小 Data 种子（APFS，跳过 Setup）
-  working-directory: device
-  run: |
-    bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log | tail -30
-    ls -l "$RUNNER_TEMP/seed.dbr"
+        working-directory: device
+        run: |
+          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log | tail -30
+          ls -l "$RUNNER_TEMP/seed.dbr"
 
-- name: 打包 payload（需要设备唯一 ID）
+      - name: 打包 payload（需要设备唯一 ID）
         working-directory: UniXNU
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
