@@ -2451,3 +2451,108 @@ sp[1] = 0x56 = 86            ← errno = EBADEXEC
 ```
 
 **距"用户态执行"只差最后一道校验。**
+
+---
+
+## 3.44 EBADEXEC 定位：load_machfile 返回 LOAD_FAILURE（2026-10-26 23:50）
+
+### 源码事实
+
+`load_return_to_errno()`（kern_exec.c:7238-7247）：
+
+```c
+case LOAD_IOERROR:    return EIO;
+case LOAD_DECRYPTFAIL: return EAUTH;
+case LOAD_FAILURE:
+default:              return EBADEXEC;      /* ← 我们拿到的 86 */
+```
+
+`encapsulated_binary` 处也可能产生 EBADEXEC（activator 迭代超过 `EAI_ITERLIMIT`）。
+
+### 推到这一步的证据链（mockfs 通道）
+
+```
+ramdisk = 裸 Mach-O (64 KB, 偏移 0)
+→ APFS 挂载失败 → mockfs 兜底成为根
+→ /sbin/launchd 命中 mockfs 的 file 节点（内容 = 整个设备）
+→ 内核 dump 到的头 = 0xfeedfacf 0x0100000c 0x00000002 0x00000002 0x00000002 0x000001b8
+  （与我们的 init 文件逐字节一致 ✅）
+→ ip_arch_size = 0x10000（设备大小）
+→ exec_mach_imgact 通过头部检查
+→ 最终 errno = 86 = EBADEXEC ← load_machfile 的 LOAD_FAILURE
+```
+
+### 明天的第一步（一条命令）
+
+把 CATCH_EXEC 的断点改回 `load_machfile` 入口 + 返回：
+
+```bash
+# 断 _load_machfile = 0xfffffff00775a8a8
+# 命中后读 x0(ip) x1(mach_header) x30(返回地址)
+# 在 $x30 下断点，continue，读 x0 = load_return_t
+```
+
+判读：
+
+| load_return_t | 含义 | 修法 |
+|---|---|---|
+| LOAD_FAILURE | 段映射失败 | 补 `__PAGEZERO` / `__LINKEDIT`，或调整 `__TEXT` 的 fileoff/vmsize |
+| LOAD_NOCPUS | CPU 相关 | 检查 cpusubtype |
+| LOAD_CANTCREATE | 内存映射失败 | 检查 vmsize / 权限 |
+| 0（成功） | 失败在 exec 后续 | 可能要求 `LC_LOAD_DYLINKER`（真 dyld） |
+
+### 今日最终状态
+
+```
+真机：UEFI → UniXNU → DarwinBoot → XNU → APFS 根 → 加载 init
+内核：正确读到我们的 Mach-O 头（mockfs 通道，绕开 APFS 读取缺陷）
+剩余：load_machfile 的段映射校验（EBADEXEC/LOAD_FAILURE）
+```
+
+---
+
+## 3.45 cpusubtype 是 EBADEXEC 的元凶；修好后 exec 不再报错但卡在内部（2026-10-27 00:20）
+
+### 决定性发现：`cpusubtype = 2` 是 arm64e
+
+我们的 `make-minimal-init.py` 里把 `CPU_SUBTYPE_ARM64_ALL` 写成了 2，而：
+
+```c
+#define CPU_SUBTYPE_ARM64_ALL  ((cpu_subtype_t) 0)
+#define CPU_SUBTYPE_ARM64_V8   ((cpu_subtype_t) 1)
+#define CPU_SUBTYPE_ARM64E     ((cpu_subtype_t) 2)   /* ← 我们误用了这个 */
+```
+
+内核 `grade_binary()` 看到"arm64e 二进制 + 非 arm64e 内核" → 拒绝 → `exec_mach_imgact` 直接返回
+**EBADEXEC(86)**（与观测完全一致）。
+
+修正为 0 后重新生成 init（`init.macho` / `init64k.macho`），并作为 ramdisk 测试。
+
+### 修正后的行为变化（重要）
+
+| 阶段 | 修正前 | 修正后 |
+|---|---|---|
+| `/sbin/launchd` exec | 立即返回 EBADEXEC(86)，屏幕打印 `failed loading ... errno 8/86` | **不再打印 failed loading** |
+| `exec_mach_imgact` | 立即返回 86 | **进入后不返回**（返回断点 0x76d078c 未命中） |
+
+结论：cpusubtype 修正让 exec 通过架构 grade，进入真正的加载阶段，随后在内部卡住
+（最可能是 `load_machfile` 的段页读取，经 mockfs 的 pagein/strategy 路径）。
+
+### 明天下一步（按顺序）
+
+1. `CATCH_EXEC=1` 断 `_load_machfile`(0xfffffff00775a8a8)：确认是否进入、是否返回
+2. 若卡在 load_machfile 内部：
+   * 检查 mockfs 的 `strategy/pagein` 是否正确转发到设备内存
+   * 尝试 dense ramdisk（`--data-ramdisk`，设备内存直接映射）
+3. 若 load_machfile 返回 0：看用户栈构建（copyout）与线程状态
+4. 若一切成功：验证 `grep -c '0x00000001000001d8'`（inasm 里用户态入口）
+
+### 今晚新增/更新的资产
+
+```
+scripts/make-minimal-init.py    cpusubtype 修正为 0（ARM64_ALL）
+out/r11/init.macho              573 B 基线
+out/r11/init64k.macho           64 KB 填充版（供 mockfs ramdisk 使用）
+scripts/qemu-run-r11.sh         CATCH_EXEC 可在 exec_mach_imgact / load_machfile 之间切换
+docs §3.43–§3.45                完整证据链
+```

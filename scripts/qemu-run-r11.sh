@@ -73,20 +73,14 @@ if [ -n "${CATCH_EXEC:-}" ]; then
     sleep 3
     "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
       -ex "target remote :1234" \
-      -ex "hbreak *$HDR_LOAD" \
+      -ex "hbreak *$LOADMACH_ADDR" \
       -ex "continue" \
-      -ex 'printf "=== 命中 exec_mach_imgact 头加载点 ===\n"' \
+      -ex 'printf "=== 进入 load_machfile ===\n"' \
+      -ex 'info registers x0 x1 x30' \
+      -ex 'hbreak *$x30' \
+      -ex "continue" \
+      -ex 'printf "=== load_machfile 返回 ===\n"' \
       -ex 'info registers x0' \
-      -ex 'set $h = *(unsigned long *)($x0 + 0x40)' \
-      -ex 'printf "头缓冲区指针 = %p\n", $h' \
-      -ex 'x/32bx $h' \
-      -ex 'x/8wx $h' \
-      -ex 'printf "--- imgp 结构（找 ip_arch_size=0x10000）---\n"' \
-      -ex 'x/96gx $x0' \
-      -ex 'printf "--- ip_vp 是文件还是目录？---\n"' \
-      -ex 'set $vp = *(unsigned long *)($x0 + 0x20)' \
-      -ex 'printf "ip_vp = %p\n", $vp' \
-      -ex 'x/32gx $vp' \
       2>&1
   ) > "/tmp/${PREFIX}.exec.log" 2>&1 &
 fi
