@@ -73,9 +73,32 @@ python3 - "$RAW" "$OUT" <<'PY'
 import sys, importlib.util
 from pathlib import Path
 raw, out = Path(sys.argv[1]), Path(sys.argv[2])
-cands = list(Path('.').glob('UniXNU/drivers/DarwinBoot/Test/packed_ramdisk.py')) + \
-        list(Path('..').glob('UniXNU/drivers/DarwinBoot/Test/packed_ramdisk.py')) + \
-        list(Path('.').glob('drivers/DarwinBoot/Test/packed_ramdisk.py'))
+import os
+cands = []
+# 先看几个已知位置
+for base in ('.', '..', 'UniXNU', '../UniXNU'):
+    b = Path(base)
+    if not b.is_dir():
+        continue
+    for rel in ('drivers/DarwinBoot/Test/packed_ramdisk.py',
+                'Test/packed_ramdisk.py'):
+        f = b / rel
+        if f.is_file():
+            cands.append(f)
+# 再做一次有限深度的搜索
+if not cands:
+    for base in ('..', '.', '../UniXNU', 'UniXNU'):
+        b = Path(base)
+        if not b.is_dir():
+            continue
+        for root, dirs, files in os.walk(b):
+            # 跳过体积大的目录
+            dirs[:] = [d for d in dirs if d not in ('.git', 'out', 'build', 'refer', '.cache')]
+            if 'packed_ramdisk.py' in files:
+                cands.append(Path(root) / 'packed_ramdisk.py')
+                break
+        if cands:
+            break
 if not cands:
     sys.exit('找不到 packed_ramdisk.py')
 spec = importlib.util.spec_from_file_location('packed_ramdisk', cands[0])

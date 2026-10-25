@@ -19,9 +19,8 @@ jobs:
         run: git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
 
       - name: 生成最小 Data 种子
-        working-directory: device
         run: |
-          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log
+          bash device/scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log
           echo "---- UUID ----"
           cat "$RUNNER_TEMP/seed.dbr.uuid"
           ls -l "$RUNNER_TEMP/seed.dbr"
