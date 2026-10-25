@@ -81,6 +81,12 @@ if [ -n "${CATCH_EXEC:-}" ]; then
       -ex 'printf "头缓冲区指针 = %p\n", $h' \
       -ex 'x/32bx $h' \
       -ex 'x/8wx $h' \
+      -ex 'printf "--- imgp 结构（找 ip_arch_size=0x10000）---\n"' \
+      -ex 'x/96gx $x0' \
+      -ex 'printf "--- ip_vp 是文件还是目录？---\n"' \
+      -ex 'set $vp = *(unsigned long *)($x0 + 0x20)' \
+      -ex 'printf "ip_vp = %p\n", $vp' \
+      -ex 'x/32gx $vp' \
       2>&1
   ) > "/tmp/${PREFIX}.exec.log" 2>&1 &
 fi
@@ -117,7 +123,7 @@ fi
 if [ -n "${CATCH_EXEC:-}" ]; then
   echo
   echo "===== load_machfile 捕获 ====="
-  grep -av '^warning' "/tmp/${PREFIX}.exec.log" 2>/dev/null | head -30
+  grep -av '^warning' "/tmp/${PREFIX}.exec.log" 2>/dev/null | head -70
 fi
 
 echo

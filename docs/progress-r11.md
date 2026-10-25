@@ -2076,3 +2076,53 @@ if (vap->va_data_size == 0) {
 ✅ 排除 AMFI / Mach-O 格式 / 内存不足
 ⬜ APFS 读文件内容返回 0 → init exec 失败（唯一剩余阻塞点）
 ```
+
+---
+
+## 3.37 定位完成：镜像正确，内核 APFS 解析错误（2026-10-26 01:40）
+
+### 决定性对比
+
+| 检查者 | 结果 |
+|---|---|
+| Linux `fsapfsmount`（libfsapfs） | `/sbin/launchd` 65536 B, 0755, root:root, inode 5 — **完全正确** |
+| 内核 APFS（v2236） | `vap->va_data_size = 0x3000000`（= 容器 block_count×block_size），读取内容得到块 0（NXSB） |
+
+**结论：镜像与文件都没有问题，是内核侧 APFS 驱动解析本卷 inode 时出错。**
+`va_data_size = nx_block_count × nx_block_size` 这个巧合是铁证：
+驱动把 inode 的读取位置解析成了 0 号块，于是"inode"内容就是容器超级块本身。
+
+### 已排除（本轮全部有实证）
+
+* 文件未写入 / 权限 / 目录缺失 → fsapfsmount 可读
+* APFS 内联存储 → 数据在块首对齐的普通块里
+* 零长度文件（exec_check_permissions 的 ENOEXEC 分支）→ 实际 size 是 48 MB，不是 0
+* exec 对象是目录（会返回 EACCES）→ 实际返回 ENOEXEC，说明是普通文件
+* AMFI（`mac_vnode_check_exec` 返回 0）
+* HFS（内核无 HFS 驱动符号）
+* mockfs（存在，但只建 ROOT/DEV，无 /sbin/launchd）
+
+### 可疑点：卷特性版本
+
+```
+fsapfsinfo: Compatible features 0x2 = NX_FEATURE_LCFD
+```
+
+本卷由 **macOS 15 runner** 创建，而内核是 **iOS 17 的 apfs-2236**。
+特性集差异是当前最合理的解释方向。
+
+### 下一步实验（按成本排序）
+
+| # | 动作 | 判定 |
+|---|---|---|
+| 1 | CI 改用 `macos-13` 造 seed，再 `fsapfsinfo` 对比特性位 | LCFD 消失 → 假设成立 |
+| 2 | 用 `newfs_apfs` 显式参数造卷（若能关闭新特性） | 同上 |
+| 3 | 在真机 Data 分区上截取一个最小镜像作为种子 | 最贴近目标环境，但需要设备 |
+| 4 | 内核侧：给 apfs kext 打补丁/换版本 | 工作量大 |
+
+### 本轮新增工具
+
+```
+fsapfsmount / fsapfsinfo（libfsapfs-utils）—— Linux 侧独立验证 APFS 镜像
+scripts/qemu-run-r11.sh 的 CATCH_EXEC 模式 —— dump imgp / vnode / 头缓冲区
+```
