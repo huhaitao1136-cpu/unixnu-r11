@@ -2176,3 +2176,52 @@ ADT:   make-r11-adt.py --data-ramdisk --root-match-volume-uuid <UUID>
 * `mac_vnode_check_exec` 放行（AMFI 不是阻塞点）
 * exec 的对象是**普通文件**（否则返回 EACCES 而不是 ENOEXEC）
 * 内核无 HFS；mockfs 存在但只有 ROOT/DEV 节点
+
+---
+
+## 3.39 卷属性假设排除；HFS 确认不存在（2026-10-26 03:50）
+
+### 本轮实验与结果
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| 卷名改 `OwnerData` + 32 MB（对齐官方 fixture） | `fsapfsinfo` 显示 `Name: OwnerData` ✓ | 卷名生效 |
+| 同上，QEMU 断点 dump 头缓冲区 | 仍是 APFS obj_phys（NXSB 结构） | **卷名/尺寸都不是原因** |
+| 搜索内核 HFS 支持 | `Apple_HFS` 仅出现在 IOMedia 匹配字典与分区类型表；无 hfs_vfsops | **内核无 HFS 驱动** |
+| `fsapfsmount` 复核 | 三份 init 均可读、65536 B、0755 | 镜像侧无问题 |
+
+### 当前唯一阻塞点（已收敛到最小范围）
+
+```
+内核 APFS 读 /sbin/launchd 的 inode 时拿到块 0 的内容（NXSB）
+  ⇒ 文件大小被解析成 nx_block_count × nx_block_size = 48 MB
+  ⇒ magic 检查失败 → error = -1 → ENOEXEC → 三个候选全失败 → panic
+```
+
+### 下次的两条路径
+
+| # | 路径 | 说明 | 成本 |
+|---|---|---|---|
+| A | **拿 Apple 自制的 APFS 镜像**当 Data seed（IPSW 里的 RestoreRamDisk / OS DMG 提取） | 若 Apple 卷能读 → 证明是"我们卷的某种结构"问题；若也不能读 → 证明是内核 APFS 与我们的 md0 不匹配 | 中（需下载几 GB IPSW） |
+| B | **反汇编 APFS kext 段**（`0x4axxxxx`），定位 fs-tree 节点读取路径 | 最彻底，能直接看到块号为何变成 0 | 高 |
+
+### 已充分验证、无需再试的结论
+
+* `rd=md0` + 稠密 raw APFS（`--data-ramdisk`）能让内核挂载 Data 卷为根（真机 + QEMU）
+* 9 处 `msr PAN` 必须 nop（ARMv8.0 无 PAN），否则任何用户内存访问都 panic
+* AMFI 放行（`mac_vnode_check_exec` 返回 0）
+* exec 对象是普通文件（EACCES/EACCES 区分已做）
+* 镜像结构正确（Linux libfsapfs 独立验证）
+* 卷名、尺寸、macOS 版本、APFS 特性位（LCFD）都不是差异点
+
+### 今日（10-25 全天）总进度
+
+```
+① UEFI 固件               ✅
+② UniXNU 启动管理器        ✅
+③ DarwinBoot 交接 XNU     ✅
+④ 内核完整启动 + 日志上屏   ✅
+⑤ APFS 卷挂载为 BSD 根     ✅（真机 md0）
+⑥ PAN 补丁（EL0 前提）      ✅
+⑦ init exec               ⛔ APFS 驱动读 inode 返回块 0
+```

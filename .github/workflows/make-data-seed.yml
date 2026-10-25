@@ -23,7 +23,7 @@ jobs:
 
       - name: 生成最小 Data 种子
         run: |
-          bash device/scripts/make-data-seed.sh "$RUNNER_TEMP/seed" 48 2>&1 | tee /tmp/seed.log
+          bash device/scripts/make-data-seed.sh "$RUNNER_TEMP/seed" 32 2>&1 | tee /tmp/seed.log
           echo "---- UUID ----"
           cat "$RUNNER_TEMP/seed.uuid"
           ls -l "$RUNNER_TEMP/seed.raw" "$RUNNER_TEMP/seed.dbr" 2>/dev/null || true
