@@ -54,11 +54,8 @@ archives = [
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
-  # AES 子类驱动的两个归档暂时停用：上游 build-arm-driver.py 把 .o 写到 build/native-aes，
-  # 而 build-native-aes-bindings.py 去找 build/software-aes，两者不一致导致 CI 失败。
-  # 启动不需要 AES 加速器，等上游修好或我们自己补一个一致的脚本再加回来。
-  # "build-arm-driver.py NativeAES",
-  # "build-native-aes-bindings.py",
+  "build-arm-driver.py NativeAES",
+  "build-native-aes-bindings.py",
   # NativeSdhci 上游不存在（UniXNU 只有 NativeUfs）；第一阶段启动不需要 eMMC，
   # 后续要做 APFS 根卷时再自己实现 libNativeSdhci.a 并把它加回这里。
 # VIRTIO 归档已停用（R11 无 virtio）
@@ -73,7 +70,7 @@ archives = [
   "build-boot-progress.py",
   "build-libpthread-kernel.py",
   # 需要参考内核候选（native-prelink），bring-up 阶段先移除：
-  # "build-native-legacy-display.py",           # 先走 GOP/legacy 显示，DSI 原生驱动后补
+  "build-native-legacy-display.py",           # bsd_init 会引用 native_legacy_display_probe
 ]
 
 [kernel.prelink]
