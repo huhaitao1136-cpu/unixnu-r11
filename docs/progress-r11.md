@@ -2391,3 +2391,63 @@ build-xnu-4k-baseline.sh:
 
 方向 2：写一个内核侧的最小 Mach-O 加载器补丁（把 ramdisk 里已知偏移的 init 映像直接映射进用户地址空间并设好入口），
 可以完全绕开 APFS 的读取路径，直接验证 EL0 —— 与「先进入用户态」的目标一致，且不依赖外部资产。
+
+---
+
+## 3.43 突破：mockfs 让内核读到了我们的 Mach-O（错误码 8 → 86）（2026-10-27 00:40）
+
+### 关键实验
+
+用 **mockfs** 作为根文件系统，ramdisk 内容为裸 Mach-O（我们的 init，偏移 0）：
+
+```bash
+python3 -c "from pathlib import Path; src=Path('seed/init.macho').read_bytes(); Path('/tmp/init-rd.img').write_bytes(src)"
+# ADT: --data-ramdisk（RAMDisk 条目）
+# QEMU: rd=md0，ramdisk = 64 KB Mach-O
+```
+
+结果（panic 捕获）：
+
+```
+x0: "Process 1 exec of %s failed, errno %d"
+sp[0] = 0xfffffff0070c3020   ← 路径字符串 "/sbin/launchd"
+sp[1] = 0x56 = 86            ← errno = EBADEXEC
+```
+
+### 与之前 APFS 路径的对比
+
+| 根文件系统 | errno | 含义 |
+|---|---|---|
+| APFS（我们的卷 / Apple ramdisk） | **8** = ENOEXEC | 内核拿到的不是合法 Mach-O（读到块 0） |
+| **mockfs + 裸 Mach-O ramdisk** | **86** = EBADEXEC | 内核读到了合法 Mach-O 头，但后续校验拒绝 |
+
+**结论：mockfs 路径完全绕过了 APFS 的读取缺陷，内核已能正确读到我们的可执行文件。**
+
+### EBADEXEC 的可能来源（下一步要查）
+
+| 来源 | 说明 |
+|---|---|
+| AMFI / 代码签名 | 我们的 init 无签名、不在信任缓存；`EBADEXEC` 是 AMFI 拒绝的典型返回 |
+| `exec_mach_imgact` 的静态二进制校验 | 例如要求 `LC_MAIN`、`__LINKEDIT`、或 PIE 标志 |
+| mockfs 文件的 size = 设备大小 | exec 可能对"文件大小 64 KB 但段只覆盖 573 字节"有额外检查 |
+
+### 下一步的验证方法（明天）
+
+1. `CATCH_EXEC=1` 断 `exec_mach_imgact`，看返回值与 `ip_arch_size`（此时应等于 65536）
+2. 若返回 86 来自 AMFI：再断 `mac_vnode_check_exec`（mockfs 的 vnode 路径）
+3. 若来自 Mach-O 校验：对比 Apple ramdisk 里 launchd 的 Mach-O 结构（有无 `__LINKEDIT`、`LC_MAIN`、PIE、签名）
+
+### 今日（10-25 全天）最终进度
+
+```
+① UEFI 固件                ✅
+② UniXNU 启动管理器         ✅
+③ DarwinBoot 交接 XNU      ✅
+④ 内核完整启动 + 日志上屏    ✅
+⑤ APFS 卷挂载为 BSD 根      ✅（真机 + QEMU）
+⑥ PAN 全套补丁（EL0 前提）   ✅（5 个变体验证必需性）
+⑦ 内核读到我们的 Mach-O      ✅（mockfs 路径，错误码 8→86）
+⑧ EL0 执行                 ⛔ 卡在 EBADEXEC 校验
+```
+
+**距"用户态执行"只差最后一道校验。**
