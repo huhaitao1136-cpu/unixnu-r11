@@ -10,13 +10,13 @@
 set -euo pipefail
 
 OUT="${1:?用法: make-data-seed.sh <输出前缀> [逻辑MB]}"
-SIZE_MB="${2:-48}"
+SIZE_MB="${2:-32}"
 WORK="$(mktemp -d /tmp/r11-seed-XXXXXX)"
 MNT="$WORK/mnt"
 
 echo "== 建 ${SIZE_MB} MB APFS 镜像"
 mkdir -p "$MNT"
-hdiutil create -size "${SIZE_MB}m" -fs APFS -layout NONE -volname "Data" "$WORK/seed.dmg" >/dev/null
+hdiutil create -size "${SIZE_MB}m" -fs APFS -layout NONE -volname "OwnerData" "$WORK/seed.dmg" >/dev/null
 hdiutil attach "$WORK/seed.dmg" -mountpoint "$MNT" -nobrowse >/dev/null
 
 echo "== 读取 APFS 卷 UUID"
