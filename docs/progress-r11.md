@@ -2278,3 +2278,57 @@ scripts/fetch-ipsw-member.py      HTTP Range 取 IPSW 单个成员（不用下 6
 内核 → 挂载 APFS → 查找文件 → 读取内容   ⛔ 最后一步读到的总是块 0
 根因方向：4 KB 内核页 vs 16 KB APFS kext 页假设
 ```
+
+---
+
+## 3.41 CI 内核构建推进到链接阶段：缺 IOStorageFamily（2026-10-26 23:40）
+
+### 本轮改动与结果
+
+| 改动 | 目的 | 结果 |
+|---|---|---|
+| defconfig `CONFIG_XNU_NATIVE_RAM_BLOCK=y` | 启用块存储驱动 | 归档成功编译 |
+| defconfig `CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n` | 让 bsd_init 不再引用 display probe | ✅ 之前 `audit-mobile-graphics-legacy` 的失败消失 |
+| board.toml 注释 `build-native-legacy-display.py` | 同上 | ✅ |
+| board.toml 加 `build-arm-driver.py NativeRamBlock` | 启用驱动 | ✅ 编译并进入链接 |
+
+### 链接失败的两类符号
+
+```
+1) IOStorageFamily 的实现（来自 libNativeRamBlock.a）
+   IOBlockStorageDevice::gMetaClass / init(OSDictionary*) / requestIdle() /
+   doUnmap(...) / vtable for IOBlockStorageDevice ...
+
+2) NativeUfs 持久化层（我们的 r11-stubs 缺两个）
+   _native_ufs_store_gpt_check
+   _native_ufs_store_mode
+```
+
+第 2 类已在本轮补进 `package/r11-stubs/ufs-store-stubs.c`（返回 -1）。
+
+第 1 类是**块存储栈的根本缺口**：`prepare-storage-headers.py` 只准备了 19 个公共头，
+没有 IOStorageFamily 的实现。这正是 board.toml 早期注释所说的
+「第一阶段不启用块存储栈（依赖参考内核候选），改用 mockfs」。
+
+### 打通块存储的两条路线
+
+| 路线 | 做法 | 代价 |
+|---|---|---|
+| A | 给 IOStorageFamily 做"链接桩"归档：提供 `IOBlockStorageDevice` 的 vtable 与方法符号（返回错误），让内核能链接；prelink 时若 Apple 的 IOStorageFamily kext 提供真实实现则自动覆盖 | 中：需要按 C++ 修饰名精确钉符号 |
+| B | 把 `refer/IOStorageFamily` 的真实源码编进内核 | 中～高：需要构建脚本支持与版本匹配 |
+
+### 已确认的上游事实（本轮）
+
+* 内核构建脚本用 `KERNEL_EXTRA_ARCHIVES + -Wl,-force_load` 收集可选归档，
+  **没有** ramblock 专属分支 —— 说明 NativeRamBlock 是通过 board.toml 的 archives
+  编译后由脚本的通用逻辑链接（本轮已验证它确实被链接）。
+* `XNU_NATIVE_LEGACY_DISPLAY`（0/1）控制 bsd_init 是否引用 display probe；
+  设为 0 后即可安全移除 legacy-display 归档。
+* 内核当前**没有任何块设备驱动**（无 virtio / USB mass storage 符号），
+  因此无法在 QEMU 里用真实块设备验证 APFS 读取。
+
+### 下一步（明天）
+
+1. 验证 `r11-stubs` 新增的两个符号让链接错误减少到只剩 IOStorageFamily
+2. 为 IOStorageFamily 生成链接桩（路线 A）
+3. 链接通过后，ADT 改 `--packed-data-ramdisk`，在 QEMU 里用 Apple ramdisk 验证 APFS 读文件是否恢复

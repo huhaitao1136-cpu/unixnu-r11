@@ -23,6 +23,15 @@ int r11_store_write(u64 lba, const void *buffer, u64 bytes)
 int r11_store_sync(void)
     __asm__("_native_ufs_store_sync");
 
+/* NativeRamBlock::attachStore() 还会引用这两个符号。
+ * 它们同样属于 NativeUfs 的持久化层（依赖 VerifiedRoot），bring-up 阶段返回 -1，
+ * 表示"没有可用的 GPT 校验 / 模式查询"，驱动会走内存盘的只读路径。 */
+int r11_store_gpt_check(void)
+    __asm__("_native_ufs_store_gpt_check");
+int r11_store_mode(void)
+    __asm__("_native_ufs_store_mode");
+
+
 int r11_legacy_display_probe(void)
     __asm__("_native_legacy_display_probe");
 int r11_legacy_display_late_probe(void)
@@ -53,6 +62,16 @@ int r11_store_write(u64 lba, const void *buffer, u64 bytes)
 }
 
 int r11_store_sync(void)
+{
+  return -1;
+}
+
+int r11_store_gpt_check(void)
+{
+  return -1;
+}
+
+int r11_store_mode(void)
 {
   return -1;
 }
