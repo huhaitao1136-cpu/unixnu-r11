@@ -1833,3 +1833,191 @@ XNU arm64 系统调用约定：`x16` = 调用号，`svc #0x80`，出错置 carry
 * **真机持久存储驱动缺失**：eMMC（SDHCI）驱动未实现，System 卷（iOS 用户态，数十 GB）
   无法放置 → 真正跑起 launchd 必须先做存储驱动
 * 完整 iOS 用户态还依赖 dyld、共享缓存、系统库与大量平台服务，不是单个二进制能解决的
+
+---
+
+## 3.33 EL0 用户态验证：卡在 init exec 被拒（2026-10-25 21:15）
+
+### 已确定的事实链
+
+| 步骤 | 证据 |
+|---|---|
+| Data seed 交给内核 | `Added memory device md0/rmd0 (03000000/0E000000) ... for 0x3000000` |
+| APFS 成为根 | `BSD root: md0, major 3, minor 0` |
+| 内核初始化完成 | `VM Swap Subsystem is ON` / `Serial keyboard started` |
+| 开始加载 init | `Load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development` |
+| exec 失败且内核进入调试器死等 | QEMU gdb：PC 落在 `_panic_trap_to_debugger+0x2fc` 的 `wfe` 循环 |
+
+**结论：内核选定了 md0 作为根并尝试 exec `/usr/appleinternal/sbin/launchd.development`，
+但 exec 未成功，随后 panic → 进 `panic_trap_to_debugger` 自旋。**
+
+### init 的候选路径（源码确认，kern_exec.c:7104-7109）
+
+```
+/usr/appleinternal/sbin/launchd.debug        (仅 DEBUG)
+/usr/appleinternal/sbin/launchd.development  (DEVELOPMENT || DEBUG)
+/sbin/launchd                                (所有构建)
+```
+
+DEVELOPMENT 内核里 `launchdsuffix` boot-arg 可以覆盖第一项；
+全部失败后 `panic("Process 1 exec of %s failed, errno %d")`（kern_exec.c:7197）。
+
+### 最小 init 程序（已通过静态验证）
+
+```
+scripts/make-minimal-init.py   → seed/init.macho (573 B)
+scripts/verify-macho.py        → 头/命令/段/节/入口/反汇编/字符串 全部 OK
+```
+
+* 手写 18 条 ARM64 指令，无 SDK：`open("/dev/console")` → `write` 标记串 → `write(1)` → `b .`
+* `LC_SEGMENT_64 __TEXT`（vmaddr 0x100000000，fileoff 0，RX）+ `LC_UNIXTHREAD`（ARM64，pc=入口）
+* 内核侧确认会构造 argv/envp 栈（`execve(p, &init_exec_args)`），所以 sp 不用我们设
+
+### 排掉的可能性
+
+| 假设 | 排除依据 |
+|---|---|
+| 内核内存不足 | QEMU 提到 4 GB 后 DarwinBoot 交接成功 |
+| init 文件不在 seed 里 | CI 日志显示三条路径都已写入 573 B |
+| 路径写错 | `Load_init_program` 打印的正是我们放的路径 |
+| 我们误判为"卡死" | 曾以为是死锁；gdb 显示实际停在 panic 调试器自旋 |
+
+**调试陷阱（重要）**：QEMU 配置里原来的 `debug=0x8` 是 **DB_KDB**（内核调试器），
+一旦异常就进 `wdt` 式自旋且不打印，掩盖了真正的 panic 文本。已改为
+`-v serial=3 keepsyms=1 rd=md0`。
+
+### 尚未排除的三条假设（按可能性排序）
+
+1. **AMFI / 代码签名拒绝**：ADT 里设了 `amfi-only-platform-code=1`，我们的 init 无签名、
+   也不在信任缓存里。这次加了 `amfi_get_out_of_my_way=1 cs_enforcement_disable=1` 仍未执行，
+   但这两个 boot-arg 在 iOS 17 系内核上大概率已失效 → 需要**真正的信任缓存或 ad-hoc 签名**。
+2. **Mach-O 结构仍缺项**：例如需要 `__PAGEZERO`、`LC_MAIN`，或内核要求 `__LINKEDIT`。
+   （`kern_exec.c` 只校验 `MH_EXECUTE` + 架构 grade，但 `load_machfile` 内部还有段布局检查）
+3. **静态（无 dyld）二进制在 arm64 iOS 上不受支持**：需要 `LC_LOAD_DYLINKER`。
+
+### 下一步（按成本从低到高）
+
+| # | 实验 | 成本 |
+|---|---|---|
+| 1 | 用 `load_machfile` 的返回码定位：在 QEMU 里用 gdb 设断点在内核 exec 返回处，直接读 x0 | 低（需 gdb 符号） |
+| 2 | 给 init 加 `__PAGEZERO` + `LC_MAIN` 变体，看行为是否变化 | 低 |
+| 3 | 生成 ad-hoc 代码签名（CodeDirectory + LC_CODE_SIGNATURE）并做信任缓存 | 中 |
+| 4 | 在 QEMU 里对 exec 路径打日志补丁（内核侧 printf 到屏幕） | 中 |
+| 5 | 换真机验证（真机 4 GB，AMFI 行为可能与 QEMU 不同） | 低但占用设备 |
+
+### 已知问题清单
+
+* 用户态执行**尚未证实**（`R11_EL0_INIT_OK` 未出现）
+* 无法读取 panic 文本：`panic_info`/`debug_buf` 全为 0（内核未启用 debug buffer），
+  `msgbuf` 无符号；panic 打印似乎未走到我们 patch 出来的图形控制台
+* 真机持久存储（eMMC）驱动仍未实现 → 无法放置 iOS 用户态
+
+---
+
+## 3.34 EL0 验证的完整进展（2026-10-25 23:00）
+
+### 今晚新确认的事实（按证据强度排序）
+
+| # | 结论 | 证据 |
+|---|---|---|
+| 1 | 内核**必须**打 PAN 补丁才能在 ARMv8.0 上跑用户态 | `_copyout+0x5c` 是 `msr PAN,#0`（ARMv8.1），A72/A73 无此指令 → sleh panic「Undefined kernel instruction: pc=... instr=d500409f」；改 nop 后正常 |
+| 2 | MAC/AMFI **放行**我们的 init | gdb：`mac_vnode_check_exec` 返回 0 |
+| 3 | `exec_mach_imgact` 返回 **-1** | gdb 在调用者返回点读到 x0=0xffffffff |
+| 4 | -1 来自 **filetype 检查** | 反汇编 `0x76cca78: ldr w8,[x24,#0xc]; cmp w8,#2; b.ne → mov w0,#-1` |
+| 5 | 我们的文件头本身**完全合法** | seed 里 magic×3、`02 00 00 00`(filetype=2)@偏移12、sizeofcmds=440 全部正确 |
+| 6 | panic 时用的是 `/sbin/launchd` 路径 | panic 参数区 sp[0]=VA→文件偏移 0xbf020 = `"/sbin/launchd"`，说明三条候选都失败 |
+
+**矛盾点（下次要解的）：** 文件里偏移 12 明明是 2，内核读到的缓冲区却让 `cmp w8,#2` 失败
+→ 必须 dump 内核的 `x24`（头缓冲区）才能定性：全 0（读失败）/ 别的文件 / 其它。
+
+### 已完成的修复（真机与 QEMU 都适用）
+
+```
+scripts/patch-kernel-pan.py     9 处 msr PAN → nop（copyin/copyout/pmap_test_access）
+```
+
+`/tmp/k-pan.macho` 是打好补丁的内核；真机 payload 里的 kernel.macho 也需要打同样的补丁
+（可直接调用该脚本，或并入 patch-payload-full.py）。
+
+### 调试工具链（本轮新增，全部可复用）
+
+```
+scripts/qemu-run-r11.sh      CATCH_PANIC=1 / CATCH_EXEC=1 两种 gdb 捕获模式
+scripts/analyze-inasm.py     把 -d in_asm 轨迹映射到内核符号（定位 panic 前调用链）
+scripts/qmp-regs.py          QMP 读 CPU 寄存器
+scripts/ppm2png.py           纯标准库 PPM→PNG
+scripts/make-minimal-init.py 手写 ARM64 Mach-O（573 B）
+scripts/verify-macho.py      静态校验（头/段/节/入口/反汇编/字符串/段长度）
+```
+
+### 关键调试经验（避免以后再踩）
+
+1. **`debug=0x8` 会打开 KDB**：一旦异常就静默 wfe，看不到 panic 文本 —— 调试 QEMU 时要删掉
+2. **`cs_enforcement_disable=1` 会让 AMFI 直接 panic**（"can't has cs_enforcement_disable"）
+3. gdb + `-s` + `hbreak *_panic` 是**拿到 panic 文本最可靠的方式**（x0=格式串、x1..=参数）
+4. gdb 不支持 Mach-O 符号 → 先用 `llvm-nm` 取地址，再按裸地址下断点
+5. `$x30` 等在 `-ex` 里必须用**单引号**，否则被 bash 展开
+6. 二进制 patch 脚本必须校验读到的内容非空（本轮曾把脚本写成空文件）
+
+### 下一步（明天从这里继续）
+
+1. `CATCH_EXEC=1` 断 `0xfffffff0076cca78`，dump `x24` 指向的 32 字节
+   —— 这一条决定「读失败」还是「读到别的文件」
+2. 若读到的是全 0 → 查 APFS 读取路径（可能是 seed 的元数据问题）
+3. 若是别的内容 → 查路径解析（`/usr/appleinternal/sbin/launchd.development` 是否指向我们的 inode）
+4. 若确认全对但检查仍失败 → 在 `ldr w8,[x24,#0xc]` 之后读 `w8` 的实际值
+
+---
+
+## 3.35 关键转折：ENOENT 与 ENOEXEC 是两个独立问题（2026-10-25 23:20）
+
+### 屏幕上终于看到的完整失败链
+
+```
+Load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+Load_init_program: attempting to load /sbin/launchd
+Load_init_program: failed loading /sbin/launchd: errno 8
+```
+
+按 `kern_exec.c` 的逻辑（非 ENOENT 才打印 "failed loading"）：
+
+| 路径 | 返回值 | 结论 |
+|---|---|---|
+| `/usr/appleinternal/sbin/launchd.development` | ENOENT | 路径查找失败（文件/目录不存在或不可达） |
+| `/sbin/launchd` | ENOEXEC(8) | 找到了文件，但被判定为不可执行 |
+
+已经验证 seed 镜像里**存在**这些名字（`appleinternal`×2、`launchd.development`×2、`launchd.debug`×2），
+所以 ENOENT 不是"没写进去"，而是**路径/权限层面**的问题。
+
+### ENOEXEC 的可能来源
+
+`exec_activate_image` 里有一条早于 Mach-O 解析的检查：
+
+```c
+/* Disallow zero length files */
+if (vap->va_data_size == 0) {
+        return ENOEXEC;
+}
+```
+
+如果 APFS 报告的 `va_data_size` 为 0（或读取失败），就会**直接 ENOEXEC**，
+完全不会进入 `exec_mach_imgact` —— 这解释了为什么最后一次断在
+`0xfffffff0076cca78`（filetype 检查）**没有命中**。
+
+另一个来源是 `error == -1`（magic/filetype 检查失败）转换为 ENOEXEC，
+之前一次运行确实观测到 `exec_mach_imgact` 返回 -1。
+
+### 下次继续的两条命令
+
+1. 断 `_exec_mach_imgact` 入口（0xfffffff0076cc9d0），确认这一次是否被调用：
+   * 命中 → 问题在 Mach-O 解析（继续 dump `x24` 指向的头 32 字节）
+   * 不命中 → 问题在 size==0 或权限检查（查 APFS 报告的 `va_data_size`）
+2. 若怀疑 size==0：在 `exec_activate_image` 的 size 检查处下断点，读 `vap->va_data_size`
+
+### 修复优先级
+
+| # | 动作 | 目的 |
+|---|---|---|
+| 1 | 用 boot-arg `launchdsuffix=release` 强制只试 `/sbin/launchd` | 排除路径差异，聚焦单一失败点 |
+| 2 | seed 里改用 `chown 0:0` + `chmod 0755`，并显式 `sync` 后再 detach | 排除 size/权限元数据问题 |
+| 3 | 在 CI 里 `hdiutil attach` 后 `ls -l` 打印三个路径的**大小与权限** | 直接确认文件元数据 |

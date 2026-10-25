@@ -144,14 +144,25 @@ def build_macho():
 
 
 def main():
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('build/init.macho')
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    pad = 0
+    for a in sys.argv[1:]:
+        if a.startswith('--pad='):
+            pad = int(a.split('=', 1)[1], 0)
+    out = Path(args[0]) if args else Path('build/init.macho')
     out.parent.mkdir(parents=True, exist_ok=True)
     blob, entry, code_off, instr_len = build_macho()
+    if pad and len(blob) < pad:
+        # 填充到指定大小：避免 APFS 把小文件内联存放在 inode 里，
+        # 那样 iOS 的 APFS 读取路径可能返回元数据块而不是文件内容。
+        blob = bytes(blob) + b'\0' * (pad - len(blob))
     out.write_bytes(blob)
     print(f'已生成 {out}  ({len(blob)} B)')
     print(f'  入口 VA     : 0x{entry:016X}（文件偏移 0x{code_off:X}）')
     print(f'  指令长度    : {instr_len} B（{instr_len // 4} 条）')
     print(f'  标记串      : {MARKER!r}')
+    if pad:
+        print(f'  已填充到    : {len(blob)} B（--pad={pad}）')
     return 0
 
 

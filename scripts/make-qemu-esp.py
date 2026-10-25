@@ -40,7 +40,7 @@ id = "xnu"
 title = "XNU kernel"
 type = "xnu"
 path = "Payloads/kernel.macho"
-{initrd_line}args = "-v serial=3 debug=0x8 rd=md0"
+{initrd_line}args = "-v serial=3 keepsyms=1 rd=md0"
 """
 
 

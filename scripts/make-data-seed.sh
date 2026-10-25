@@ -63,12 +63,14 @@ if [ -f "$INIT_BIN" ]; then
   echo "== 安装最小 init（$(stat -f%z "$INIT_BIN") B）"
   mkdir -p "$MNT/sbin" "$MNT/usr/appleinternal/sbin"
   # kern_exec.c 的候选顺序：launchd.debug → launchd.development → /sbin/launchd
+  # 目录必须存在且可遍历，否则内核 namei 会返回 ENOENT
+  chmod 755 "$MNT/usr" "$MNT/usr/appleinternal" "$MNT/usr/appleinternal/sbin" "$MNT/sbin" 2>/dev/null || true
   for target in /usr/appleinternal/sbin/launchd.debug \
                 /usr/appleinternal/sbin/launchd.development \
                 /sbin/launchd; do
     cp "$INIT_BIN" "$MNT$target"
     chmod 755 "$MNT$target"
-    echo "   $target"
+    echo "   $target  $(ls -l "$MNT$target" | awk '{print $1, $5}')"
   done
 else
   echo "!! 找不到 $INIT_BIN，seed 里不会有 init"
