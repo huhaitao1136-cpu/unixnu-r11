@@ -70,7 +70,11 @@ archives = [
   "build-boot-progress.py",
   "build-libpthread-kernel.py",
   # 需要参考内核候选（native-prelink），bring-up 阶段先移除：
-  "build-native-legacy-display.py",           # bsd_init 会引用 native_legacy_display_probe
+  # legacy display 需要参考内核候选（native-prelink），CI 里拿不到；
+  # 用 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n 让 bsd_init 不再引用它。
+  # "build-native-legacy-display.py",
+  # 块存储栈：把 PackedRAMDisk 变成真正的块设备（APFS 才能正常读文件）
+  "build-arm-driver.py NativeRamBlock",
 ]
 
 [kernel.prelink]

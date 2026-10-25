@@ -2225,3 +2225,56 @@ ADT:   make-r11-adt.py --data-ramdisk --root-match-volume-uuid <UUID>
 ⑥ PAN 补丁（EL0 前提）      ✅
 ⑦ init exec               ⛔ APFS 驱动读 inode 返回块 0
 ```
+
+---
+
+## 3.40 补丁矩阵收敛 + 页大小不匹配假设（2026-10-26 23:30）
+
+### 补丁必要性矩阵（QEMU，Apple ramdisk 作为 initrd）
+
+| 变体 | trap 修复 | mrs PAN | CPU 校验 | PAN nop | 结果 |
+|---|---|---|---|---|---|
+| full | ✓ | →1 | ✓ | ✓ | 启动成功，APFS 读文件失败（ENOEXEC） |
+| A | ✗ | ✗ | ✓ | ✓ | zone_init 阶段 panic |
+| C | ✓ | ✗（未改） | ✓ | ✓ | `Undefined kernel instruction: instr=d5384268`（mrs PAN） |
+| D | ✓ | →0 | ✓ | ✓ | `panic: context switch with PAN disabled` |
+| E | ✓ | →1 | ✗ | ✓ | `panic: CPU configuration in device tree is invalid` |
+
+**结论：`patch-kernel-full.py` 的补丁集已经是最小必需集**
+（PAN nop + mrs PAN→1 + 0xE7FFDEFF trap→nop + CPU 校验+输出开关+serial_init+cons_ops_index），
+APFS 读文件失败与本项目补丁无关。
+
+### 关键新线索：页大小
+
+* 内核由 `scripts/build-xnu-4k-baseline.sh` 构建 → **4 KB 页**
+* 启动日志显示 `SKIO: skmem_region_init seg_size 16384`
+* APFS kext 来自 Apple 预编译（iOS 上为 **16 KB 页** 假设）
+
+假设：**APFS 的页缓存（ubc）路径按 16 KB 页计算偏移，在 4 KB 内核上错位**，
+而元数据走块设备读写（buf_strategy，按 4 KB 块）不受影响。
+这解释了"能挂载、能查找、但读不出文件内容"，也解释了 Apple 原版 ramdisk 同样失败。
+
+### 验证该假设的方法
+
+| # | 方法 | 说明 |
+|---|---|---|
+| 1 | 查内核构建的 page size 配置 | `configs/r11_defconfig` 里 `PAGE_SIZE`/`ARM64_PGSZ` 相关项 |
+| 2 | 查 APFS kext 的页大小假设 | kext 二进制里 `_page_size`/`PAGE_SHIFT` 相关常量，或 misalignment 检查 |
+| 3 | 用 16 KB 页重新构建内核 | 需要改 UniXNU 的构建设置；CI 内核构建目前仍受阻 |
+| 4 | 对比：4 KB 页内核 + 4 KB 页的 APFS kext | 需要 Apple 的 4 KB 版本 kext（不存在于 iOS） |
+
+### 相关资产（本轮新增）
+
+```
+scripts/patch-kernel-minimal.py   可分段打补丁：--with-validate / --with-trapfix / --with-mrs0 / --with-mrs1
+/tmp/k-vA..vE.macho               五个变体内核（QEMU 已验证各自行为）
+/tmp/rrd-apfs.img                 Apple 恢复 ramdisk（186 MB，裸 APFS，含真 launchd）
+scripts/fetch-ipsw-member.py      HTTP Range 取 IPSW 单个成员（不用下 6 GB）
+```
+
+### 今日结论
+
+```
+内核 → 挂载 APFS → 查找文件 → 读取内容   ⛔ 最后一步读到的总是块 0
+根因方向：4 KB 内核页 vs 16 KB APFS kext 页假设
+```
