@@ -69,6 +69,8 @@ def main() -> int:
     ap.add_argument('--payload', required=True, type=Path)
     ap.add_argument('--seed', required=True, type=Path)
     ap.add_argument('--uuid', required=True)
+    ap.add_argument('--raw', action='store_true',
+                    help='seed 是稠密原始 APFS（用 --data-ramdisk），否则按 DBRDISK1 打包（--packed-data-ramdisk）')
     ap.add_argument('--adt-tool', type=Path,
                     default=Path('/root/src/UniXNU/out/r11/tree/scripts/make-r11-adt.py'))
     a = ap.parse_args()
@@ -113,7 +115,7 @@ def main() -> int:
         '--cpu-regs', board['cpu_regs'],
         '--psci-method', board['psci'],
         '--unique-chip-id', chip_hex,
-        '--packed-data-ramdisk',
+        '--data-ramdisk' if a.raw else '--packed-data-ramdisk',
         '--persistent-data',
         '--ipad-identity',
     ]

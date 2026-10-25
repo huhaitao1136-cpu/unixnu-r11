@@ -23,17 +23,18 @@ jobs:
 
       - name: 生成最小 Data 种子
         run: |
-          bash device/scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log
+          bash device/scripts/make-data-seed.sh "$RUNNER_TEMP/seed" 48 2>&1 | tee /tmp/seed.log
           echo "---- UUID ----"
-          cat "$RUNNER_TEMP/seed.dbr.uuid"
-          ls -l "$RUNNER_TEMP/seed.dbr"
+          cat "$RUNNER_TEMP/seed.uuid"
+          ls -l "$RUNNER_TEMP/seed.raw" "$RUNNER_TEMP/seed.dbr" 2>/dev/null || true
 
       - name: 上传 seed
         uses: actions/upload-artifact@v4
         with:
           name: r11-data-seed
           path: |
+            ${{ runner.temp }}/seed.raw
             ${{ runner.temp }}/seed.dbr
-            ${{ runner.temp }}/seed.dbr.uuid
+            ${{ runner.temp }}/seed.uuid
             /tmp/seed.log
           if-no-files-found: error

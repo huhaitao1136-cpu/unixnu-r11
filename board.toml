@@ -152,7 +152,7 @@ volume = "R11ESP"
 # boot 分区只有 64 MiB（0x4000000），而负载是 boot.img 的 ramdisk：
 # header(4K) + kernel(BootShim+gzip FD ~4M) + dtb(~350K) 之后只剩 ~58 MiB。
 # 因此不能用 sheng 的 192；Data 种子必须走 packed 形式。
-size_mib = 56
+size_mib = 128
 loader = "firmware"
 title = "Boot"
 dram_size = "0xFE4C0000"           # 实测：bank0 0x80000000+2GiB，bank1 0x100000000+0x7E4C0000，首尾相接
