@@ -17,8 +17,12 @@ jobs:
         with:
           path: device
 
-      - name: 取出 UniXNU 主仓库
-        run: git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
+      - name: 取出 UniXNU 主仓库（固定 commit，避免上游更新导致补丁不适用）
+        run: |
+          git clone https://github.com/UniXNU/UniXNU.git UniXNU
+          cd UniXNU
+          git checkout e88eaf95c9e8aab75bf93b7380fb68ea92f130e4
+          git log --oneline -1
 
       - name: 缓存源码与编译对象
         uses: actions/cache@v4
