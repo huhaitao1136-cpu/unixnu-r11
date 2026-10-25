@@ -1741,3 +1741,95 @@ scripts/find-code-cave.py          ← 找 NOP 空洞放 trampoline
 * 最后卡在哪个子系统
 
 下一步应该看日志**末尾**停在哪里（IOFindBSDRoot / bsd_init）。
+
+---
+
+## 3.32 根文件系统挂载成功：Data seed → md0 → APFS（2026-10-25 夜）
+
+### 结果（真机 OPPO R11 屏幕日志）
+
+```
+Added memory device md0/rmd0 (03000000/0E000000) at FFFFFFFF008570000 for 0000000030000000
+BSD root: md0, major 3, minor 0
+spec_open : si_devbsdunit initialized to (0), throttle_mask is (0x0), issd is (0)
+Serial keyboard started
+vm_free_delayed_pages: initialized 0 free pages
+VM Swap Subsystem is ON
+No POST boot-arg set.
+Load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+```
+
+含义：XNU 已把内存块设备 **md0** 选为 BSD 根设备（APFS 挂载完成），并进入
+`Load_init_program` 阶段开始查找/加载第一个用户态程序。
+
+### 关键结论：三条容易踩的坑
+
+| 现象 | 真因 | 解法 |
+|---|---|---|
+| 内核一直 `Waiting on <dict ... IONetworkMedia>` / `... IOMedia UUID=...` | `/chosen/root-matching` 的 UUID 与任何卷都不匹配；`--packed-data-ramdisk` 写的是 `PackedRAMDisk`，而 **XNU 只认 `RAMDisk`**（`IOKitBSDInit.cpp:766`） | 用稠密 raw APFS + `--data-ramdisk`（ADT 里生成 `RAMDisk` 条目），或者更彻底：**boot-arg `rd=md0`**，走源码里 `mdevlookup()` 的直接内存盘分支，完全绕开 UUID 匹配 |
+| DarwinBoot `boot refused: Out of Resources` | 48 MB ramdisk + 54 MB 内核 + 内核窗口，在 2 GB 内存下分配失败 | 真机 4 GB 无碍；QEMU 需 `-m 4096` |
+| UniXNU 菜单停在 `timeout -1 ms, input yes` | `Menu.c:1158` `HasInput = (CountInputDevices() > 0)`，有输入设备就永远等按键（QEMU 的串口也算输入设备） | 真机本就没有可用 ConIn，会自动启动；QEMU 调试时可 patch `HasInput = FALSE` + `RemainingMs = 1500` |
+
+### Data seed 的构造与打包
+
+* 生成：`scripts/make-data-seed.sh`（macOS `hdiutil`）
+  * `hdiutil create -size 48m -fs APFS` → 写入最小目录 + `com.apple.purplebuddy.plist`
+  * `hdiutil convert -format UDRW` 得到**稠密 raw**（48 MB，XNU 内置 ramdisk 路径必须用它）
+  * 同时打印并写出 APFS **卷 UUID**（`<out>.uuid`）
+* 安装 init（本次新增）：把 `seed/init.macho` 复制到
+  `/sbin/launchd`、`/usr/appleinternal/sbin/launchd.development`、`/usr/libexec/launchd`，权限 0755
+* 身份：APFS 有两个 UUID —— 容器 UUID 与卷 UUID 不同；`root-matching` 要的是**卷 UUID**
+
+### payload / 固件参数（已确认可用）
+
+| 项 | 值 |
+|---|---|
+| payload 卷大小 | `board.toml [payload] size_mib = 128` |
+| 固件解压缓冲 | `R11_DECOMPRESS_SIZE / R11_MAX_VOLUME = 160 MiB` |
+| payload 内容 | `kernel.macho`(54 MB) + `kernel.macho.adt` + `scratch-data.img`(48 MB 稠密 raw) |
+| `unixnu.toml` | `initrd = "Payloads/scratch-data.img"`（xnu 类型不打印 initrd 日志，属正常） |
+| 内核 boot-arg | 在原 args 后追加 **`rd=md0`** |
+| ADT | `make-r11-adt.py ... --data-ramdisk --root-match-volume-uuid <卷UUID>` |
+
+本地打包工具（不需要 macOS）：
+
+```
+scripts/repack-payload-bigger.py   ← 重建 128 MiB payload + 换 ADT + 放稠密 seed + 改 toml
+scripts/local-add-data-seed.py     ← 只替换 seed/ADT（payload 已够大时用）
+```
+
+### QEMU 调试链（本次重大收获）
+
+```
+scripts/qemu-run-r11.sh <kernel.macho> <前缀> <seed.raw>
+scripts/make-qemu-esp.py   ← 支持 --initrd，生成带 initrd 的 toml
+scripts/ppm2png.py         ← 纯标准库把截屏 PPM 转 PNG（无 PIL 也能看图）
+```
+
+要点：
+* QEMU 需 `-m 4096`，否则 DarwinBoot 因内存不足拒绝启动
+* 去掉 `usb-kbd` 并 patch `HasInput = FALSE`，菜单才会自动启动
+* 内核日志只在 framebuffer 上，串口到 `exiting boot services` 就结束 → 用截屏看
+
+### 最小 ARM64 Mach-O init（用户态验证工具）
+
+```
+scripts/make-minimal-init.py   ← 手写指令直接生成 Mach-O（无需 SDK/assembler）
+scripts/verify-macho.py        ← 静态校验：头/命令/段/节/入口/反汇编/字符串
+seed/init.macho                ← 573 B，已通过全部检查
+```
+
+行为：`open("/dev/console", O_WRONLY)` → `write(fd, "R11_EL0_INIT_OK\n", 16)` →
+`write(1, ...)` → `b .` 死循环（避免 PID 1 退出导致 panic）。
+
+XNU arm64 系统调用约定：`x16` = 调用号，`svc #0x80`，出错置 carry（`b.cs` 跳过）；
+`SYS_exit=1, SYS_write=4, SYS_open=5`。
+
+### 已知问题 / 下一步
+
+* **用户态执行尚未验证**：`launchd` 不存在于最小 seed，内核会加载失败
+  → 已把最小 init 装进 seed，待重新生成 seed 后在 QEMU 里验证 `R11_EL0_INIT_OK`
+* **APFS 是否以"完整可读写"方式挂载未验证**：目前只证明内核选定了 md0 作为根
+* **真机持久存储驱动缺失**：eMMC（SDHCI）驱动未实现，System 卷（iOS 用户态，数十 GB）
+  无法放置 → 真正跑起 launchd 必须先做存储驱动
+* 完整 iOS 用户态还依赖 dyld、共享缓存、系统库与大量平台服务，不是单个二进制能解决的

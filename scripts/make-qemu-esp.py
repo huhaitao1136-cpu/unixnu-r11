@@ -7,11 +7,13 @@
   EFI/UniXNU/Drivers/DarwinBoot.efi
   EFI/UniXNU/Payloads/kernel.macho
   EFI/UniXNU/Payloads/kernel.macho.adt
+  EFI/UniXNU/Payloads/scratch-data.img   （可选，--initrd）
 
 用法：
   python3 make-qemu-esp.py --out out/esp-qemu \
       --unixnu-app <UniXNU.efi> --darwinboot <DarwinBoot.efi> \
-      --kernel <kernel.macho> --adt <kernel.macho.adt>
+      --kernel <kernel.macho> --adt <kernel.macho.adt> \
+      [--initrd <seed.raw>]
 """
 import argparse
 import shutil
@@ -38,7 +40,7 @@ id = "xnu"
 title = "XNU kernel"
 type = "xnu"
 path = "Payloads/kernel.macho"
-args = "-v serial=3 debug=0x8"
+{initrd_line}args = "-v serial=3 debug=0x8 rd=md0"
 """
 
 
@@ -49,9 +51,13 @@ def main() -> int:
     ap.add_argument('--darwinboot', type=Path, required=True)
     ap.add_argument('--kernel', type=Path, required=True)
     ap.add_argument('--adt', type=Path, required=True)
+    ap.add_argument('--initrd', type=Path, default=None)
     args = ap.parse_args()
 
-    for p in (args.unixnu_app, args.darwinboot, args.kernel, args.adt):
+    needed = [args.unixnu_app, args.darwinboot, args.kernel, args.adt]
+    if args.initrd is not None:
+        needed.append(args.initrd)
+    for p in needed:
         if not p.is_file():
             print(f'!! 缺少 {p}', file=sys.stderr)
             return 1
@@ -67,7 +73,12 @@ def main() -> int:
     shutil.copyfile(args.darwinboot, out / 'EFI/UniXNU/Drivers/DarwinBoot.efi')
     shutil.copyfile(args.kernel, out / 'EFI/UniXNU/Payloads/kernel.macho')
     shutil.copyfile(args.adt, out / 'EFI/UniXNU/Payloads/kernel.macho.adt')
-    (out / 'EFI/UniXNU/unixnu.toml').write_text(TOML, encoding='utf-8')
+    initrd_line = ''
+    if args.initrd is not None:
+        shutil.copyfile(args.initrd, out / 'EFI/UniXNU/Payloads/scratch-data.img')
+        initrd_line = 'initrd = "Payloads\\\\scratch-data.img"\n'
+    (out / 'EFI/UniXNU/unixnu.toml').write_text(
+        TOML.format(initrd_line=initrd_line), encoding='utf-8')
 
     for f in sorted(out.rglob('*')):
         if f.is_file():

@@ -52,6 +52,28 @@ print('写入', p)
 PY
 chmod 600 "$MNT/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist" || true
 
+# ---- 最小 init：验证 EL0 用户态执行 ----
+# kern_exec.c 的候选顺序（第 7104-7109 行）：
+#   /usr/appleinternal/sbin/launchd.debug
+#   /usr/appleinternal/sbin/launchd.development
+#   /sbin/launchd
+# 三处都放同一份最小程序，确保任意分支都能 exec 成功。
+INIT_BIN="$(cd "$(dirname "$0")/.." && pwd)/seed/init.macho"
+if [ -f "$INIT_BIN" ]; then
+  echo "== 安装最小 init（$(stat -f%z "$INIT_BIN") B）"
+  mkdir -p "$MNT/sbin" "$MNT/usr/appleinternal/sbin"
+  # kern_exec.c 的候选顺序：launchd.debug → launchd.development → /sbin/launchd
+  for target in /usr/appleinternal/sbin/launchd.debug \
+                /usr/appleinternal/sbin/launchd.development \
+                /sbin/launchd; do
+    cp "$INIT_BIN" "$MNT$target"
+    chmod 755 "$MNT$target"
+    echo "   $target"
+  done
+else
+  echo "!! 找不到 $INIT_BIN，seed 里不会有 init"
+fi
+
 echo "== 卸载并转成稠密 raw（UDRW）"
 sync
 hdiutil detach "$MNT" >/dev/null
