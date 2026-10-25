@@ -64,15 +64,8 @@ jobs:
           xcrun ar rcs "$STUB/libR11Stubs.a" "$STUB/ufs-store-stubs.o"
           nm "$STUB/libR11Stubs.a" | head -8
 
-      - name: 修正 NativeAES 构建脚本的对象目录（上游默认 build/native-aes 与实际 build/software-aes 不一致）
-        working-directory: UniXNU
-        run: |
-          if [ -f scripts/build-native-aes-bindings.py ]; then
-            sed -i '' "s#default=ROOT / 'build/native-aes'#default=ROOT / 'build/software-aes'#" scripts/build-native-aes-bindings.py
-            grep -n "objects-dir" scripts/build-native-aes-bindings.py
-          else
-            echo "没有这个脚本，跳过"
-          fi
+      - name: 修补 NativeAES bindings 脚本（上游缺少 mkdir 与对象拷贝）
+        run: python3 device/scripts/fix-native-aes-bindings.py UniXNU/scripts/build-native-aes-bindings.py
 
       - name: 编译内核（耗时最长）
         working-directory: UniXNU
