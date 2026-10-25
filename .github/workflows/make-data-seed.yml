@@ -8,7 +8,7 @@ on:
 
 jobs:
   seed:
-    runs-on: macos-13
+    runs-on: macos-14
     steps:
       - name: 取出设备仓库
         uses: actions/checkout@v4
