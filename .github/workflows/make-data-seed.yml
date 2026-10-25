@@ -1,0 +1,37 @@
+name: make-data-seed
+
+# 只做一件事：在 macOS 上生成最小 APFS Data seed 并上传。
+# 不编内核、不打包 payload —— 那些在本地做。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  seed:
+    runs-on: macos-15
+    steps:
+      - name: 取出设备仓库
+        uses: actions/checkout@v4
+        with:
+          path: device
+
+      - name: 取出 UniXNU（只为拿 packed_ramdisk.py）
+        run: git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
+
+      - name: 生成最小 Data 种子
+        working-directory: device
+        run: |
+          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log
+          echo "---- UUID ----"
+          cat "$RUNNER_TEMP/seed.dbr.uuid"
+          ls -l "$RUNNER_TEMP/seed.dbr"
+
+      - name: 上传 seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: r11-data-seed
+          path: |
+            ${{ runner.temp }}/seed.dbr
+            ${{ runner.temp }}/seed.dbr.uuid
+            /tmp/seed.log
+          if-no-files-found: error
