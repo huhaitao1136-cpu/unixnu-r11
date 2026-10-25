@@ -84,6 +84,24 @@ jobs:
           bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log | tail -30
           ls -l "$RUNNER_TEMP/seed.dbr"
 
+      - name: 把 Data seed 的 UUID 写进 board.toml
+        working-directory: device
+        run: |
+          UUID="$(cat "$RUNNER_TEMP/seed.dbr.uuid")"
+          echo "seed UUID = $UUID"
+          python3 - "$UUID" <<'PY'
+          import re, sys
+          from pathlib import Path
+          uuid = sys.argv[1].strip()
+          p = Path('board.toml')
+          s = p.read_text()
+          s2 = re.sub(r'root_match_volume_uuid\s*=\s*"[^"]*"',
+                      'root_match_volume_uuid = "%s"' % uuid, s, count=1)
+          p.write_text(s2)
+          print('board.toml 已更新')
+          PY
+          grep -n 'root_match_volume_uuid' board.toml
+
       - name: 打包 payload（需要设备唯一 ID）
         working-directory: UniXNU
         env:

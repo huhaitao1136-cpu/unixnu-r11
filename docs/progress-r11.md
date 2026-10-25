@@ -1192,3 +1192,552 @@ _gc_ops (表)        0xFFFFFFF007B2F028
 _cons_ops_index     0xFFFFFFF007167920
 _PE_kputc           0xFFFFFFF0071F9B58
 ```
+
+## 3.23 自写 GOP 驱动 + UniXNU 界面崩溃（2026-10-25 凌晨）
+
+### 背景
+
+`SimpleFbDxe` 在本机装不上 GOP（`LocateMemoryMapAreaByName` 失败），
+厂商 `DisplayDxe` 的二进制（`Binaries/r11/QcomPkg/Drivers/`）是空的，
+所以自己写了 `R11FbGop`：
+
+```
+平台参数（真机实测）
+  基址    0x9D400000
+  分辨率  1080 x 1920
+  真实 pitch 1088 像素（不是 1080）
+  格式    BGRx8888
+```
+
+实现：单模式 GOP + Blt（VideoFill / BufferToVideo / VideoToBuffer / VideoToVideo）。
+
+### 踩的坑
+
+1. 只加到 DSC **[Components]** 和 `APRIORI.inc` 不够——
+   还必须加到 **`DXE.inc`**（那才是"放进 FV 的模块列表"），否则编了但不进固件
+2. `EFI_DEVICE_PATH_PROTOCOL.Length` 是 `UINT8[2]`，不能直接赋值，
+   要用 `SetDevicePathNodeLength` / `SetDevicePathEndNode`
+3. `EFI_PIXEL_BITMASK` 没有 `Reserved0` 字段
+
+### 结果
+
+```
+R11GOP: install Success, fb 0x9D400000 stride 1088 1080x1920     ← GOP 装上
+R11GOP: present, mode 0, fb 0x9D400000 size 0x2400000 1080x1920   ← 后续能查到
+```
+
+但 UniXNU 开始画界面时崩溃：
+
+```
+Synchronous Exception at 0x00000000A2EA9650
+X0 = FAR = 0xBE12FEF15B52FEE8
+Data abort: Translation fault, zeroth level
+```
+
+崩溃地址在 UniXNU 镜像（0xA2E80000 + 0x1E000）之外，属于别的模块；
+`ui: headless` 时这条路径从不执行，有了 GOP 才走进来。
+把 `PixelsPerScanLine` 改成 1080（与 width 一致）并给 Blt 加防御后仍然崩。
+
+### 决定
+
+**暂时停用 R11FbGop**（DXE.inc / APRIORI.inc / DSC 里都注释掉），
+回到已验证的稳定状态：headless UniXNU → DarwinBoot 帧缓冲兜底 → 内核入口（绿条）。
+
+代码保留在 `r11Pkg/Drivers/R11FbGop/`，需要时重新启用继续调试。
+
+### 下一步（恢复图形界面时）
+
+1. 找出 `0xA2EA9650` 属于哪个 FV 模块（解包 FV 比对加载地址）
+2. 或给 UniXNU 的绘制代码加更细的探针
+3. `Blt` 目前每类操作最多打印 12 次调用参数，可以直接看出哪次参数异常
+
+## 3.24 UniXNU 图形模式 + 绘制崩溃（2026-10-25 00:45）
+
+### 进展：界面模式激活
+
+重新启用 `R11FbGop` 后，手机上出现：
+
+```
+R11GOP: self 0x9F8E9000..0x9F8EB000
+R11GOP: install Success, fb 0x9D400000 stride 1088 1080x1920
+R11GOP: present, mode 0, fb 0x9D400000 size 0x2400000 1080x1920
+...
+UNIXNU: ui: graphics 1080x1920, scale 4, portrait layout      ← 图形模式！
+```
+
+**UniXNU 不再 headless，走进了图形界面代码路径。**
+
+### 崩溃
+
+```
+Synchronous Exception at 0x00000000A808B778
+X0 = FAR = 0xBE12FEF15B52FEE8
+Data abort: Translation fault, zeroth level
+```
+
+* 崩溃代码地址 `0xA808B778` **不在** 我们驱动的范围（0x9F8E9000..0x9F8EB000），
+  也不在 UniXNU 的范围（0xA2E80000..0xA2E9E000）
+* 但栈里出现我们驱动的数据指针 `0x9F8EADF4` / `0x9F8EA5F4`，
+  说明调用链**经过了 R11FbGop**
+* `R11GOP: blt#N` 一条都没打印出来，说明崩溃发生在 Blt 的第一条语句之前
+  （或者 DEBUG 输出在那一刻被中断）
+
+### 已加的探针（下次继续用）
+
+| 探针 | 输出 |
+|---|---|
+| `R11FbGop` 安装时 | `R11GOP: self <base>..<limit>` |
+| 每次 Blt | `R11GOP: blt#N op=? dst(x,y) WxH`（最多 40 条） |
+| 前两次驱动通知 | `R11IMG: <base>..<limit> (KB)` 全部已加载镜像 |
+
+`R11IMG` 那批行在日志最顶部，需要开机后立刻截图（或改成分页打印）。
+
+### 下一步
+
+1. 抓到 `R11IMG` 全表 → 找出 `0xA808B000` 是哪个模块
+   （可先在 `R11BootRamdisk` 里把 `DumpLoadedImages` 改成"每 5 个一屏 + Stall"，
+   或者只打印 base 在 0xA8000000 以上的）
+2. 或者干脆绕过 UniXNU 的绘制：给 `[ui]` 加 `console = "none"`，
+   让它回到 headless（保留 GOP 给 DarwinBoot 用）
+
+## 3.25 里程碑：UniXNU 图形界面在真机上显示（2026-10-25 01:15）
+
+### 真机截图内容
+
+```
+🍎 UniXNU
+version 0.1.0
+config: \EFI\UniXNU\unixnu.toml
+
+┌──────────────────────────┐
+│ [1]  Boot      xnu       │  ← 蓝色高亮
+├──────────────────────────┤
+│ [2]  Restart   action    │
+├──────────────────────────┤
+│ [3]  Power off action    │
+└──────────────────────────┘
+
+        Booting Boot in 3 s
+        Select the default entry
+        boots when the timer ends
+
+      0 loaded / 0 failed   kits 0
+      acpi 0
+```
+
+**UniXNU 的完整启动菜单在 OPPO R11 上正常显示，无斜切、无错位。**
+
+### 根因：帧缓冲 pitch 是 1080，不是 1088
+
+之前 `R11_FB_STRIDE = 1088` 时，全屏填充（1080x1920）会写到：
+
+```
+0x9D400000 + 1088 * 1920 * 4 = 0x9D400000 + 8,355,840 B
+```
+
+而固件只映射了 `1080 * 1920 * 4 = 8,294,400 B`（正好一屏），
+超出约 61 KB → **Translation fault（Data abort, zeroth level）**。
+
+用 1088 时的现象：写到屏幕最后几行才崩，前 512 行完全正常
+（这也是为什么 `R11_FB_FILL_MAX_ROWS = 512` 的测试不崩）。
+
+改成 `R11_FB_STRIDE = 1080` 后：全屏填充 + 贴图全部正常。
+
+### 定位过程（二分法）
+
+| 步骤 | 开关 | 结果 | 结论 |
+|---|---|---|---|
+| 1 | `R11_FB_NOOP_BLT = 1` | 不崩，UniXNU 走完全流程 | 崩溃在绘制代码里 |
+| 2 | 只画 `op=2`（贴图） | 不崩，屏幕出现 Logo 碎片 | 贴图路径 OK |
+| 3 | 只画 `op=0`（填充） | **崩** | 填充是元凶 |
+| 4 | 填充限制 512 行 | 不崩，屏幕出现大片色块 | 是"写越界"而非逻辑错误 |
+| 5 | stride 改 1080，全屏填充 | **完美显示界面** | pitch = 1080 ✓ |
+
+### 保留的调试开关（`R11FbGop.c` 顶部）
+
+```c
+#define R11_FB_STRIDE          1080        /* 关键：必须等于 width */
+#define R11_FB_NOOP_BLT        0           /* 1 = 什么都不画 */
+#define R11_FB_SKIP_FILL       0           /* 1 = 跳过 EfiBltVideoFill */
+#define R11_FB_SKIP_BUFFER     0           /* 1 = 跳过 EfiBltBufferToVideo */
+#define R11_FB_FILL_MAX_ROWS   0           /* >0 = 限制填充行数（探测边界用） */
+```
+
+### 附带结论
+
+* `R11GOP: install Success` / `R11GOP: self <base>..<limit>` 探针保留（打印上限已降到 5 条）
+* 安装时画的那条绿条已移除
+* 固件自己的文字控制台仍会在同一帧缓冲上画日志，所以 UI 下方会残留一些调试文字
+  （UniXNU 进入图形模式后不再往 ConOut 输出，残留来自之前的日志）
+
+## 3.26 按键输入：SPMI/PMIC 探查（2026-10-25 01:40）
+
+### 硬件事实（来自原厂设备树）
+
+```
+gpio_keys {
+  vol_up   { gpios = <&pm660l-gpio 8 1>; linux,code = <115>; }   // GPIO 8
+  vol_down { gpios = <&pm660l-gpio 5 1>; linux,code = <114>; }   // GPIO 5
+}
+pm660l-gpio { gpio@c000 { reg = <0xc000 0x100>; } }              // 外设基址 0xc000
+```
+
+* 三个键都不是 SoC 引脚，而是 **PMIC（PM660L）的输入**
+* 必须经 **SPMI 总线 + PMIC arbiter** 才能读到
+* R11 的 arbiter（设备树 `qcom,spmi@800f000`）：
+
+```
+core   0x0800F000  0x1000      版本 / channel 映射
+chnls  0x08400000  0x1000000
+obsrvr 0x09400000  0x1000000   观察者通道（读数据走这里）
+intr   0x0A400000  0x220000
+cnfg   0x0800A000  0x3000
+qcom,ee = 0
+```
+
+### 已写驱动：`r11Pkg/Drivers/R11KeysDxe`
+
+* SPMI 观察者通道读（命令字 `[27]=read`、`[11:4]=寄存器`、`[2:0]=字节数-1`）
+* channel 表查找（core 窗口寄存器 `0x800 + 4*n`，`[19:8] = SID<<8|PID`）
+* 音量键 → ScanCode Up/Down，提供 `SimpleTextInput` + `SimpleTextInputEx`
+* 20 ms 定时轮询
+* **必须放进 APRIORI**，否则我们自己的启动器在它调度前就跳进 UniXNU 了
+
+### 真机结果
+
+```
+R11KEYS: arbiter version 0x30000000      ← arbiter v3，版本寄存器可读
+（之后卡住，map[] 诊断行滚出屏幕）
+```
+
+### 下一步（明天从这里开始）
+
+1. **读回 `map[0..7]`** —— 判断 channel 表在 `0x800+4n` 还是 `0x900+4n`，
+   或者需要按 `chnls` 区域 0x8000 步进取表
+2. `PM660L_GPIO_SID` 可能是 0 而不是 1（PM660 = 0，PM660L = 1，需确认）
+3. 观察者通道偏移（`0x10000/EE`、`0x80/channel`、CMD 0x0 / STATUS 0x8 / DATA 0x18）
+   在 v3 上是否相同 —— 参考 `hackios-xnu` 的 `redwood_buttons.c`（arbiter v5 的完整实现）
+4. 音量键状态读 `GPIO STATUS1/STATUS2`（0x0A/0x0B，每字节 8 个引脚，低有效）
+
+### 为什么这条链值得做
+
+* UniXNU 现在显示 `No input device`，只能 3 秒超时自动启动
+* 有按键后：音量键选菜单、电源键确认
+* 这也是后续 XNU 侧输入驱动（`redwood_buttons.c` 式的 BSD 驱动）的预研
+
+## 3.27 按键：SPMI 打通（2026-10-25 02:05）
+
+### 已验证的真机输出
+
+```
+R11KEYS: self 0xA807A000..0xA8083000
+R11GOP: install Success, fb 0x9D400000 stride 1080 1080x1920
+R11KEYS: arbiter version 0x30000000              ← arbiter v3
+R11KEYS: map[0..7] = 00000000 0000D000 00022000 00022100 00000000 00000900 00018900 00010000
+R11KEYS: found ch 83 for pid 0x1D0 (map 001D000) ← 通道 0x53
+R11KEYS: channel gpio=0x53 pon=0x53
+R11KEYS: install Success
+R11KEYS: poll timer Success
+R11KEYS: poll#1 ver=0x30000000 ch=0x53/0x53
+R11KEYS: VOL_UP                                  ← ★ 真的读到了按键
+R11KEYS: VOL_DOWN                                ← ★
+```
+
+UniXNU 侧：
+
+```
+R11IN: ConIn=0x3EEA0 ConOut=0x3FEFB0
+R11IN: 3 SimpleTextIn handle(s)
+R11IN: physical=2 (UniXNU needs >0)
+UNIXNU: menu: shown 3 entries, default 0 'xnu', timeout 15000 ms, input yes, rotate 0 ms
+```
+以及界面上的 `Up/Down: select    Enter: boot    1-9: boot entry    Esc: stop timer`。
+
+### 关键参数（已确定）
+
+| 项 | 值 |
+|---|---|
+| arbiter 版本 | v3（0x30000000） |
+| core | 0x0800F000（版本寄存器 0x0 可读） |
+| channel 映射表 | core 内 `0x800 + 4*n`，`[19:8] = SID<<8|PID` |
+| PM660L GPIO 外设 | PID 0x1D0（SID 1，寄存器基址 0x8D00 → `>>8`） |
+| 通道号 | 0x53 |
+| 观察者通道 | 0x09400000 + 0x80*0x53 = 0x09402980 |
+| 命令字 | `(1<<27) | (reg<<4) | (nbytes-1)` |
+| STATUS/DATA | +0x08 / +0x18 |
+| 音量上 | GPIO 8 → STATUS2(0x0B) bit0，低有效 |
+| 音量下 | GPIO 5 → STATUS1(0x0A) bit5，低有效 |
+
+### 踩过的坑
+
+1. `EVT_NOTIFY_WAIT` 事件**必须带回调函数**，传 NULL 会返回 `EFI_INVALID_PARAMETER`，
+   导致 `WaitForKey` 为空，ConSplitter 收不到按键通知
+2. UniXNU 的 `CountInputDevices()` 要求：`gST->ConIn != NULL`
+   **且**存在带 DevicePath 的 `SimpleTextIn` 句柄
+3. 启动器（R11BootRamdisk）必须排在 `ConSplitterDxe` / `GraphicsConsoleDxe` **之后**，
+   否则 UniXNU 启动时 ConIn 还不存在 → 永远 `input no`
+
+### 剩余问题
+
+进入 UniXNU 后**瞬间黑屏**（菜单一闪而过）——某个按键事件让菜单立即退出。
+日志里 `VOL_UP`/`VOL_DOWN` 能正常打印，说明 SPMI 侧没问题。
+
+### 明天的方案：直接覆盖 gST->ConIn
+
+```
+1. 驱动在 BDS 之后运行（或在 R11BootRamdisk 启动 UniXNU 前）
+2. 保存 mOriginalConIn = gST->ConIn
+3. gST->ConIn = 我们自己的 SIMPLE_TEXT_INPUT
+   ReadKeyStroke：先读我们的按键队列；没有则转发 mOriginalConIn
+   WaitForKey：我们的事件，按键时 SignalEvent
+4. UniXNU 读 gST->ConIn 直接命中我们的实现 → 100% 收到按键
+```
+
+这样彻底绕开 ConSplitter 的聚合逻辑，不依赖它的绑定时机。
+
+## 3.28 按键最后一层：ConSplitter 没接纳我们的设备（2026-10-25 02:40）
+
+### 本轮学到的事实
+
+| 观察 | 含义 |
+|---|---|
+| `R11KEYS: connect self Not Found` | 没有驱动愿意绑定我们的输入设备句柄 |
+| `input yes` 但按键无效 | UniXNU 只数"物理句柄"，ConIn 里并没有我们 |
+| 加 `gEfiConsoleInDeviceGuid` 后仍无效 | ConSplitter 启动时的扫描已经结束，后到的设备没被加入 |
+| 加 GCD 检查后连 `VOL_*` 都不打印 | `gDS->GetMemorySpaceDescriptor(0x09402980)` 返回不存在 → 读取被拦掉（**教训：不要用 GCD 判断 SPMI 观察者区可达性**） |
+| 定时器改成 `TPL_CALLBACK` 后没有任何轮询日志 | 本环境的 CALLBACK 通知不被派发，**必须用 `TPL_NOTIFY`** |
+
+### 结论：剩下的就是"协议转发"一层
+
+```
+PM660L GPIO ──SPMI──> 我们的驱动   ✅ 已验证（VOL_UP/VOL_DOWN 打印过）
+我们的驱动 ──SimpleTextIn──> ConSplitter ──> ConIn ──> UniXNU   ❌ 卡在这里
+```
+
+### 下次的三个技术手段（按优先级）
+
+1. **把日志写进 FAT 卷**（最高优先）
+   R11BootRamdisk 已经把 payload 卷挂在 `R11ESP` 上，我们的驱动可以追加写
+   `\keys.log`，刷完用 `mtype -i payload.img ::/keys.log` 直接读，不必拍照。
+
+2. **改 UniXNU 源码**（我们有 `src/UniXNU`）
+   让它绕过 ConSplitter，直接用 `LocateHandleBuffer(ByProtocol, SimpleTextIn)`
+   逐个 `ReadKeyStroke`，或提供一个自定义协议给 UniXNU 认。
+
+3. **在 QEMU 里模拟按键**
+   QEMU 的 GOP/ConSplitter 与真机同源，可先用 `qmp` 注入按键验证 UniXNU 侧逻辑。
+
+### 当前可用的镜像
+
+| 文件 | 说明 |
+|---|---|
+| `out/r11/boot/boot-ui-clean.img` | 界面干净版（推荐日常使用） |
+| `out/r11/boot/boot-keys-v3.img` | 带按键驱动（SPMI 读取待恢复） |
+| `out/r11/boot/boot-keys-n.img` | 按键驱动 + 去抖，菜单稳定 |
+
+刷机与恢复命令见 3.5 节。
+
+## 3.29 按键：SPMI 观察者通道被拒绝（2026-10-25 17:50）
+
+### 设备树核查（9 个 DTB 全部检查）
+
+所有 9 个 FDT 里音量键都指向 **PMIC GPIO**（不是 SoC 的 TLMM）：
+
+```
+fdt1: pm660l-gpio 8/5      fdt6: 3/5
+fdt2/7/8: 8/5              fdt3/4/5/9: 8/5
+TLMM（pinctrl@03000000, reg = <0x3000000 0xc00000>）phandle = 0x7d，没有按键引用它
+```
+
+### 真机扫描结果
+
+| 探测 | 结果 |
+|---|---|
+| arbiter 版本（core+0x0） | `0x30000000`（v3）✔ 可读 |
+| 通道 0x53 的 TYPE（reg 0x04） | `0x01` = PON ✔ 可读 |
+| 通道 0x53 的 reg 0x0A/0x0B | `FF`（超时/被拒绝） |
+| 512 通道 × 16 寄存器全量快照对比 | **没有任何值随按键变化** |
+| 找到的 GPIO(0x10) 外设数 | 0 |
+| 找到的 PON(0x01) 外设数 | 0（但 0x53 明明能读 TYPE=0x01 → 说明扫描时多数事务失败） |
+
+### 结论
+
+arbiter v3 的观察者通道**只允许访问少数外设**；我们对 GPIO 外设的读事务被拒绝
+（大概率返回 STATUS_DENIED）。redwood 那份参考实现是 **v5** 的布局，
+其"观察者通道可读任意外设"的前提在 v3 上不成立。
+
+### 下一步（下次做，按可行性排序）
+
+1. **给 R11SpmiRead 加了 STATUS 日志**：把 `STATUS` 寄存器的原始值画到浮层上，
+   确认到底是 DENIED(bit2) 还是 FAILURE(bit1)。
+   如果是 DENIED → 需要先在 `cnfg` 区（0x0800A000）把自己写成该通道的 owner。
+2. **按 Linux `drivers/spmi/spmi-pmic-arb.c` 的 v2/v3 分支重写访问流程**
+   （该文件有 `pmic_arb` 与 `pmic_arb_ver5` 两套；我们用错了 v5 的偏移）。
+3. 或者：**放弃按键**，UniXNU 靠超时自动启动（功能已可用），
+   把精力放到"内核日志上屏"和"Data seed"上。
+
+### 本轮新增的调试设施（很有价值，以后都能用）
+
+* **屏幕浮层**（`R11DrawOverlay`）：在屏幕最底部两行实时显示
+  `CH/A/K/F` + `S/V/P/G`，每 50ms 重画，不会被日志滚掉
+* **学习模式**：按住按键 → 对 512 通道 × 16 寄存器做两次快照 → 找变化的位
+* 内置 5x7 点阵字体（0-9 A-Z），用 GOP Blt 逐像素画字
+
+## 3.30 内核日志上屏：定位到 gc_enabled，但补丁位置错了（2026-10-25 18:30）
+
+### 已确认的调用链
+
+```
+console_write_unbuffered
+  → _cnputc
+    → cons_ops[1].putc = vcputc_options   (0xFFFFFFF0073B787C)
+       开头：
+         gc_initialized = [0xFFFFFFF007B2EE00]
+         gc_enabled     = [0xFFFFFFF007B2EE04]
+         if (gc_initialized == 1 && gc_enabled == 0) → return   ← 什么都不画
+       正常路径：
+         cbz  gc_buffer_size(0xFFFFFFF007B2F08C) → 跳过
+         bl   vc_paint_char (0xFFFFFFF0073BA878)                ← 真正画字
+```
+
+### 关键符号
+
+```
+_gc_initialized      0xFFFFFFF007B2EE00   （__DATA，zerofill，文件里改不了）
+_gc_enabled          0xFFFFFFF007B2EE04   （同上）
+_gc_buffer_size      0xFFFFFFF007B2F08C
+_gc_enable           0xFFFFFFF0073BBC40   ← 分配缓冲区、置标志
+_vc_paint_char       0xFFFFFFF0073BA878
+_vcputc_options      0xFFFFFFF0073B787C
+```
+
+### 试过但失败的补丁
+
+| 补丁 | 位置 | 结果 |
+|---|---|---|
+| `b.eq` → `nop`（强制 gc_ops 赋值块） | 0x73BA278 | `vc_paint_char` 仍未调用 |
+| `b.ne` → `b`（强制走绘制主流程） | 0x73B78B4 | 无效 |
+| 在提前返回处插 `bl gc_enable` | 0x73B78B8~C8 | **内核死锁**（控制台锁已被持有） |
+
+### 教训
+
+`vcputc_options` 在**持锁**上下文里执行；在它内部调用 `gc_enable`
+（需要分配内存、可能再取锁）会死锁。轨迹证据：`early_block` 执行了、
+`gc_enable` 执行了，但 `main_path`/`vc_paint_char`/`processor_idle` 全都没出现。
+
+### 下次的正确位置
+
+在**启动早期、无锁**的地方调一次 `gc_enable(TRUE)`：
+* `initialize_screen` 正常返回的路径（它末尾就是 `b gc_enable`，w0=1）
+* 或 `PE_init_console` 之后
+* 绝不能在 `vcputc_options` 里面
+
+### 本轮新增脚本
+
+```
+scripts/patch-vcputc.py            强制走绘制主流程（已证明无效）
+scripts/patch-gc-enabled.py        改 gc_enabled（发现是 zerofill，文件改不了）
+scripts/patch-gc-enable-call.py    在 vcputc_options 里调 gc_enable（导致死锁）
+```
+
+### QEMU 调试闭环（今天最大的工程收益）
+
+```
+改补丁 → qemu-run-r11.sh <kernel> runNN → grep 轨迹/screendump → 30 秒出结论
+```
+
+不用刷机即可验证内核补丁对错，下一步继续用这个方法快速试错。
+
+## 3.31 里程碑：内核日志成功显示在真机屏幕上（2026-10-25 18:35）
+
+### 根因与修法（经过完整验证）
+
+`vcputc_options`（0xFFFFFFF0073B787C）开头：
+
+```asm
+gc_initialized == 1 && gc_enabled == 0  →  直接 return，一个字都不画
+```
+
+运行时实测：
+
+```
+_gc_initialized (0xB2EE00) = 1
+_gc_enabled     (0xB2EE04) = 0     ← 就是这个导致控制台"禁用"
+_gc_buffer_size (0xB2F08C) = 0     ← 缓冲区从未分配
+_vc_geometry    (PE_state.video) 全部正确（base/width/height/depth/op=1）
+```
+
+### 失败的尝试（都记录在案，别再走）
+
+| 补丁 | 位置 | 结果 |
+|---|---|---|
+| `b.eq` → `nop`（强制 gc_ops 赋值块） | 0x73BA278 | 无效（那块只写 update_color + 置 gc_initialized） |
+| `b.ne` → `b`（强制绘制主流程） | 0x73B78B4 | 无效 |
+| 在提前返回处插 `bl gc_enable` | 0x73B78B8 | **死锁**（控制台锁已持有） |
+| 在 `PE_init_kprintf` 里调 `gc_enable` | trampoline | 无效（vinfo 还没填）+ 首次实现忘了保存 x30 → 内核不返回 |
+| 数据补丁写 `gc_enabled = 1` | 0xB2EE04 | 做不到（__DATA 是 zerofill，文件里没有） |
+
+### 成功的方法
+
+**在 `initialize_screen` 的主 epilogue（`0x73BA7C8: ret`）改成跳到 trampoline**：
+
+```asm
+; initialize_screen 末尾
+0x73BA7C8:  b  trampoline
+
+; trampoline（写入 __TEXT_EXEC 的 NOP 空洞 0x79E9BEC）
+    stp  x29, x30, [sp, #-16]!
+    mov  w0, #1
+    bl   gc_enable            ; 分配图形控制台缓冲区
+    ldp  x29, x30, [sp], #16
+    ret
+```
+
+**为什么这个时机对**：
+* `initialize_screen` 由 `PE_init_platform` 单线程调用
+* 此时 `PE_state.video` 已完整填充（base/width/height/depth/op）
+* **没有持有任何控制台锁**（之前的死锁就是因为在持锁路径里调）
+
+### 验证（QEMU）
+
+```
+vc_paint_char 执行 ✅
+gc_enable 执行 ✅
+processor_idle 到达 ✅（71538 个基本块，内核健康）
+屏幕：完整内核日志
+```
+
+### 验证（真机 OPPO R11）
+
+```
+Darwin Image4 Validator Version 6.3.0
+calling policy_init for AppleImage4
+Security Policy loaded: Apple Mobile File Integrity (AMFI)
+AppleARMRNSMFantast: Starting
+Registered CoreAnalyticsHub functions with xnu.virtual boot
+Skylake: sk_copy_64_16 ...... PASSED
+...（全部内存自检 PASSED）
+IOSurfaceRoot: installMemoryRegions()
+DarwinNVRAMHandler.cpp: sync: 894 - serializeVariables failed
+Waiting on <dict ID="0"><key>IOProviderClass</key><string ID="1">IONetworkMedia
+```
+
+**内核日志第一次显示在 OPPO R11 屏幕上。**
+
+### 关键脚本
+
+```
+scripts/patch-init-screen-gc.py    ← initialize_screen 返回前调 gc_enable(TRUE)
+scripts/patch-payload-full.py      ← 一次给 payload 里的内核打全套补丁
+scripts/find-xrefs.py              ← 扫描 bl 调用点（找 callers）
+scripts/find-code-cave.py          ← 找 NOP 空洞放 trampoline
+```
+
+### 调试方法沉淀
+
+有了内核日志之后，后续所有问题都可以直接看屏幕：
+* 驱动加载顺序
+* 每条 Error
+* 最后卡在哪个子系统
+
+下一步应该看日志**末尾**停在哪里（IOFindBSDRoot / bsd_init）。
