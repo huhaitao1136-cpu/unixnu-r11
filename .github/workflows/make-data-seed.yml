@@ -15,8 +15,11 @@ jobs:
         with:
           path: device
 
-      - name: 取出 UniXNU（只为拿 packed_ramdisk.py）
-        run: git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
+      - name: 取出 UniXNU 与 DarwinBoot（packed_ramdisk.py 在 DarwinBoot 子模块里）
+        run: |
+          git clone --depth 1 https://github.com/UniXNU/UniXNU.git UniXNU
+          git clone --depth 1 https://github.com/UniXNU/DarwinBoot.git UniXNU/drivers/DarwinBoot
+          ls UniXNU/drivers/DarwinBoot | head -20
 
       - name: 生成最小 Data 种子
         run: |
