@@ -31,10 +31,10 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/r11/tree/.cache
             UniXNU/out/r11/tree/build
-          key: r11-${{ hashFiles('device/board.toml', 'device/configs/r11_defconfig', 'device/scripts/*.py') }}-${{ github.run_id }}
+          key: r11b-${{ hashFiles('device/board.toml', 'device/configs/r11_defconfig', 'device/scripts/*.py') }}-${{ github.run_id }}
           restore-keys: |
-            r11-${{ hashFiles('device/board.toml', 'device/configs/r11_defconfig', 'device/scripts/*.py') }}-
-            r11-
+            r11b-${{ hashFiles('device/board.toml', 'device/configs/r11_defconfig', 'device/scripts/*.py') }}-
+            r11b-
 
       - name: 安装依赖
         run: |
