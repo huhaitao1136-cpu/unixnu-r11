@@ -2126,3 +2126,53 @@ fsapfsinfo: Compatible features 0x2 = NX_FEATURE_LCFD
 fsapfsmount / fsapfsinfo（libfsapfs-utils）—— Linux 侧独立验证 APFS 镜像
 scripts/qemu-run-r11.sh 的 CATCH_EXEC 模式 —— dump imgp / vnode / 头缓冲区
 ```
+
+---
+
+## 3.38 特性版本假设被否定；问题收敛到 APFS kext 读取行为（2026-10-26 03:00）
+
+### 实验记录
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| macOS 15 造卷 | `Compatible features: 0x2 (NX_FEATURE_LCFD)` | 基线 |
+| macOS 14 造卷 | 同样 `0x2 (NX_FEATURE_LCFD)` | **特性不是差异点**，假设否定 |
+| Linux fsapfsmount 读卷 | `/sbin/launchd` 65536 B / 0755 / inode 5，`/usr/appleinternal/sbin/*` 两份都在 | **镜像完全正确** |
+| 内核 exec 我们的 init | `va_data_size = 0x3000000`（= 容器 block_count×block_size），读内容 = 块 0 | **驱动侧解析错误** |
+
+### 当前最可能的技术解释
+
+1. APFS 挂载时读了大量块（容器/卷超级块/B-tree）都正常 → **带偏移的读本身是好的**
+2. 但读 `/sbin/launchd` 的 inode 时得到的是块 0 的内容（NXSB）
+   → 该 inode 的读取地址被解析成 0（extent 记录或 omap 解析出错）
+3. `/usr/...` 路径返回 ENOENT（文件确实存在）
+   → 路径解析层也不正常，可能与 XNU 的 firmlink/synthetic 目录处理有关
+
+### 剩下的可选方向（下次择一）
+
+| # | 方向 | 成本 | 风险 |
+|---|---|---|---|
+| A | 在 `-d in_asm` 轨迹里找 APFS kext 段（`0x4axxxxx`）执行的读块调用，看它请求的块号 | 中 | 需要反汇编 kext 段 |
+| B | 造一个更小的卷（如 8 MB）测试是否与容量/偏移计算相关 | 低 | 可能无信息 |
+| C | 用真 iOS 设备 dump 的最小 Data 卷作为种子 | 中 | 需要设备 |
+| D | 放弃 APFS 作为 EL0 验证载体；改为在 payload 里放一个**内核可直接执行的 Mach-O**（需要内核补丁，如 hook `load_init_program`） | 高 | 侵入性强 |
+| E | 检查 APFS kext 的 block-size 假设（512 vs 4096）是否与 md0 的 IOMedia 一致 | 中 | 需要看 kext 与 md 驱动的交互 |
+
+### 关键资产清单（下次直接可用）
+
+```
+镜像:  seed5/seed.raw (macOS 14 版, UUID 980A1373-...) / seed4 (macOS 15 版)
+内核:  /tmp/k-pan.macho (PAN nop 补丁)
+ADT:   make-r11-adt.py --data-ramdisk --root-match-volume-uuid <UUID>
+工具:  qemu-run-r11.sh (CATCH_PANIC / CATCH_EXEC), analyze-inasm.py, ppm2png.py,
+       fsapfsinfo/fsapfsmount, verify-macho.py, make-minimal-init.py --pad
+验证:  fsapfsmount 挂载镜像可读全部三份 init（镜像侧确认）
+```
+
+### 已确认成立的上游事实（不需重复验证）
+
+* `rd=md0` 让内核把内存盘当根（绕开 IOMedia UUID 匹配）
+* `msr PAN` 的 9 处必须 nop，否则 ARMv8.0 上任何用户内存访问都 panic
+* `mac_vnode_check_exec` 放行（AMFI 不是阻塞点）
+* exec 的对象是**普通文件**（否则返回 EACCES 而不是 ENOEXEC）
+* 内核无 HFS；mockfs 存在但只有 ROOT/DEV 节点
