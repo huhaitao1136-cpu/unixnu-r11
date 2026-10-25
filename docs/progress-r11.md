@@ -2332,3 +2332,62 @@ scripts/fetch-ipsw-member.py      HTTP Range 取 IPSW 单个成员（不用下 6
 1. 验证 `r11-stubs` 新增的两个符号让链接错误减少到只剩 IOStorageFamily
 2. 为 IOStorageFamily 生成链接桩（路线 A）
 3. 链接通过后，ADT 改 `--packed-data-ramdisk`，在 QEMU 里用 Apple ramdisk 验证 APFS 读文件是否恢复
+
+---
+
+## 3.42 块存储栈的硬依赖：native-owner 参考候选（2026-10-27 00:00）
+
+### 本轮 CI 结果
+
+```
+✅ legacy-display 归档移除后，之前的 audit 失败消失
+✅ 内核补丁(stubs)生效：链接错误里不再出现 _native_ufs_store_gpt_check / _mode
+❌ 仍剩 IOStorageFamily：
+     IOBlockStorageDevice::gMetaClass / init(OSDictionary*) / requestIdle() /
+     doUnmap(...) / vtable for IOBlockStorageDevice / getProperty(...) ...
+     ← 全部来自 libNativeRamBlock.a
+```
+
+### 依赖链
+
+```
+board.toml:  "build-arm-driver.py NativeRamBlock"
+   ↓ 需要 XNU_NATIVE_AES=1（已满足）
+   ↓ 驱动 import 原始 IOStorageFamily 的类实现
+build-xnu-4k-baseline.sh:
+   if [ "$NATIVE_RAM_BLOCK" = 1 ] && [ "$XNU_NATIVE_AES" != 1 ]; then exit 1
+   ...
+   KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$RAM_BLOCK_ARCHIVE"
+   ↓
+链接时需要 storage 的"原始绑定"
+   ↓ 来自 build/native-prelink/native-owner-*.macho
+   ↓ 而该文件：
+       - audit-*.py / build-native-*.py 都是"读"
+       - 没有任何脚本"写"它 → 离线资产（参考设备/kernelcache 探测产物）
+```
+
+### 这意味着
+
+* 启用块存储（NativeRamBlock / NativeVirtioBlock）在当前仓库条件下**不可行**，
+  除非自己实现 IOStorageFamily 或拿到 native-owner 参考候选。
+* 与之一致的历史线索：board.toml 早期注释「第一阶段不启用块存储栈（依赖参考内核候选），改用 mockfs」。
+
+### 另一道墙：APFS on 内置 ramdisk
+
+* 元数据读取正常（挂载成功、目录查找部分可用）
+* 文件内容读取返回**块 0**（容器超级块），我们卷与 Apple 原版 ramdisk 表现一致
+* 已排除：镜像、卷名、尺寸、特性位、macOS 版本、AMFI、Mach-O 格式
+
+### 下次可选方向
+
+| # | 方向 | 前提 | 评价 |
+|---|---|---|---|
+| 1 | 自己实现最小 IOStorageFamily（IOMedia + IOBlockStorageDevice），让 NativeRamBlock 有超类 | 需要 4K 版 IOMedia 语义 | 工作量大 |
+| 2 | 给内核打"从内存直接加载 init"的补丁（绕过 VFS/APFS） | 需要写 Mach-O 加载逻辑 | 中线，但能立刻证明 EL0 |
+| 3 | 继续查 APFS 读块 0 的根因 | 需要反汇编 APFS kext（无符号） | 难 |
+| 4 | 拿到 native-owner 参考候选（参考设备探测） | 需要目标设备/离线环境 | 依赖外部资产 |
+
+### 推荐
+
+方向 2：写一个内核侧的最小 Mach-O 加载器补丁（把 ramdisk 里已知偏移的 init 映像直接映射进用户地址空间并设好入口），
+可以完全绕开 APFS 的读取路径，直接验证 EL0 —— 与「先进入用户态」的目标一致，且不依赖外部资产。
