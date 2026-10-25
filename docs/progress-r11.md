@@ -2021,3 +2021,58 @@ if (vap->va_data_size == 0) {
 | 1 | 用 boot-arg `launchdsuffix=release` 强制只试 `/sbin/launchd` | 排除路径差异，聚焦单一失败点 |
 | 2 | seed 里改用 `chown 0:0` + `chmod 0755`，并显式 `sync` 后再 detach | 排除 size/权限元数据问题 |
 | 3 | 在 CI 里 `hdiutil attach` 后 `ls -l` 打印三个路径的**大小与权限** | 直接确认文件元数据 |
+
+---
+
+## 3.36 APFS 文件数据读取返回 0 字节（2026-10-25 23:55）
+
+### 决定性观测
+
+在 `exec_mach_imgact` 的 `ldr x24,[x0,#0x40]` 之后 dump 头缓冲区，两次（573 B 版与 64 KB 填充版）结果相同：
+
+```
+0x…:  b4 a3 4c 5a 7f 5c 36 a8   01 00 00 00 00 00 00 00
+      04 00 00 00 00 00 00 00   01 00 00 80 00 00 00 00
+```
+
+解出来是 **APFS obj_phys_t**：`cksum(8)` + `oid=1` + `xid=4` + `type=0x80000001`（OBJ_PHYSICAL|NX_SUPERBLOCK），
+也就是**容器超级块（磁盘第 0 块）**。两次只有 checksum 不同（镜像不同）。
+
+结论：**内核读文件内容时返回 0 字节**，缓冲区残留挂载早期读过的 NXSB；
+于是 magic 检查失败 → `error = -1` → **ENOEXEC**。
+
+### 已排除
+
+| 假设 | 排除依据 |
+|---|---|
+| 文件未写入 seed | 镜像里有 3 份 Mach-O（magic ×3、标记串 ×3） |
+| 文件是 APFS 内联存储 | 三份数据都在**块首对齐**位置（0xa7000/0xb7000/0xc7000），各占 16 个块 |
+| 权限问题 | seed 日志显示 `-rwxr-xr-x`，目录也 chmod 755 |
+| 目录不存在 | `/sbin/launchd` 能打开（否则 ENOENT） |
+
+### 仍存疑
+
+* `exec_activate_image` 有一条 `if (vap->va_data_size == 0) return ENOEXEC;` —— 如果 APFS 报 size=0，
+  内核**根本不会**读内容。这与"栈里残留 NXSB"完全一致，需要直接读 `vap->va_data_size` 验证。
+* 另一个可能：读内容时 APFS 返回错误（inode 的 dstream/extent 记录与本内核 APFS 版本不兼容）。
+
+### 下一步（明天按此顺序）
+
+| # | 实验 | 判定 |
+|---|---|---|
+| 1 | 断 `exec_activate_image` 里 size 检查处，读 `vap->va_data_size` | =0 → 是 inode 元数据问题；=65536 → 是读内容失败 |
+| 2 | 用 **HFS+** 做根（Linux `mkfs.hfsplus` + `hfsplus` 写文件） | 若 init 能跑 → 说明整条 exec 链路 OK，问题纯在 APFS 数据读取 |
+| 3 | 换一种造 seed 的方式（`diskutil apfs create`、或从真 iOS 设备 dump 一个最小 Data 卷） | 版本兼容性验证 |
+
+### 今日总进度
+
+```
+✅ 自制 UEFI 固件启动
+✅ UniXNU 启动管理器
+✅ DarwinBoot 交接 XNU
+✅ XNU 完整启动 + 日志上屏
+✅ APFS Data 卷挂载为根（真机 + QEMU）
+✅ PAN 补丁（ARMv8.0 跑用户态的前提）
+✅ 排除 AMFI / Mach-O 格式 / 内存不足
+⬜ APFS 读文件内容返回 0 → init exec 失败（唯一剩余阻塞点）
+```
