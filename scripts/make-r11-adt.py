@@ -207,7 +207,10 @@ def main():
                             ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))]),
               # eMMC (SDHCI at 0x0C0C4000) 在 arm-io 窗口之外，child reg 会是负数。
               # 节点只用于驱动类匹配；NativeSdhci 的物理窗口来自它自己的常量。
-              node('sdhci', [('compatible', b'qcom,sdm660-sdhci\0')])]),
+              # compatible 必须含 'qcom,sdhci-msm-v5'——NativeSdhci::probe 就是按它匹配的；
+              # sdm660-sdhci 只是别名，留着方便别的驱动复用同一节点。
+              node('sdhci', [('compatible', b'qcom,sdhci-msm-v5\0qcom,sdm660-sdhci\0'),
+                             ('device_type', b'sdhci\0')])]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)

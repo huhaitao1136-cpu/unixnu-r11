@@ -16,7 +16,10 @@
  *   scripts/build-arm-driver.py NativeSdhci
  * 产物 libNativeSdhci.a，再由 CONFIG_XNU_NATIVE_SDHCI=y 链进内核。
  *
- * 状态：骨架 + 可用的 PIO 读路径；写路径、CMD6 高速切换、ADMA2、中断都是 TODO。
+ * 状态：探测模式（默认）。start() 里做 reset -> clock -> cardInit -> EXT_CSD -> 读 LBA0/LBA1
+ *       并把 GPT 分区表打印到屏幕，用来在真机上验证整条链路。
+ *       块设备层（IOBlockStorageDevice）需要 IOStorageFamily 的原版绑定审计，默认关闭，
+ *       用 -DXNU_NATIVE_SDHCI_BLOCK_DEVICE=1 打开；写路径、CMD6、ADMA2、中断仍是 TODO。
  */
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
@@ -24,8 +27,18 @@
 #include <IOKit/IOMemoryDescriptor.h>
 /* 内核头文件里没有 IOMemoryMap.h（只有 IOUSer 的）；IOMemoryMap 由
  * IOMemoryDescriptor.h / IODeviceMemory.h 的声明带出来 —— 与 ButtonProbe.cpp 的做法一致。 */
+/* 块设备层（IOBlockStorageDevice）的实现体在 IOStorageFamily kext 里，静态链接期
+ * 需要"原版绑定审计"生成 .set 绝对地址绑定（见 src/UniXNU/scripts/audit-storage-interface.py
+ * 与 build-native-virtio-bindings.py）。bring-up 第一步只要证明 eMMC 能读，
+ * 所以默认关掉这一层：驱动退化成纯 IOService 探测器，不引入任何 storage 符号。
+ * audit + 绑定打通后再用 -DXNU_NATIVE_SDHCI_BLOCK_DEVICE=1 打开。 */
+#ifndef XNU_NATIVE_SDHCI_BLOCK_DEVICE
+#define XNU_NATIVE_SDHCI_BLOCK_DEVICE 0
+#endif
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/storage/IOStorage.h>
+#endif
 #include <pexpert/pexpert.h>
 #include <string.h>
 
@@ -79,7 +92,9 @@ static bool sdhciWaitSet (uintptr_t base, uint32_t off, uint32_t mask, uint32_t 
     return false;
 }
 
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
 class NativeSdhciBlock;
+#endif
 
 class NativeSdhci : public IOService
 {
@@ -107,6 +122,8 @@ private:
     bool     waitTransferComplete ();
     bool     pioTransfer (bool read, void *buffer, UInt32 bytes);
     bool     readCsd ();
+    bool     readExtCsd ();
+    bool     probeMedia ();
 
     uintptr_t fCore     = 0;
     uintptr_t fVendor   = 0;
@@ -114,9 +131,12 @@ private:
     OSSharedPtr<IOMemoryMap> fVendorMap;
     UInt16    fRca      = 0;
     UInt64    fBlockCount = 0;
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
     NativeSdhciBlock *fBlockDevice = nullptr;
+#endif
 };
 
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
 class NativeSdhciBlock : public IOBlockStorageDevice
 {
     OSDeclareDefaultStructors (NativeSdhciBlock)
@@ -151,9 +171,12 @@ public:
 private:
     NativeSdhci *fController = nullptr;
 };
+#endif /* XNU_NATIVE_SDHCI_BLOCK_DEVICE */
 
 OSDefineMetaClassAndStructors (NativeSdhci, IOService)
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
 OSDefineMetaClassAndStructors (NativeSdhciBlock, IOBlockStorageDevice)
+#endif
 
 /* ============================ NativeSdhci ============================ */
 
@@ -191,9 +214,24 @@ IOService *NativeSdhci::probe (IOService *provider, SInt32 *score)
     }
 
     if (!match) {
+        /* 节点里写了 sdhci 但 compatible 不对时也要吼一声，否则真机上完全静默、
+         * 分不清"没匹配到"和"匹配到但 start 失败"。 */
+        const char *text = nullptr;
+        size_t len = 0;
+        if (OSData *data = OSDynamicCast (OSData, property)) {
+            text = static_cast<const char *> (data->getBytesNoCopy ());
+            len = data->getLength ();
+        } else if (OSString *string = OSDynamicCast (OSString, property)) {
+            text = string->getCStringNoCopy ();
+            len = text ? strlen (text) : 0;
+        }
+        if (text && sdhciContains (text, len, "sdhci")) {
+            IOLog ("NativeSdhci: probe saw compatible=%.*s but no match\n", (int) (len < 96 ? len : 96), text);
+        }
         return nullptr;
     }
     native_sdhci_matched = 1;
+    IOLog ("NativeSdhci: matched DT node, probing controller\n");
     if (score) {
         *score = 1000;
     }
@@ -212,9 +250,6 @@ bool NativeSdhci::mapRegisters (IOService *provider)
                 if (fCoreMap) {
                     fCore = static_cast<uintptr_t> (fCoreMap->getVirtualAddress ());
                     ok = true;
-#if DEBUG
-                    IOLog ("NativeSdhci: core from provider reg0 @0x%llx\n", (unsigned long long) pa);
-#endif
                 }
             }
         }
@@ -400,6 +435,175 @@ bool NativeSdhci::readCsd ()
     return true;
 }
 
+/* ---------------- EXT_CSD 与介质探测（bring-up 用，不依赖 storage 层） ---------------- */
+
+static void sdhciCopyLe (uint64_t *out, const uint8_t *raw, size_t bytes)
+{
+    uint64_t value = 0;
+    for (size_t i = 0; i < bytes && i < 8; i++) {
+        value |= (uint64_t) raw[i] << (8 * i);
+    }
+    *out = value;
+}
+
+/* GPT 的分区名是 72 字节 UTF-16LE；只保留低字节里的可见 ASCII，够认分区 */
+static void sdhciGptName (const uint8_t *entry, char *out, size_t outSize)
+{
+    size_t k = 0;
+    for (size_t i = 0; i < 36 && k + 1 < outSize; i++) {
+        uint8_t lo = entry[56 + i * 2];
+        if (lo == 0) {
+            break;
+        }
+        out[k++] = (lo >= 0x20 && lo < 0x7f) ? (char) lo : '?';
+    }
+    out[k] = '\0';
+}
+
+/* GPT GUID 前 3 段小端、后 2 段大端，这里按展示顺序重排 */
+static void sdhciFormatGuid (const uint8_t *raw, char *out)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    static const uint8_t order[16] = {3,2,1,0, 5,4, 7,6, 8,9, 10,11,12,13,14,15};
+    size_t k = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            out[k++] = '-';
+        }
+        uint8_t byte = raw[order[i]];
+        out[k++] = hex[byte >> 4];
+        out[k++] = hex[byte & 0xF];
+    }
+    out[k] = '\0';
+}
+
+bool NativeSdhci::readExtCsd ()
+{
+    uint8_t ext[kSdhciBlockSize] __attribute__ ((aligned (64)));
+    memset (ext, 0, sizeof (ext));
+
+    sdhciWrite32 (fCore, SDHCI_BLOCK_SIZE, (uint32_t) kSdhciBlockSize);
+    sdhciWrite32 (fCore, SDHCI_BLOCK_COUNT, 1);
+    sdhciWrite32 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
+
+    if (!sendCommand (MMC_SEND_EXT_CSD, 0,
+                      SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+                      nullptr)) {
+        IOLog ("NativeSdhci: CMD8 (SEND_EXT_CSD) failed\n");
+        return false;
+    }
+    if (!pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
+        IOLog ("NativeSdhci: EXT_CSD transfer failed\n");
+        return false;
+    }
+
+    /* EXT_CSD[212..215] = SEC_COUNT（512 B 扇区总数，eMMC 4.0+） */
+    uint64_t secCount = 0;
+    sdhciCopyLe (&secCount, ext + 212, 4);
+    if (secCount) {
+        fBlockCount = secCount;
+    }
+    IOLog ("NativeSdhci: EXT_CSD rev=%u SEC_COUNT=%llu (%llu MiB) BUS_WIDTH=%u HS_TIMING=%u\n",
+           ext[192], (unsigned long long) secCount,
+           (unsigned long long) (secCount / 2048), ext[183], ext[185]);
+    return true;
+}
+
+bool NativeSdhci::probeMedia ()
+{
+    uint8_t block[kSdhciBlockSize] __attribute__ ((aligned (64)));
+
+    (void) readExtCsd ();
+
+    memset (block, 0, sizeof (block));
+    if (readBlocks (0, 1, block) != kIOReturnSuccess) {
+        IOLog ("NativeSdhci: LBA0 read FAILED\n");
+        return false;
+    }
+    IOLog ("NativeSdhci: LBA0 ok sig=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+           block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7]);
+
+    if (block[510] == 0x55 && block[511] == 0xAA) {
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *entry = block + 446 + i * 16;
+            uint64_t start = 0, sectors = 0;
+            if (entry[4] == 0) {
+                continue;
+            }
+            sdhciCopyLe (&start, entry + 8, 4);
+            sdhciCopyLe (&sectors, entry + 12, 4);
+            IOLog ("NativeSdhci:   MBR p%d type=0x%02x start=%llu count=%llu\n",
+                   i + 1, entry[4], (unsigned long long) start, (unsigned long long) sectors);
+        }
+    }
+
+    uint8_t header[kSdhciBlockSize] __attribute__ ((aligned (64)));
+    memset (header, 0, sizeof (header));
+    if (readBlocks (1, 1, header) != kIOReturnSuccess) {
+        return true;
+    }
+    if (memcmp (header, "EFI PART", 8) != 0) {
+        IOLog ("NativeSdhci: no GPT (LBA1 sig=%02x%02x%02x%02x)\n",
+               header[0], header[1], header[2], header[3]);
+        return true;
+    }
+
+    uint64_t entriesLba = 0, firstUsable = 0, lastUsable = 0, entryCount = 0, entrySize = 0;
+    sdhciCopyLe (&firstUsable, header + 0x30, 8);
+    sdhciCopyLe (&lastUsable,  header + 0x38, 8);
+    sdhciCopyLe (&entriesLba,  header + 0x48, 8);
+    sdhciCopyLe (&entryCount,  header + 0x50, 4);
+    sdhciCopyLe (&entrySize,   header + 0x54, 4);
+    IOLog ("NativeSdhci: GPT ok entries=%llu size=%llu table_lba=%llu usable=%llu..%llu\n",
+           (unsigned long long) entryCount, (unsigned long long) entrySize,
+           (unsigned long long) entriesLba,
+           (unsigned long long) firstUsable, (unsigned long long) lastUsable);
+
+    const uint32_t perBlock = entrySize ? (uint32_t) (kSdhciBlockSize / entrySize) : 0;
+    if (perBlock == 0) {
+        return true;
+    }
+    uint32_t found = 0, shown = 0;
+    for (uint64_t i = 0; i < entryCount && shown < 16; i += perBlock) {
+        uint8_t table[kSdhciBlockSize] __attribute__ ((aligned (64)));
+        memset (table, 0, sizeof (table));
+        if (readBlocks (entriesLba + i / perBlock, 1, table) != kIOReturnSuccess) {
+            IOLog ("NativeSdhci: GPT table read failed at entry %llu\n", (unsigned long long) i);
+            break;
+        }
+        for (uint32_t j = 0; j < perBlock && i + j < entryCount; j++) {
+            const uint8_t *entry = table + j * entrySize;
+            bool empty = true;
+            for (int k = 0; k < 16; k++) {
+                if (entry[k]) {
+                    empty = false;
+                    break;
+                }
+            }
+            if (empty) {
+                continue;
+            }
+            found++;
+            if (shown >= 16) {
+                continue;
+            }
+            char name[40], type[40];
+            uint64_t first = 0, last = 0;
+            sdhciGptName (entry, name, sizeof (name));
+            sdhciFormatGuid (entry, type);
+            sdhciCopyLe (&first, entry + 32, 8);
+            sdhciCopyLe (&last,  entry + 40, 8);
+            IOLog ("NativeSdhci:   GPT[%u] %s %llu..%llu type=%s\n",
+                   (unsigned) (i + j), name, (unsigned long long) first,
+                   (unsigned long long) last, type);
+            shown++;
+        }
+    }
+    IOLog ("NativeSdhci: GPT non-empty=%u shown=%u\n", found, shown);
+    native_sdhci_step = 10;
+    return true;
+}
+
 bool NativeSdhci::cardInit ()
 {
     uint32_t resp[4] = {0, 0, 0, 0};
@@ -538,14 +742,14 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
 
-    /* 读 block 0 做一次链路自检（MBR/GPT 头，失败不代表链路坏，只记录） */
-    {
-        uint8_t probe[kSdhciBlockSize] __attribute__ ((aligned (64)));
-        if (readBlocks (0, 1, probe) == kIOReturnSuccess) {
-            native_sdhci_step = 9;
-        }
+    native_sdhci_step = 9;
+    /* bring-up 第一步：把卡信息 / LBA0 / GPT 分区表打在屏幕上 */
+    if (!probeMedia ()) {
+        IOLog ("NativeSdhci: media probe failed at step %u\n", native_sdhci_step);
+        goto fail;
     }
 
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
     fBlockDevice = OSTypeAlloc (NativeSdhciBlock);
     if (!fBlockDevice) {
         goto fail;
@@ -559,6 +763,10 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
     fBlockDevice->registerService ();
+#else
+    IOLog ("NativeSdhci: probe mode, %llu blocks, block device NOT registered\n",
+           (unsigned long long) fBlockCount);
+#endif
     return true;
 
 fail:
@@ -567,11 +775,13 @@ fail:
 
 void NativeSdhci::stop (IOService *provider)
 {
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
     if (fBlockDevice) {
         fBlockDevice->terminate (kIOServiceSynchronous);
         fBlockDevice->release ();
         fBlockDevice = nullptr;
     }
+#endif
     fCoreMap.reset ();
     fVendorMap.reset ();
     fCore = 0;
@@ -586,6 +796,7 @@ void NativeSdhci::free ()
     IOService::free ();
 }
 
+#if XNU_NATIVE_SDHCI_BLOCK_DEVICE
 /* ========================= NativeSdhciBlock ========================= */
 
 bool NativeSdhciBlock::init (NativeSdhci *controller)
@@ -768,4 +979,4 @@ IOReturn NativeSdhciBlock::reportMediaState (bool *mediaPresent, bool *changedSt
     }
     return kIOReturnSuccess;
 }
-
+#endif /* XNU_NATIVE_SDHCI_BLOCK_DEVICE */

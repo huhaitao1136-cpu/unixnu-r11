@@ -2556,3 +2556,132 @@ out/r11/init64k.macho           64 KB 填充版（供 mockfs ramdisk 使用）
 scripts/qemu-run-r11.sh         CATCH_EXEC 可在 exec_mach_imgact / load_machfile 之间切换
 docs §3.43–§3.45                完整证据链
 ```
+
+---
+
+## 3.46 存储栈 Step1：NativeSdhci 编译通过 → 链接期撞上 IOStorageFamily，改走探测模式（2026-10-26 20:10）
+
+### 结论先行
+
+驱动**编译通过**（含 `-Werror` 与 ARM64/iOS 17 目标文件审计），但**内核链接失败**，
+缺的 15 个符号全部来自 IOStorageFamily kext。这证明"能编译"和"能链接"是两件事，
+也证明了我们的驱动写法在 ABI 层面是对的（类大小 `0x90`、190 槽 vtable、deployment 17.0 都对得上）。
+
+```
+archive-07: NativeSdhci: -Werror build and actual ARM64/iOS 17 object audit passed
+ld: symbol(s) not found for architecture arm64
+```
+
+```
+"vtable for IOBlockStorageDevice"
+"IOBlockStorageDevice::gMetaClass"
+"IOBlockStorageDevice::IOBlockStorageDevice(OSMetaClass const*)"
+"IOBlockStorageDevice::~IOBlockStorageDevice()"
+"IOBlockStorageDevice::init(OSDictionary*)"
+"IOBlockStorageDevice::getProperty(OSSymbol const*) const"
+"IOBlockStorageDevice::setProperties(OSObject*)"
+"IOBlockStorageDevice::requestIdle()"
+"IOBlockStorageDevice::doSynchronize(unsigned long long, unsigned long long, unsigned int)"
+"IOBlockStorageDevice::doSynchronizeCache()"
+"IOBlockStorageDevice::getWriteCacheState(bool*)"
+"IOBlockStorageDevice::setWriteCacheState(bool)"
+"IOBlockStorageDevice::doSetPriority(IOBlockStorageDeviceExtent*, unsigned int, unsigned char)"
+"IOBlockStorageDevice::doGetProvisionStatus(unsigned long long, unsigned long long, unsigned int*, IOBlockStorageProvisionDeviceExtent*, unsigned long long)"
+"IOBlockStorageDevice::doUnmap(IOBlockStorageDeviceExtent*, unsigned int, unsigned int)"
+"IOStorage::complete(IOStorageCompletion*, int, unsigned long long)"
+```
+
+`NOTE: a missing vtable usually means the first non-inline virtual member function has no definition.`
+—— 因为 `IOBlockStorageDevice` 的实现体不在 XNU 源码树里，它在 Apple 的 IOStorageFamily kext 中。
+
+### 官方怎么解决的（机制，重要）
+
+`sheng`（唯一官方 port）在 `device/board.toml:50-51` 里有两条归档：
+
+```toml
+"build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
+"build-native-virtio-bindings.py --component NativeVirtioBlock",
+```
+
+`UniXNU/scripts/build-native-virtio-bindings.py` 的尾部直接生成汇编再用 `ar` 重打包：
+
+```python
+assembly = out / 'original-bindings.S'
+assembly.write_text(''.join(f'.globl {name}\n.set {name}, {value:#x}\n' for name, value in sorted(bindings.items())))
+subprocess.run(['xcrun','clang','-target','arm64-apple-ios17.0','-c', assembly, '-o', out/'original-bindings.o'], check=True)
+subprocess.run(['xcrun','ar','rcs', archive, obj_path, out/'original-bindings.o'], check=True)
+```
+
+即 **`.set 符号名, 绝对地址`**：把驱动里未定义的符号直接绑到"原版 IOStorageFamily 在
+kernelcache 里被 slide 之后的真实地址"。链接期不需要符号体，运行期直接跳进原版 kext 代码。
+
+地址来源是 `UniXNU/scripts/audit-storage-interface.py`：
+1. 用公开的 Darwin 23 `refer/IOStorageFamily/IOBlockStorageDevice.cpp`（pin `e45fbe30a7879e0b16e26dddb78538f1b00e0bff`）编译出参考对象，得到 190 个虚函数槽的**顺序**，并校验 `DW_AT_byte_size == 0x90`、`methods.count('___cxa_pure_virtual') == 14`（`audit-storage-interface.py:93`）。
+2. 去原始 kernelcache 里 `com.apple.iokit.IOStorageFamily` 的 `__DATA_CONST` 扫出这个 vtable（`audit-storage-interface.py:112-125`，要求 `matched == 176`），读到真实指针值。
+3. 输入是 `build/native-prelink/native-apfs-load-positive.macho` + `.json`，且校验 `original_sha256 == f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7`。
+
+**我们能用同一套**：`board.toml:89` 的 `kernelcache_sha256` 就是同一个值——我们和 sheng 用同一份
+iPadOS 17.7.11（iPad7,1 / 21H461）IPSW，所以审计结果一致。
+
+### 本次采用的折中：探测模式（B 方案）
+
+`build-native-*-bindings.py` 需要一个我们目前没有的中间产物
+（`build/native-prelink/native-apfs-load-positive.macho`），所以先绕开 storage 层：
+把 `NativeSdhciBlock` 整段用 `#if XNU_NATIVE_SDHCI_BLOCK_DEVICE`（默认 0）关掉，
+驱动退化成**纯 IOService 探测器**，链接期不再引入任何 storage 符号。
+
+`drivers/NativeSdhci/NativeSdhci.cpp` 的改动：
+
+| 位置 | 改动 |
+|---|---|
+| L32-41 | `XNU_NATIVE_SDHCI_BLOCK_DEVICE` 默认 0，`IOBlockStorageDevice.h`/`IOStorage.h` 变成条件 include |
+| L95-97 | `class NativeSdhciBlock;` 前向声明条件编译 |
+| L134-136 | `NativeSdhciBlock *fBlockDevice` 成员条件编译 |
+| L139-174 / L784-967 | 块设备类的声明段与整段实现条件编译（含 `OSDefineMetaClassAndStructors`） |
+| L465-495 | 新增 `readExtCsd()`：CMD8 读 512 B EXT_CSD，取 `SEC_COUNT[212..215]`（512 B 扇区数）、`EXT_CSD_REV[192]`、`BUS_WIDTH[183]`、`HS_TIMING[185]` |
+| L497-590 | 新增 `probeMedia()`：读 LBA0（打印前 8 字节 + MBR 0x55AA 与 4 个分区项）、读 LBA1 校验 `"EFI PART"`、打印 GPT 头字段（entries/size/table_lba/first_usable/last_usable），再逐块扫分区表并打印前 16 个非空条目（名称从 72 B UTF-16LE 取 ASCII，类型 GUID 按前 3 段小端重排） |
+| L704-759 | `start()` 的链路：`softReset` → `setBusPowerAndClock` → `cardInit` → `probeMedia`；块设备注册整段进 `#if` |
+| L761-775 | `stop()` 的块设备清理进 `#if` |
+| L179-210 | `probe()` 增加日志：匹配成功打 `matched DT node`；带 `sdhci` 字样但不匹配时打 `compatible=%.*s but no match`——避免真机上"静默失败"分不清哪一步 |
+
+配套改动：
+- `configs/r11_defconfig`：`CONFIG_XNU_NATIVE_RAM_BLOCK=n`（RamBlock 同样依赖 storage 符号；之前 `=y` 时内核脚本 `test -f libNativeRamBlock.a` 直接失败）。
+- `board.toml`：`"build-arm-driver.py NativeRamBlock"` 注释掉，只留 `NativeSdhci`。
+- `scripts/make-r11-adt.py:208-211`：`sdhci` 节点的 compatible 改成
+  `qcom,sdhci-msm-v5\0qcom,sdm660-sdhci\0`（原来只有 `qcom,sdm660-sdhci`，与
+  `NativeSdhci::probe()` 里匹配的 `qcom,sdhci-msm-v5` 不一致 → 真机上根本不会匹配），并加 `device_type = "sdhci"`。
+  节点仍不带 `reg`：SDHCI 在 `0x0C0C4000`，落在 `arm-io` 的 `ranges` 窗口（`0x08000000`）之外，
+  child reg 会溢出；物理窗口由驱动自己的 `R11_SDHCI_CORE_PHYS`/`R11_SDHCI_VENDOR_PHYS` 常量映射。
+
+### 真机上应该看到的日志（验证清单）
+
+```
+NativeSdhci: matched DT node, probing controller
+NativeSdhci: EXT_CSD rev=... SEC_COUNT=... (.... MiB) BUS_WIDTH=... HS_TIMING=...
+NativeSdhci: LBA0 ok sig=0000000000000000
+NativeSdhci:   MBR p1 type=0xee start=1 count=...
+NativeSdhci: GPT ok entries=128 size=128 table_lba=2 usable=... 
+NativeSdhci:   GPT[1] pmic ... type=...
+NativeSdhci:   GPT[n] ... (R11 有 69 个分区)
+NativeSdhci: probe mode, N blocks, block device NOT registered
+```
+
+- `SEC_COUNT == 0` 或 `EXT_CSD` 读失败 → CMD8 之前的时钟/总线宽度没设对（`setBusPowerAndClock()` 目前固定 400 kHz、8-bit、1.8 V）。
+- `LBA0 ok` 但全是 0 → 命令通了但数据相位没取到（PIO 读的 `SDHCI_DATA_AVAILABLE` 轮询或 `TRANSFER_MODE`）。
+- `no GPT` 但 MBR p1 type=0xee → GPT 头不在 LBA1（少见，多为 4K 逻辑扇区）。
+- 完全没有 `NativeSdhci:` 开头任何一行 → ADT 里没有 `sdhci` 节点或 compatible 没改对（用 `probe saw compatible=...` 那行区分）。
+
+### 风险与已知限制
+
+- **QEMU 没有 sdhci-msm**，这一步只能在真机上验证；CI 只能保证编译与链接。
+- `cardInit()` 仍走默认速度（未做 CMD6 切 HS200），够读分区表，读大文件会慢。
+- 写路径仍未实现（`writeBlocks` 返回 `kIOReturnNotWritable`），探测阶段不写任何东西。
+- 探测发生在 `NativeSdhci::start()`，依赖 IOKit 把 ADT 节点当 provider 发出来——`ArmDTPlatform` 的匹配路径此前只被 `ArmCpu`/`NativeAES` 用过，这是第一次用它匹配外设节点。
+
+### 下一步（Step 2 → Step 3）
+
+1. 真机跑一次，按上面的清单确认卡初始化与 GPT。
+2. 若链路通：补 `build-native-sdhci-bindings.py`（照 `build-native-virtio-bindings.py` 写，`--component NativeSdhci`），
+   并生成它需要的 `build/storage-abi/interface-audit.json`（先解决 `native-apfs-load-positive.macho` 的生产者），
+   打开 `-DXNU_NATIVE_SDHCI_BLOCK_DEVICE=1` 把块设备层接回去。
+3. 然后才是 `IOBlockStorageDevice` → `IOMedia` → APFS 挂 System 卷 → 真 `launchd`。

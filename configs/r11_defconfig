@@ -14,9 +14,11 @@ CONFIG_XNU_NATIVE_SDHCI=y
 # CONFIG_XNU_NATIVE_UFS is not set
 
 CONFIG_XNU_NATIVE_AES=y
-# R11 无 virtio 传输；只要 RAM 块设备（payload 卷）
+# R11 无 virtio 传输；RAM 块设备（payload 卷）暂时关掉：
+# NativeRamBlock 会让内核链接期缺 IOBlockStorageDevice 的符号，
+# 探测阶段只保留 NativeSdhci（纯 IOService，不碰 storage 层）。
 CONFIG_XNU_NATIVE_VIRTIO_BLOCK=n
-CONFIG_XNU_NATIVE_RAM_BLOCK=y
+CONFIG_XNU_NATIVE_RAM_BLOCK=n
 CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y

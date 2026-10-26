@@ -58,9 +58,10 @@ archives = [
   "build-native-aes-bindings.py",
   # eMMC 块设备驱动（我们自己写的，见 drivers/NativeSdhci）
   "build-arm-driver.py NativeSdhci",
-  # 存储归档不能只加一半：内核脚本里 NATIVE_RAM_BLOCK=1 时会 test -f libNativeRamBlock.a，
-  # 缺了就直接 "test -f failed" 退出（之前为了隔离 SDHCI 编译错误临时注释掉，已恢复）。
-  "build-arm-driver.py NativeRamBlock",
+  # NativeRamBlock 依赖 IOStorageFamily 的原版绑定审计，探测阶段不需要：
+  # 它的归档一旦链进来，链接期就缺 IOBlockStorageDevice 的 15 个符号（见 docs §3.44）。
+  # 波形：先证明 eMMC 能读（NativeSdhci 探测模式），再做绑定审计把块设备层打开。
+  # "build-arm-driver.py NativeRamBlock",
 # VIRTIO 归档已停用（R11 无 virtio）
   # "build-arm-driver.py NativeVirtioBlock",
   # R11 第一阶段不启用块存储栈（依赖参考内核候选），改用 mockfs
