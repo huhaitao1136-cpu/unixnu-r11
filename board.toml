@@ -56,6 +56,8 @@ archives = [
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
   "build-native-aes-bindings.py",
+  # eMMC 块设备驱动（我们自己写的，见 drivers/NativeSdhci）
+  "build-arm-driver.py NativeSdhci",
   # NativeSdhci 上游不存在（UniXNU 只有 NativeUfs）；第一阶段启动不需要 eMMC，
   # 后续要做 APFS 根卷时再自己实现 libNativeSdhci.a 并把它加回这里。
 # VIRTIO 归档已停用（R11 无 virtio）
@@ -74,7 +76,9 @@ archives = [
   # 用 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n 让 bsd_init 不再引用它。
   # "build-native-legacy-display.py",
   # 块存储栈：把 PackedRAMDisk 变成真正的块设备（APFS 才能正常读文件）
-  "build-arm-driver.py NativeRamBlock",
+  # 暂时关掉 RamBlock：它缺 IOStorageFamily 符号会让链接先失败，
+  # 先让 NativeSdhci 单独暴露编译/链接问题（顺序与故障隔离）。
+  # "build-arm-driver.py NativeRamBlock",
 ]
 
 [kernel.prelink]

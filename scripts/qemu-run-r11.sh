@@ -21,6 +21,7 @@ FILETYPE_CHK=0xfffffff0076cca78         # filetype 检查
 MAC_EXEC_ADDR=0xfffffff00794aecc        # _mac_vnode_check_exec
 MACH_IMGACT_ADDR=0xfffffff0076cc9d0    # _exec_mach_imgact
 LOADMACH_ADDR=0xfffffff00775a8a8
+PSIGNAL_ADDR=0xfffffff0076ef7d0      # _psignal_internal
 
 fail() { echo "!! $*"; exit 1; }
 
@@ -85,6 +86,24 @@ if [ -n "${CATCH_EXEC:-}" ]; then
   ) > "/tmp/${PREFIX}.exec.log" 2>&1 &
 fi
 
+# ---- CATCH_SIG：只抓发给 init 的 SIGKILL(9)，看是谁发的 ----
+if [ -n "${CATCH_SIG:-}" ]; then
+  (
+    sleep 3
+    "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
+      -ex "target remote :1234" \
+      -ex "hbreak *$PSIGNAL_ADDR" \
+      -ex "condition 1 \$x4 == 9" \
+      -ex "continue" \
+      -ex 'printf "=== 捕获 SIGKILL 发送点 ===\n"' \
+      -ex 'info registers x0 x1 x2 x3 x4 x5 x30' \
+      -ex 'printf "--- os_reason 结构（x5）---\n"' \
+      -ex 'x/8wx $x5' \
+      -ex 'bt 8' \
+      2>&1
+  ) > "/tmp/${PREFIX}.sig.log" 2>&1 &
+fi
+
 if [ -n "${CATCH_PANIC:-}" ]; then
   (
     sleep 3
@@ -93,7 +112,10 @@ if [ -n "${CATCH_PANIC:-}" ]; then
       -ex "hbreak *$PANIC_ADDR" -ex "continue" \
       -ex 'printf "=== hit _panic ===\n"' \
       -ex 'info registers x0 x1 x2 x3 x4' \
-      -ex 'x/s $x0' -ex 'x/12gx $sp' 2>&1
+      -ex 'x/s $x0' \
+      -ex 'x/s $x1' \
+      -ex 'x/s $x2' \
+      -ex 'x/12gx $sp' 2>&1
   ) > "/tmp/${PREFIX}.panic.log" 2>&1 &
 fi
 
@@ -118,6 +140,12 @@ if [ -n "${CATCH_EXEC:-}" ]; then
   echo
   echo "===== load_machfile 捕获 ====="
   grep -av '^warning' "/tmp/${PREFIX}.exec.log" 2>/dev/null | head -70
+fi
+
+if [ -n "${CATCH_SIG:-}" ]; then
+  echo
+  echo "===== SIGKILL 捕获 ====="
+  grep -av '^warning' "/tmp/${PREFIX}.sig.log" 2>/dev/null | head -40
 fi
 
 echo

@@ -10,7 +10,7 @@ CONFIG_XNU_ARMCPU=y
 # ── 存储：R11 是 eMMC 5.1（sdm660 的 0xc0c4000.sdhci），sheng 是 UFS ──
 # 需要新写 NativeSdhci 驱动并产出 libNativeSdhci.a，见 board.toml 的 archives
 # 第一阶段暂不提供 eMMC 驱动（上游无 NativeSdhci），根卷改用 ramdisk/离线镜像。
-CONFIG_XNU_NATIVE_SDHCI=n
+CONFIG_XNU_NATIVE_SDHCI=y
 # CONFIG_XNU_NATIVE_UFS is not set
 
 CONFIG_XNU_NATIVE_AES=y

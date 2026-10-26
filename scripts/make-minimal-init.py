@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 VMADDR = 0x100000000
+PAGEZERO_SIZE = 0x100000000   # arm64 可执行文件必须的 hard page zero（4 GiB）
 MH_MAGIC_64 = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
 CPU_SUBTYPE_ARM64_ALL = 0x00000000   # 注意：2 是 CPU_SUBTYPE_ARM64E！
@@ -113,20 +114,24 @@ def build_code():
 def build_macho():
     code, data, msg_off, dev_off = build_code()
 
-    seg_cmd_size = 72 + 80
+    pagezero_cmd_size = 72           # LC_SEGMENT_64，无 section
+    seg_cmd_size = 72 + 80           # __TEXT + 一个 __text section
     th_cmd_size = 8 + 8 + 34 * 8     # cmd+cmdsize + flavor+count + 34 个 64 位寄存器
-    sizeofcmds = seg_cmd_size + th_cmd_size
+    sizeofcmds = pagezero_cmd_size + seg_cmd_size + th_cmd_size
     code_off = (32 + sizeofcmds + 7) & ~7
     entry = VMADDR + code_off
     filesize = code_off + len(code) + len(data)
     vmsize = (filesize + 0xFFF) & ~0xFFF
 
     hdr = struct.pack('<IIIIIIII', MH_MAGIC_64, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL,
-                      MH_EXECUTE, 2, sizeofcmds, 0, 0)
+                      MH_EXECUTE, 3, sizeofcmds, 0, 0)
 
     sect = struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT',
                        entry, len(code), code_off, 2, 0, 0, 0, 0x80000400, 0, 0)
     # filesize 必须是真实内容长度（不能填 vmsize，否则内核读段会越过文件末尾）
+    # arm64 可执行文件必须有 4 GiB 的 __PAGEZERO（vm_map_has_hard_pagezero 检查）
+    pagezero = struct.pack('<II16sQQQQIIII', LC_SEGMENT_64, pagezero_cmd_size, b'__PAGEZERO',
+                           0, PAGEZERO_SIZE, 0, 0, 0, 0, 0, 0)
     seg = struct.pack('<II16sQQQQIIII', LC_SEGMENT_64, seg_cmd_size, b'__TEXT',
                       VMADDR, vmsize, 0, filesize, 5, 5, 1, 0)
 
@@ -136,7 +141,7 @@ def build_macho():
     state[32] = entry
     th += b''.join(struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF) for v in state)
 
-    cmds = seg + sect + th
+    cmds = pagezero + seg + sect + th
     body = hdr + cmds
     body += b'\0' * (code_off - len(body))
     body += code + data

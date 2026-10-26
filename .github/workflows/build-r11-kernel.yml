@@ -67,6 +67,9 @@ jobs:
       - name: 修补 NativeAES bindings 脚本（上游缺少 mkdir 与对象拷贝）
         run: python3 device/scripts/fix-native-aes-bindings.py UniXNU/scripts/build-native-aes-bindings.py
 
+      - name: 把 NativeSdhci 接入构建脚本
+        run: python3 device/scripts/patch-tree-for-sdhci.py
+
       - name: 编译内核（耗时最长）
         working-directory: UniXNU
         run: |

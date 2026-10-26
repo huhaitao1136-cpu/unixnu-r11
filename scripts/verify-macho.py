@@ -66,9 +66,9 @@ def main() -> int:
     magic, cpu, sub, ftype, ncmds, sizeofcmds, flags, _res = struct.unpack_from('<IIIIIIII', b, 0)
     check(magic == 0xFEEDFACF, f'magic = {magic:#x} (期望 0xfeedfacf, 64 位)')
     check(cpu == 0x0100000C, f'cputype = {cpu:#x} (ARM64)')
-    check(sub == 0x2, f'cpusubtype = {sub:#x}')
+    check(sub == 0x0, f'cpusubtype = {sub:#x} (0 = ARM64_ALL，2 是 ARM64E)')
     check(ftype == 2, f'filetype = {ftype} (MH_EXECUTE)')
-    check(ncmds == 2, f'ncmds = {ncmds}')
+    check(ncmds in (2, 3), f'ncmds = {ncmds}（3 = PAGEZERO + TEXT + THREAD）')
     print(f'  sizeofcmds = {sizeofcmds}')
 
     off = 32
@@ -84,9 +84,15 @@ def main() -> int:
             segname = segname.rstrip(b'\0').decode()
             print(f'        seg={segname} vmaddr={vmaddr:#x} vmsize={vmsize:#x} '
                   f'fileoff={fileoff:#x} filesize={filesize:#x} initprot={initprot}')
-            check(segname == '__TEXT', '段名是 __TEXT')
-            check(fileoff == 0, 'fileoff = 0（段从文件头开始）')
-            check(initprot & 0x4 and initprot & 0x1, 'initprot 可读可执行')
+            if segname == '__PAGEZERO':
+                check(vmaddr == 0, '__PAGEZERO vmaddr = 0')
+                check(vmsize == 0x100000000, '__PAGEZERO vmsize = 4 GiB（arm64 硬性要求）')
+                check(filesize == 0, '__PAGEZERO 不占文件')
+                check(initprot == 0, '__PAGEZERO 无权限')
+            else:
+                check(segname == '__TEXT', '段名是 __TEXT')
+                check(fileoff == 0, 'fileoff = 0（段从文件头开始）')
+                check(initprot & 0x4 and initprot & 0x1, 'initprot 可读可执行')
             check(filesize <= len(b), f'filesize {filesize:#x} 不超过文件长度 {len(b):#x}')
             check(vmsize >= filesize, 'vmsize >= filesize')
             s = off + 72
