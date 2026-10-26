@@ -93,7 +93,8 @@ def patch(path: Path, edits, label: str) -> bool:
     return True
 
 
-driver_targets = [ROOT / 'scripts' / 'build-arm-driver.py']
+# build-arm-driver.py 来自设备仓库（已在仓库里改好）；这里只兜底检查
+driver_targets = [ROOT / 'scripts' / 'build-arm-driver.py', ROOT.parent / 'device' / 'scripts' / 'build-arm-driver.py']
 kernel_targets = [ROOT / 'scripts' / 'build-xnu-4k-baseline.sh']
 for scripts in sorted(ROOT.glob('out/*/*/*/tree/scripts')):
     driver_targets.append(scripts / 'build-arm-driver.py')
