@@ -2685,3 +2685,66 @@ NativeSdhci: probe mode, N blocks, block device NOT registered
    并生成它需要的 `build/storage-abi/interface-audit.json`（先解决 `native-apfs-load-positive.macho` 的生产者），
    打开 `-DXNU_NATIVE_SDHCI_BLOCK_DEVICE=1` 把块设备层接回去。
 3. 然后才是 `IOBlockStorageDevice` → `IOMedia` → APFS 挂 System 卷 → 真 `launchd`。
+
+---
+
+## 3.47 内核链接 + prelink 通过；payload 卡在种子文件名（2026-10-26 20:30）
+
+### 结论先行
+
+去掉 `IOBlockStorageDevice` 继承之后，**整条内核链一枪过**：编译、链接、prelink、打包 UniXNU 全部成功。
+
+```
+== kernel: bootstrap pass for the compile records      ← 第一遍故意失败，只为出编译记录
+Undefined symbols: _mockfs_mountroot / _native_legacy_display_probe
+== kernel: prepare storage headers → PASS: 19 public IOStorageFamily headers prepared
+== kernel: archive 7/10: build-arm-driver.py NativeSdhci
+NativeSdhci: -Werror build and actual ARM64/iOS 17 object audit passed
+== kernel: LDFILELIST bsd / LD mach.development.bcm2837.unstripped.noctf   ← 无 undefined
+== kernel: prelink → Experimental candidate: 53997568 bytes
+== kernel: kernel.macho sha256 bc1f9118dd3d54d1c74bc9dcf1f1fa53b01d49de17eba819713f040f145fec91
+== package: UniXNU → UniXNU.efi 93696 / UniXNUDxe.efi 14336
+```
+
+`kernel.macho`（53,997,568 B）已经能从 Artifacts 下载到 —— 这一轮**内核侧没有剩活**。
+
+### payload 没出来的根因：种子文件名
+
+`make-data-seed.sh` 的产物是 `<prefix>.raw` / `<prefix>.dbr` / `<prefix>.uuid`，
+**`<prefix>` 本身不是文件**。workflow 里却写的是：
+
+```yaml
+bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096     # 前缀叫 seed.dbr
+./unixnu build -D ../device payload --data-ramdisk "$RUNNER_TEMP/seed.dbr"   # 这个路径不存在
+```
+
+于是 payload 步骤实际收到的是一条没有 `--data-ramdisk` 的 `--skip-setup` 命令，被工具直接拒掉：
+
+```
+unixnu: --skip-setup edits the Data seed: pass the original one with --data-ramdisk FILE
+```
+
+也就是说：**种子本身是成功的**（`F192F7EA-089E-4800-B30C-18F310A407EB`，APFS，
+三个 launchd 路径 65536 B 0755 都写进去了），坏的只是传参。
+
+### 本轮改动
+
+| 位置 | 改动 | 原因 |
+|---|---|---|
+| workflow 种子步骤 | `continue-on-error: true`、`ls seed.dbr.*` | 种子失败不许再拦内核产物；`ls` 不能再指向不存在的文件（`bash -e` 会红） |
+| workflow 种子大小 | 4096 → 32 MB | 128 MiB 的 payload 要装 51.5 MiB 内核，4096 MB 根本塞不进；`hdiutil` 也快得多 |
+| workflow UUID 步骤 | 没有 `.uuid` 就 `exit 0` | 幂等 |
+| workflow payload 步骤 | 传 `$RUNNER_TEMP/seed.dbr.raw`；没有就退回不带 `--skip-setup` | 稠密 raw 才是 `/chosen/memory-map/RAMDisk` 要的东西 |
+| workflow 产物上传 | `if: always()` | 默认 `success()` 会让"种子红 → 产物全丢"重演 |
+| workflow 日志上传 | 增加 `/tmp/seed.log` | 上次种子为什么红完全看不到 |
+| `board.toml` | `packed_data_ramdisk = true` → `false` | `true` 会写成 `PackedRAMDisk`（DBRDISK1），那条路要 `NativeRamBlock`；XNU 只认 `RAMDisk` 键名，设 true 等于根卷静默挂不上 |
+
+顺带修掉一个 bash 3.2 的坑：macOS runner 的 `/bin/bash` 是 3.2，`set -u` 下展开空数组
+（`"${EXTRA[@]}"`）会直接 `unbound variable`，已改成普通字符串拼接。
+
+### 状态
+
+- ✅ 内核：编译 / 链接 / prelink / 打包全绿，产物可下载。
+- ⏳ payload：等下一轮 CI（改动已就位，只差跑一次）。
+- ⏳ 真机探测：拿到 `payload.img` 后打进 `boot.img` 刷机，观察
+  `NativeSdhci: matched DT node` → `EXT_CSD ... SEC_COUNT` → `GPT ok ... GPT[1]`。

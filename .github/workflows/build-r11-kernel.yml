@@ -96,8 +96,8 @@ jobs:
         continue-on-error: true
         working-directory: device
         run: |
-          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 64 2>&1 | tee /tmp/seed.log | tail -30
-          ls -l "$RUNNER_TEMP/seed.dbr"
+          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 32 2>&1 | tee /tmp/seed.log | tail -30
+          ls -l "$RUNNER_TEMP"/seed.dbr.*
 
       - name: 把 Data seed 的 UUID 写进 board.toml
         working-directory: device
@@ -127,16 +127,17 @@ jobs:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
           set -o pipefail
-          # macOS runner 的 /bin/bash 是 3.2：set -u 下展开空数组会报 unbound variable，
-          # 所以这里用普通字符串拼接。
-          SEED_ARGS=""
-          if [ -f "$RUNNER_TEMP/seed.dbr" ]; then
-            SEED_ARGS="--data-ramdisk $RUNNER_TEMP/seed.dbr"
-            echo "带 Data 种子: $RUNNER_TEMP/seed.dbr"
+          # make-data-seed.sh 的产物是 <prefix>.raw / <prefix>.dbr / <prefix>.uuid ——
+          # <prefix> 本身不是文件。XNU 的 /chosen/memory-map/RAMDisk 吃的是稠密 raw，
+          # 所以这里必须传 .raw（.dbr 是 DBRDISK1 打包版，需要 NativeRamBlock，还没开）。
+          SEED_RAW="$RUNNER_TEMP/seed.dbr.raw"
+          if [ -f "$SEED_RAW" ]; then
+            echo "带 Data 种子: $SEED_RAW"
+            ./unixnu build -D ../device payload --data-ramdisk "$SEED_RAW" --skip-setup 2>&1 | tee /tmp/payload.log | tail -50
           else
-            echo "没有种子，payload 不带 data-ramdisk（探测模式不需要根卷）"
+            echo "没有种子 raw：让 payload 自己生成种子（不加 --skip-setup）"
+            ./unixnu build -D ../device payload 2>&1 | tee /tmp/payload.log | tail -50
           fi
-          ./unixnu build -D ../device payload $SEED_ARGS --skip-setup 2>&1 | tee /tmp/payload.log | tail -50
 
       - name: 失败时也上传日志
         if: always()

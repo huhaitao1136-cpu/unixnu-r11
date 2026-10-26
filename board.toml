@@ -232,7 +232,10 @@ owned_memory_size = "0x60000000"     # 1.5 GiB 起步；总量 3.98 GiB 还要�
 root_match_volume_uuid = "00000000-0000-0000-0000-000000000000"   # TODO：由 [userdata] 生成后回填
 cpu_regs = "0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"   # 实测 2 簇×4 核：cpu0-3=A53(part 0x801)，cpu4-7=gold(0x800)
 psci_method = "smc"
-packed_data_ramdisk = true
+# false：把种子以稠密 raw 交给 XNU 的 /chosen/memory-map/RAMDisk（rd=md0 走这条路）。
+# true 会写成 PackedRAMDisk（DBRDISK1），那条路要 NativeRamBlock 驱动，目前还没开，
+# 而且 XNU 只认 RAMDisk 这个键名 —— 设 true 会让根卷静默挂不上。
+packed_data_ramdisk = false
 persistent_data = true
 ipad_identity = true
 unique_chip_id = "required"           # 平台种子不进仓库
