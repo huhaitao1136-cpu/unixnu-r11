@@ -89,15 +89,23 @@ jobs:
           echo "---- 末尾 120 行 ----"
           tail -120 /tmp/diag.log || true
 
+      # 种子只用于「APFS Data 根卷」这条支线。存储探测（NativeSdhci）不依赖它，
+      # 所以这一步失败绝不能拦住内核产物 —— 用 continue-on-error 把失败降级为警告。
       - name: 生成最小 Data 种子（APFS，跳过 Setup）
+        id: seed
+        continue-on-error: true
         working-directory: device
         run: |
-          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 4096 2>&1 | tee /tmp/seed.log | tail -30
+          bash scripts/make-data-seed.sh "$RUNNER_TEMP/seed.dbr" 64 2>&1 | tee /tmp/seed.log | tail -30
           ls -l "$RUNNER_TEMP/seed.dbr"
 
       - name: 把 Data seed 的 UUID 写进 board.toml
         working-directory: device
         run: |
+          if [ ! -f "$RUNNER_TEMP/seed.dbr.uuid" ]; then
+            echo "没有种子 UUID，跳过（payload 将不带 data-ramdisk）"
+            exit 0
+          fi
           UUID="$(cat "$RUNNER_TEMP/seed.dbr.uuid")"
           echo "seed UUID = $UUID"
           python3 - "$UUID" <<'PY'
@@ -119,7 +127,16 @@ jobs:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
           set -o pipefail
-          ./unixnu build -D ../device payload --data-ramdisk "$RUNNER_TEMP/seed.dbr" --skip-setup 2>&1 | tee /tmp/payload.log | tail -50
+          # macOS runner 的 /bin/bash 是 3.2：set -u 下展开空数组会报 unbound variable，
+          # 所以这里用普通字符串拼接。
+          SEED_ARGS=""
+          if [ -f "$RUNNER_TEMP/seed.dbr" ]; then
+            SEED_ARGS="--data-ramdisk $RUNNER_TEMP/seed.dbr"
+            echo "带 Data 种子: $RUNNER_TEMP/seed.dbr"
+          else
+            echo "没有种子，payload 不带 data-ramdisk（探测模式不需要根卷）"
+          fi
+          ./unixnu build -D ../device payload $SEED_ARGS --skip-setup 2>&1 | tee /tmp/payload.log | tail -50
 
       - name: 失败时也上传日志
         if: always()
@@ -129,11 +146,13 @@ jobs:
           path: |
             /tmp/kernel.log
             /tmp/payload.log
+            /tmp/seed.log
             /tmp/diag.log
             UniXNU/out/r11/logs/**
           if-no-files-found: ignore
 
       - name: 上传内核与 payload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: r11-boot-artifacts
