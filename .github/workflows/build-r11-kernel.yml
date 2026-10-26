@@ -127,17 +127,15 @@ jobs:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
           set -o pipefail
-          # make-data-seed.sh 的产物是 <prefix>.raw / <prefix>.dbr / <prefix>.uuid ——
-          # <prefix> 本身不是文件。XNU 的 /chosen/memory-map/RAMDisk 吃的是稠密 raw，
-          # 所以这里必须传 .raw（.dbr 是 DBRDISK1 打包版，需要 NativeRamBlock，还没开）。
-          SEED_RAW="$RUNNER_TEMP/seed.dbr.raw"
-          if [ -f "$SEED_RAW" ]; then
-            echo "带 Data 种子: $SEED_RAW"
-            ./unixnu build -D ../device payload --data-ramdisk "$SEED_RAW" --skip-setup 2>&1 | tee /tmp/payload.log | tail -50
-          else
-            echo "没有种子 raw：让 payload 自己生成种子（不加 --skip-setup）"
-            ./unixnu build -D ../device payload 2>&1 | tee /tmp/payload.log | tail -50
-          fi
+          # 为什么这里干脆不带种子：
+          #   --data-ramdisk 要的是稠密 raw（.raw），但 --skip-setup 的
+          #   seed-data-skip-setup.py 只会解析 DBRDISK1 打包件，传 .raw 会
+          #   ValueError: Invalid packed RAM disk header；
+          #   而打包件（.dbr）只能通过 PackedRAMDisk 交给 NativeRamBlock，
+          #   那个驱动这一阶段没开。
+          # 所以本阶段用「不带种子的 payload」——这也正是之前真机刷过的配置，
+          # 存储探测发生在 IOKit 匹配期，比挂根卷早，不需要 Data 卷。
+          ./unixnu build -D ../device payload 2>&1 | tee /tmp/payload.log | tail -50
 
       - name: 失败时也上传日志
         if: always()
