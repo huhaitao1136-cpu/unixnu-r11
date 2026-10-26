@@ -59,7 +59,12 @@ def main() -> int:
     print(f'已取出 {got} ({kernel.stat().st_size} B)')
 
     print('== 打内核补丁')
-    if run(['python3', SCRIPTS / 'patch-kernel-full.py', kernel, kernel]).returncode != 0:
+    # 注意：必须用 patch-kernel-minimal.py 并带齐三组开关。
+    # patch-kernel-full.py 只认 msr PAN,#1（0xD500419F），漏掉了更常见的
+    # msr PAN,#0（0xD500409F，_copyout 里那条）—— 那正是真机上第一个
+    # Undefined kernel instruction 的位置。这里改成 minimal + 全开关。
+    if run(['python3', SCRIPTS / 'patch-kernel-minimal.py', kernel, kernel,
+            '--with-validate', '--with-trapfix', '--with-mrs1']).returncode != 0:
         return 1
     print('== 打内核日志上屏补丁')
     if run(['python3', SCRIPTS / 'patch-init-screen-gc.py', kernel]).returncode != 0:

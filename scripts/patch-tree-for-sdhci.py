@@ -12,6 +12,13 @@
   build-xnu-4k-baseline.sh
     4. 新增 NATIVE_SDHCI 开关，打开时 -DXNU_NATIVE_SDHCI=1
     5. 打开时把 libNativeSdhci.a 用 -Wl,-force_load 链进内核
+  patches/xnu/native-sdhci-personality.patch
+    6. 把 XNU_NATIVE_SDHCI 的 IOKit personality 写进主仓库 patches/xnu/ 与装配树
+       （内核的 gIOKernelConfigTables 只在编译期烧进去；没有这段，NativeSdhci 类
+       永远不会被 IOKit 匹配到，probe 也不会被调用）
+
+注意：不能把 .patch 直接放在设备仓库 patches/ 下——tree.py 把 patches 当模块整目录
+链接，同名的 xnu 模块会盖掉主仓库那套上游补丁。所以这里在构建期把文件投递过去。
 
 说明：build-arm-driver.py 来自 SoC 仓库，只在装配树 out/<dev>/<os>/<cfg>/tree/scripts
 里出现；build-xnu-4k-baseline.sh 在主仓库 scripts 与装配树里都有。这里「发现即改」，
@@ -74,6 +81,26 @@ fi'''),
 ]
 
 
+PERSONALITY_PATCH = Path(__file__).resolve().parent / 'data' / 'native-sdhci-personality.patch'
+
+
+def install_personality_patch() -> None:
+    """把 personality 补丁投递到主仓库 patches/xnu/ 与每个已装配的树。"""
+    if not PERSONALITY_PATCH.is_file():
+        sys.exit(f'缺少 {PERSONALITY_PATCH}')
+    text = PERSONALITY_PATCH.read_text()
+    targets = [ROOT / 'patches' / 'xnu', *sorted(ROOT.glob('out/*/*/*/tree/patches/xnu'))]
+    for folder in dict.fromkeys(targets):
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / PERSONALITY_PATCH.name
+        if target.is_file() and target.read_text() == text:
+            print(f'  personality patch: 已存在  {target}')
+            continue
+        with target.open('w', encoding='utf-8', newline='\n') as handle:
+            handle.write(text)
+        print(f'  personality patch: 已写入  {target}')
+
+
 def patch(path: Path, edits, label: str) -> bool:
     if not path.is_file():
         return False
@@ -108,7 +135,10 @@ print('build-xnu-4k-baseline.sh:')
 for t in dict.fromkeys(kernel_targets):
     touched += bool(patch(t, KERNEL_EDITS, 'build-xnu-4k-baseline.sh'))
 
+print('patches/xnu/native-sdhci-personality.patch:')
+install_personality_patch()
+
 if not touched:
     sys.exit('两个脚本都没找到；检查工作目录')
 
-print('完成：NativeSdhci 已接入构建（编译 + 链接两个环节）')
+print('完成：NativeSdhci 已接入构建（编译 + 链接 + personality 三段）')

@@ -2748,3 +2748,96 @@ unixnu: --skip-setup edits the Data seed: pass the original one with --data-ramd
 - ⏳ payload：等下一轮 CI（改动已就位，只差跑一次）。
 - ⏳ 真机探测：拿到 `payload.img` 后打进 `boot.img` 刷机，观察
   `NativeSdhci: matched DT node` → `EXT_CSD ... SEC_COUNT` → `GPT ok ... GPT[1]`。
+
+
+## 3.48 真机第二次启动：内核跑起来了，但 NativeSdhci 一声不吭（2026-10-26 21:10）
+
+### 现象
+
+打过补丁的 payload 刷进去后，屏幕不再停死在菜单帧，内核日志整篇滚出来：
+
+- `Darwin Image4 Validator Version 6.3.0`、`Security policy loaded: AppleImage4 hooks`
+- `AppleImage4: failed to read nonce slot data: 2`（七个 magazine 各一条，没有 nonce 盘是预期）
+- `calling mpo_policy_init for AMFI` / `Seatbelt sandbox policy (Sandbox)` / `no external trust caches found`
+- `apfs_module_start:3232: load: com.apple.filesystems.apfs, v2236.140.6`
+- `dill_init: all the create dill kernel threads have been scheduled`
+- `Skylwalk: sk_copy64_8 ... PASSED` 整套 17 项
+- `bsd_autoconf: calling kinit`、`ifnet_attach: ... lo0`（这一轮才第一次到 kinit）
+- `Install_apfs_vfs_fs:8248`、`IOSurfaceRoot::installMemoryRegions()`
+- 最后一行：`Waiting on <dict ID="0"><key>IOProviderClass</key><string ID="1">IOMedia</string>...<string ID="3">2E551AA5-5686-458D-B878-B467DF68CDB2</string></dict></dict>`
+
+也就是内核在等 UUID `2E551AA5-...` 的 IOMedia。payload 这轮**不带 Data ramdisk**
+（`payload.json` 的 `data_ramdisk_sha256` 是 null），eMMC 又没有块设备，所以永远等下去。
+
+**而且整篇日志里没有一条 `NativeSdhci:`。**
+
+### 根因：驱动类没有 personality，内核根本不会去匹配它
+
+UniXNU 的 XNU 驱动是静态链进内核的 C++ IOKit 类，**内核只从 `iokit/KernelConfigTables.cpp`
+的 `gIOKernelConfigTables` 里认 personality**；`Info.plist` 只是给人看的。
+
+交叉验证：
+
+| 检查 | 结果 |
+|---|---|
+| `kernel.macho` 里 `<string>NativeSdhci` / `<string>ArmDTPlatform` / `<string>ArmCpu` | 0 次 |
+| `kernel.macho` 里 `IOKitPersonalities` | 25 次（全是 Apple 自己的） |
+| `out/r11/tree/.cache/xnu-work/iokit/KernelConfigTables.cpp` | 有 `ArmCpu`/`ArmVirtPlatform`/`ArmDTPlatform`/`IOPanicPlatform`/`IOExclaveProxy` + `XNU_NATIVE_AES`/`VIRTIO_BLOCK`/`VIRTIO_CONSOLE`/`RAM_BLOCK`/`UFS` 五段，**没有 `XNU_NATIVE_SDHCI`** |
+
+`patch-tree-for-sdhci.py` 之前只做了两件事：给编译加 `-DXNU_NATIVE_SDHCI=1`、把
+`libNativeSdhci.a` 用 `-Wl,-force_load` 链进去。类在内存里，但没有任何 personality 指向
+`IOClass = NativeSdhci`，`probe()` 一次都不会被调用 —— 所以日志干净得可疑。
+
+### 修法：构建期把 personality 补丁投递进 `patches/xnu/`
+
+`build-xnu-4k-baseline.sh:44` 是 glob 应用补丁：
+
+```sh
+for PATCH in "$ROOT"/patches/xnu/*.patch "$ROOT"/kits/NativePrelink/patches/*.patch; do
+```
+
+所以只要 `$ROOT/patches/xnu/` 里多一个文件就会被应用。`patches/xnu/native-aes-personality.patch`
+就是这个格式（`@@ -61,4 +61,48 @@`，追加在 `")";` 之前）。
+
+**不能**把 .patch 直接放设备仓库的 `patches/` 下：`tree.py:44,69` 把 patches 当**模块整目录
+链接**，设备仓库一旦出现 `patches/xnu`，同名的 `xnu` 模块会盖掉主仓库那套上游补丁，
+上游几十个 xnu 补丁会全部消失。所以改成：
+
+| 文件 | 作用 |
+|---|---|
+| `unixnu-r11/scripts/data/native-sdhci-personality.patch` | 唯一副本（454 B） |
+| `unixnu-r11/scripts/make-sdhci-personality-patch.py` | 从装配后的 `KernelConfigTables.cpp` 生成它（往 `")";` 前插块，写 LF；`write_text` 在 Windows 上会写成 CRLF，patch 就永远 apply 不上） |
+| `unixnu-r11/scripts/patch-tree-for-sdhci.py` | CI 里把补丁投递到 `$ROOT/patches/xnu/`（已存在的树也覆盖一份） |
+
+补丁内容：
+
+```
+@@ -105,4 +105,11 @@
+     "     'IOProbeScore'    = 500:32;"
+     "   }"
+ #endif
++#if defined(XNU_NATIVE_SDHCI) && XNU_NATIVE_SDHCI
++    "   ,{"
++    "     'IOClass'         = NativeSdhci;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IOProbeScore'    = 1000:32;"
++    "   }"
++#endif
+     ")";
+```
+
+provider 选 `IOPlatformDevice`：ADT 里 `sdhci` 节点是 `arm-io` 的子节点
+（`make-r11-adt.py`，`compatible = qcom,sdhci-msm-v5\0qcom,sdm660-sdhci\0`，无 `reg`），
+`ArmDTPlatform::createDeviceNubs()` 给每个子节点建 nub，UFS 用同一套。
+
+本地验证（WSL，`/root/src/UniXNU`）：脚本两次运行幂等；补丁投递后
+`git -C .cache/xnu-work apply --check` 通过；apply 后 `KernelConfigTables.cpp:110` 出现
+`"     'IOClass'         = NativeSdhci;"`，回滚干净。
+
+### 下一步
+
+1. 重跑 CI → 下载 `kernel.macho` + `payload.img`。
+2. `python3 scripts/patch-payload-full.py out/r11/payload/payload.img` 打补丁（**CI 产物从不自动打**）。
+3. `build-stage1.sh` 出 `boot.img`（7,864,320 B）→ `dd` 刷入 → 看 `NativeSdhci: matched DT node`。
+4. 若 personality 生效但 `Waiting on IOMedia` 仍在最前面：给 payload 加回一个最小 Data ramdisk，
+   让根卷等待有解，内核才会继续走到 exec。

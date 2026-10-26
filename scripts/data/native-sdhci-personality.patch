@@ -1,0 +1,15 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -105,4 +105,11 @@
+     "     'IOProbeScore'    = 500:32;"
+     "   }"
+ #endif
++#if defined(XNU_NATIVE_SDHCI) && XNU_NATIVE_SDHCI
++    "   ,{"
++    "     'IOClass'         = NativeSdhci;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IOProbeScore'    = 1000:32;"
++    "   }"
++#endif
+     ")";
