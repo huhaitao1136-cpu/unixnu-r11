@@ -21,8 +21,9 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
-#include <IOKit/IOMemoryMap.h>
 #include <IOKit/IOMemoryDescriptor.h>
+/* 内核头文件里没有 IOMemoryMap.h（只有 IOUSer 的）；IOMemoryMap 由
+ * IOMemoryDescriptor.h / IODeviceMemory.h 的声明带出来 —— 与 ButtonProbe.cpp 的做法一致。 */
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/storage/IOStorage.h>
 #include <pexpert/pexpert.h>
