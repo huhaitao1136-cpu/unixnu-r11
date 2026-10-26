@@ -68,7 +68,8 @@ jobs:
         run: python3 device/scripts/fix-native-aes-bindings.py UniXNU/scripts/build-native-aes-bindings.py
 
       - name: 把 NativeSdhci 接入构建脚本
-        run: python3 device/scripts/patch-tree-for-sdhci.py
+        working-directory: UniXNU
+        run: python3 ../device/scripts/patch-tree-for-sdhci.py
 
       - name: 编译内核（耗时最长）
         working-directory: UniXNU
