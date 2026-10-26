@@ -98,7 +98,7 @@ def install_personality_patch() -> None:
     if not PERSONALITY_PATCH.is_file():
         sys.exit(f'缺少 {PERSONALITY_PATCH}')
     text = PERSONALITY_PATCH.read_text()
-    targets = [ROOT / 'patches' / 'xnu', *sorted(ROOT.glob('out/*/*/*/tree/patches/xnu'))]
+    targets = [ROOT / 'patches' / 'xnu', *[t / 'patches' / 'xnu' for t in assembled_trees()]]
     for folder in dict.fromkeys(targets):
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / PERSONALITY_PATCH.name
@@ -110,10 +110,16 @@ def install_personality_patch() -> None:
         print(f'  personality patch: 已写入  {target}')
 
 
+def assembled_trees():
+    """已装配的树：实际布局是 out/<dev>/tree；老布局 out/<dev>/<os>/<cfg>/tree 也一并兼容。"""
+    found = [*sorted(ROOT.glob('out/*/tree')), *sorted(ROOT.glob('out/*/*/*/tree'))]
+    return [d for d in dict.fromkeys(found) if d.is_dir()]
+
+
 def xnu_work_dirs():
     """所有可能出现过的 XNU 源码缓存（build-xnu-4k-baseline.sh 用的是相对 .cache/xnu-work）。"""
     dirs = [ROOT / '.cache' / 'xnu-work']
-    for tree in sorted(ROOT.glob('out/*/*/*/tree')):
+    for tree in assembled_trees():
         dirs.append(tree / '.cache' / 'xnu-work')
     return [d for d in dict.fromkeys(dirs) if (d / 'iokit' / 'KernelConfigTables.cpp').is_file()]
 
@@ -162,7 +168,7 @@ def patch(path: Path, edits, label: str) -> bool:
 # build-arm-driver.py 来自设备仓库（已在仓库里改好）；这里只兜底检查
 driver_targets = [ROOT / 'scripts' / 'build-arm-driver.py', ROOT.parent / 'device' / 'scripts' / 'build-arm-driver.py']
 kernel_targets = [ROOT / 'scripts' / 'build-xnu-4k-baseline.sh']
-for scripts in sorted(ROOT.glob('out/*/*/*/tree/scripts')):
+for scripts in [t / 'scripts' for t in assembled_trees()]:
     driver_targets.append(scripts / 'build-arm-driver.py')
     kernel_targets.append(scripts / 'build-xnu-4k-baseline.sh')
 
