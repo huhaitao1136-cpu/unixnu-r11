@@ -25,6 +25,7 @@
 两处都改，避免 build 时重新装配覆盖。脚本可重复执行（已改过就跳过）。
 """
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -78,6 +79,14 @@ fi'''),
   fi
   if [ "${XNU_SOURCE_PTHREAD:-0}" = 1 ]; then
     PTHREAD_ARCHIVE=$ROOT/build/libpthread-kernel/libpthread_kernel.a'''),
+    # SDHCI personality 插在 native-aes-personality.patch 新增块的正后方（都是 ")"; 前的 #endif）。
+    # 只要它留在树里，AES 补丁的 `--reverse --check` 就会失败、正向 apply 也失败，构建直接 exit。
+    # 所以把它并进 LATE_PATCH 先撤一轮，下面按名字顺序重新应用。
+    ('''for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \\
+    "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do''',
+     '''for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \\
+    "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch" \\
+    "$ROOT/patches/xnu/native-sdhci-personality.patch"; do'''),
 ]
 
 
@@ -99,6 +108,36 @@ def install_personality_patch() -> None:
         with target.open('w', encoding='utf-8', newline='\n') as handle:
             handle.write(text)
         print(f'  personality patch: 已写入  {target}')
+
+
+def xnu_work_dirs():
+    """所有可能出现过的 XNU 源码缓存（build-xnu-4k-baseline.sh 用的是相对 .cache/xnu-work）。"""
+    dirs = [ROOT / '.cache' / 'xnu-work']
+    for tree in sorted(ROOT.glob('out/*/*/*/tree')):
+        dirs.append(tree / '.cache' / 'xnu-work')
+    return [d for d in dict.fromkeys(dirs) if (d / 'iokit' / 'KernelConfigTables.cpp').is_file()]
+
+
+def revert_personality_patch() -> None:
+    """把上一轮构建留在 .cache/xnu-work 里的 SDHCI personality 插入撤回。
+
+    build-xnu-4k-baseline.sh 靠 `git apply --reverse --check` 判断"是否已应用"来跳过补丁。
+    我们的插入点紧跟在 native-aes-personality.patch 新增块的末尾（都是 ")"; 之前的
+    `#endif`），所以一旦我们的块留在树里，AES 补丁的反向检查就会失败 →
+    构建在 `patch failed: iokit/KernelConfigTables.cpp:61` 处直接 exit。
+    因此每次构建前先撤回自己，让构建脚本按名字顺序（aes 在前、sdhci 在后）重新应用。"""
+    patch_file = ROOT / 'patches' / 'xnu' / PERSONALITY_PATCH.name
+    if not patch_file.is_file():
+        return
+    for work in xnu_work_dirs():
+        check = subprocess.run(
+            ['git', '-C', str(work), 'apply', '--reverse', '--check', str(patch_file)],
+            capture_output=True, text=True)
+        if check.returncode != 0:
+            continue
+        subprocess.run(['git', '-C', str(work), 'apply', '--reverse', str(patch_file)],
+                       check=True, capture_output=True, text=True)
+        print(f'  personality patch: 已撤回旧插入  {work}')
 
 
 def patch(path: Path, edits, label: str) -> bool:
@@ -137,6 +176,7 @@ for t in dict.fromkeys(kernel_targets):
 
 print('patches/xnu/native-sdhci-personality.patch:')
 install_personality_patch()
+revert_personality_patch()
 
 if not touched:
     sys.exit('两个脚本都没找到；检查工作目录')
