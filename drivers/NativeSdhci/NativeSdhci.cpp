@@ -28,7 +28,6 @@
 #include <IOKit/storage/IOStorage.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
-#include <string>
 
 #include "SdhciRegs.h"
 
@@ -64,7 +63,7 @@ static uintptr_t sdhciMapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMem
     if (!memory) {
         return 0;
     }
-    keep = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+    keep = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere), OSNoRetain);
     memory->release ();
     return keep ? static_cast<uintptr_t> (keep->getVirtualAddress ()) : 0;
 }
@@ -189,7 +188,7 @@ IOService *NativeSdhci::probe (IOService *provider, SInt32 *score)
                                data->getLength (), "qcom,sdhci-msm-v5");
     } else if (OSString *string = OSDynamicCast (OSString, property)) {
         const char *text = string->getCStringNoCopy ();
-        match = text && std::strstr (text, "qcom,sdhci-msm-v5");
+        match = text && sdhciContains (text, strlen (text), "qcom,sdhci-msm-v5");
     }
 
     if (!match) {
@@ -211,7 +210,7 @@ bool NativeSdhci::mapRegisters (IOService *provider)
             if (IODeviceMemory *memory = provider->getDeviceMemoryWithIndex (0)) {
                 IOPhysicalAddress pa = memory->getPhysicalAddress ();
                 fCoreMap = OSSharedPtr<IOMemoryMap> (
-                    memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+                    memory->map (kIOMapAnywhere), OSNoRetain);
                 if (fCoreMap) {
                     fCore = static_cast<uintptr_t> (fCoreMap->getVirtualAddress ());
                     ok = true;
@@ -232,7 +231,7 @@ bool NativeSdhci::mapRegisters (IOService *provider)
     if (provider && provider->getDeviceMemoryCount () > 1) {
         if (IODeviceMemory *memory = provider->getDeviceMemoryWithIndex (1)) {
             fVendorMap = OSSharedPtr<IOMemoryMap> (
-                memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+                memory->map (kIOMapAnywhere), OSNoRetain);
             if (fVendorMap) {
                 fVendor = static_cast<uintptr_t> (fVendorMap->getVirtualAddress ());
             }
@@ -593,7 +592,7 @@ void NativeSdhci::free ()
 
 bool NativeSdhciBlock::init (NativeSdhci *controller)
 {
-    if (!IOBlockStorageDevice::init () || !controller) {
+    if (!IOBlockStorageDevice::init (nullptr) || !controller) {
         return false;
     }
     fController = controller;
@@ -634,6 +633,14 @@ IOReturn NativeSdhciBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 
         return status;
     }
 
+    /* 只读实现：写请求直接拒绝（reportWriteProtection 也是只读） */
+    if (buffer->getDirection () != kIODirectionIn) {
+        if (completion) {
+            IOStorage::complete (completion, kIOReturnUnsupported, 0);
+        }
+        return kIOReturnUnsupported;
+    }
+
     /* 同步 PIO：一次只做一个块，够把根卷挂起来；性能与多块留作 TODO */
     UInt64 remaining = nblks;
     UInt64 current = block;
@@ -647,7 +654,7 @@ IOReturn NativeSdhciBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 
         }
         status = fController->readBlocks (current, 1, scratch);
         if (status == kIOReturnSuccess) {
-            buffer->writeBytes (0, scratch, kSdhciBlockSize);
+            buffer->writeBytes ((current - block) * kSdhciBlockSize, scratch, kSdhciBlockSize);
         }
         IOFreeAligned (scratch, kSdhciBlockSize);
         current++;
