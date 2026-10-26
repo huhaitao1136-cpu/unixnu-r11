@@ -141,13 +141,12 @@ public:
     IOReturn reportEjectability (bool *isEjectable) override;
     IOReturn reportMaxValidBlock (UInt64 *maxBlock) override;
     IOReturn reportMediaState (bool *mediaPresent, bool *changedState = 0) override;
-    IOReturn reportPollRequirements (bool *pollRequired, bool *pollAgain) override;
+    /* reportPollRequirements 仅 TARGET_OS_OSX 存在，iOS 内核里没有这个虚函数 */
     IOReturn reportRemovability (bool *isRemovable) override;
     IOReturn reportWriteProtection (bool *isWriteProtected) override;
 
     /* ---- 非虚辅助（基类没有这两个虚函数，不能写 override）---- */
     IOReturn doSyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 nblks);
-    IOReturn getDeviceType (UInt8 *deviceType);
 
 private:
     NativeSdhci *fController = nullptr;
@@ -208,7 +207,6 @@ bool NativeSdhci::mapRegisters (IOService *provider)
     if (fCore == 0) {
         if (provider && provider->getDeviceMemoryCount () > 0) {
             if (IODeviceMemory *memory = provider->getDeviceMemoryWithIndex (0)) {
-                IOPhysicalAddress pa = memory->getPhysicalAddress ();
                 fCoreMap = OSSharedPtr<IOMemoryMap> (
                     memory->map (kIOMapAnywhere), OSNoRetain);
                 if (fCoreMap) {
@@ -723,14 +721,6 @@ IOReturn NativeSdhciBlock::reportWriteProtection (bool *isWriteProtected)
     return kIOReturnSuccess;
 }
 
-IOReturn NativeSdhciBlock::getDeviceType (UInt8 *deviceType)
-{
-    if (!deviceType) {
-        return kIOReturnBadArgument;
-    }
-    *deviceType = kIOBlockStorageDeviceTypeGeneric;
-    return kIOReturnSuccess;
-}
 
 /* ============ 上面这些是 IOBlockStorageDevice 要求的其余纯虚函数 ============ */
 
@@ -779,12 +769,3 @@ IOReturn NativeSdhciBlock::reportMediaState (bool *mediaPresent, bool *changedSt
     return kIOReturnSuccess;
 }
 
-IOReturn NativeSdhciBlock::reportPollRequirements (bool *pollRequired, bool *pollAgain)
-{
-    if (!pollRequired || !pollAgain) {
-        return kIOReturnBadArgument;
-    }
-    *pollRequired = false;   /* eMMC 不会自己拔出，不需要轮询 */
-    *pollAgain    = false;
-    return kIOReturnSuccess;
-}
