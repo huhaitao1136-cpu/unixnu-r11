@@ -13,9 +13,11 @@
     4. 新增 NATIVE_SDHCI 开关，打开时 -DXNU_NATIVE_SDHCI=1
     5. 打开时把 libNativeSdhci.a 用 -Wl,-force_load 链进内核
   patches/xnu/native-sdhci-personality.patch
-    6. 把 XNU_NATIVE_SDHCI 的 IOKit personality 写进主仓库 patches/xnu/ 与装配树
+    6. 把 XNU_NATIVE_SDHCI 的 IOKit personality 写进主仓库 patches/xnu/
        （内核的 gIOKernelConfigTables 只在编译期烧进去；没有这段，NativeSdhci 类
-       永远不会被 IOKit 匹配到，probe 也不会被调用）
+       永远不会被 IOKit 匹配到，probe 也不会被调用）。装配树的 tree/patches/xnu 是指向
+       主仓库的符号链接，只写主仓库一处即可；若在装配树里 mkdir，会造出真实目录，
+       下次装配 tree.py 的 _link() unlink() 会报 PermissionError
 
 注意：不能把 .patch 直接放在设备仓库 patches/ 下——tree.py 把 patches 当模块整目录
 链接，同名的 xnu 模块会盖掉主仓库那套上游补丁。所以这里在构建期把文件投递过去。
@@ -25,6 +27,7 @@
 两处都改，避免 build 时重新装配覆盖。脚本可重复执行（已改过就跳过）。
 """
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -94,20 +97,38 @@ PERSONALITY_PATCH = Path(__file__).resolve().parent / 'data' / 'native-sdhci-per
 
 
 def install_personality_patch() -> None:
-    """把 personality 补丁投递到主仓库 patches/xnu/ 与每个已装配的树。"""
+    """把 personality 补丁投递到主仓库 patches/xnu/。
+
+    只能写主仓库：装配树里的 tree/patches/xnu 是指向主仓库的**符号链接**，
+    写进去等于两处都有。绝不能在装配树里 mkdir —— 那会造出一个真实目录，
+    下一次装配时 tree.py 的 _link() 对它 unlink() 会报
+    PermissionError: [Errno 1] Operation not permitted。"""
     if not PERSONALITY_PATCH.is_file():
         sys.exit(f'缺少 {PERSONALITY_PATCH}')
     text = PERSONALITY_PATCH.read_text()
-    targets = [ROOT / 'patches' / 'xnu', *[t / 'patches' / 'xnu' for t in assembled_trees()]]
-    for folder in dict.fromkeys(targets):
-        folder.mkdir(parents=True, exist_ok=True)
-        target = folder / PERSONALITY_PATCH.name
-        if target.is_file() and target.read_text() == text:
-            print(f'  personality patch: 已存在  {target}')
+    folder = ROOT / 'patches' / 'xnu'
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / PERSONALITY_PATCH.name
+    if target.is_file() and target.read_text() == text:
+        print(f'  personality patch: 已存在  {target}')
+        return
+    with target.open('w', encoding='utf-8', newline='\n') as handle:
+        handle.write(text)
+    print(f'  personality patch: 已写入  {target}')
+
+
+def heal_tree_patches() -> None:
+    """清掉旧版本脚本误建在装配树里的真实目录 patches/xnu，恢复成符号链接。"""
+    for tree in assembled_trees():
+        folder = tree / 'patches' / 'xnu'
+        if folder.is_symlink() or not folder.is_dir():
             continue
-        with target.open('w', encoding='utf-8', newline='\n') as handle:
-            handle.write(text)
-        print(f'  personality patch: 已写入  {target}')
+        entries = sorted(p.name for p in folder.iterdir())
+        if entries == [PERSONALITY_PATCH.name]:
+            shutil.rmtree(folder)
+            print(f'  personality patch: 已清理误建的目录  {folder}')
+        else:
+            print(f'  personality patch: 警告 {folder} 是真实目录且含其他内容，未处理')
 
 
 def assembled_trees():
@@ -182,6 +203,7 @@ for t in dict.fromkeys(kernel_targets):
 
 print('patches/xnu/native-sdhci-personality.patch:')
 install_personality_patch()
+heal_tree_patches()
 revert_personality_patch()
 
 if not touched:
