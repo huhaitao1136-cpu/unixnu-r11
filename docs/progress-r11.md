@@ -3105,3 +3105,60 @@ v7 第一版撞了两处：
    的局部变量。把探针整体套进一个 `{ ... }` 作用域即可（标签在作用域之外，不构成"跳进作用域"）。
 
 教训：这个驱动文件里 `goto fail` 很多，**新增局部变量一律放在函数开头或独立作用域里**。
+
+## 3.53 NativeSdhci v7 真机结果：延迟修好了，`RESET_ALL` 卡住；v8 改为 CMD|DATA 复位（2026-10-27）
+
+### 3.53.1 真机日志（v7）
+
+```
+NativeSdhci[v7]: ver=02 caps=742dc8b2 caps1=0000000f
+NativeSdhci[v7]: delay probe: begin (cntfrq=19200000 cntpct=18446744085119878400)
+NativeSdhci[v7]: delay probe: done (advanced=68590475116 ticks)
+NativeSdhci[v7]: start: asserting software reset (0x2C word)
+NativeSdhci[v7]: reset: assert=01 word 000f0007 -> 01000003
+NativeSdhci[v7]: reset: never cleared, word=01000003
+NativeSdhci[v7]: reset timed out
+```
+
+三条结论：
+
+1. **`IODelay` 确认是本平台的坑**：换成 `CNTPCT_EL0` 自旋后 `delay probe: done` 打出来了，
+   `cntfrq=19200000`（19.2 MHz，与 GCC 侧 XO 一致）。§3.52 的诊断成立。
+2. **`IOLog` 的 `%llu` 不可信**：打印出的 `cntpct=18446744085119878400` 已经大于 `2^64`
+   （18446744073709551616），`advanced=68590475116` 也对不上 100 us（应为 1901 tick）。
+   所以 v8 起所有 64 位值改成 `%08x%08x` 两段打印。
+3. **`RESET_ALL` 在这个平台上不会清零**：写之前 `CLOCK_CONTROL` 字是 `000f0007`
+   （低 16 位 `0x0007` = INT_CLK_EN + INT_CLK_STABLE + SD_CLK_EN，说明 **ABL 交接时控制器
+   已经被初始化好了、卡时钟已经在跑**；`0x0f` 是 TIMEOUT_CONTROL 默认值），
+   写 `01` 后读回 `01000003`（复位位一直挂着，只有 SD_CLK_EN 被复位清掉），200 ms 后仍是 `01000003`。
+
+### 3.53.2 推论：上一轮"8 位访问挂死总线"的判断要修正
+
+v5 在 `ver=` 之后静默，当时归因为 `sdhciWrite8(0x2F)`。现在看更可能是这样：
+8 位写没问题，**是紧接着的轮询里第一次 `IODelay(10)` 挂住了**（v5 的 `softReset` 只有在
+复位位立刻清零时才不进 `IODelay` 分支，而 `RESET_ALL` 不会立刻清零）。
+v6 换成整字读写之后仍然停在 `delay probe`，正好把这两件事分开了。
+整字访问保留（无害且少一次对齐风险），但结论按 v7 的证据改写。
+
+### 3.53.3 v8 改动
+
+1. `softReset()` 不再是致命错误：超时后**强制把复位字节写 0**，打
+   `reset: never cleared (word=…), forced 0 -> …, continuing`，然后继续往下做。
+2. `start()` 改用 `SDHCI_RESET_CMD | SDHCI_RESET_DATA`（`0x06`）：只复位命令/数据状态机，
+   不碰时钟与电源 —— 全复位在我们这种"bootloader 已初始化"的环境里只会把卡时钟关掉。
+3. 所有 `CLOCK_CONTROL` 写入都只保留 `TIMEOUT_CONTROL` 字节，**复位字节恒写 0**
+   （`tail = word & 0x00FF0000`），避免残留的复位位挡住后续时钟使能。
+4. 探针日志改成 32 位两段（`cntpct=%08x%08x`、`advanced=%08x%08x`）。
+
+### 3.53.4 判读表（v8）
+
+| 屏幕出现 | 结论 | 下一步 |
+|---|---|---|
+| `delay probe: done (advanced=…)` | 计数器正常（100 us ≈ `000000000000076d` @ 19.2 MHz） | — |
+| `reset: never cleared …, continuing` | 复位位卡住但已强制清掉，属**预期** | 看下一行 `bus:` |
+| `bus: hostctl2=…` | 电源/位宽写进去了 | 看 `clock: div=24 … stable` |
+| `internal clock never stabilised` | GCC 基频或分频写没生效 | 复核 `sdcc1_apps_clk_src` 分频（M/N/D） |
+| `clock: div=24 (400 kHz) … stable` | SDCLK 起来了 | 等 `cardInit: CMD0` |
+| `cardInit: OCR=…` | CMD 线通、卡有响应 | 等 `CMD2/CMD3/CMD9` → `EXT_CSD … SEC_COUNT` |
+| `card never left busy (CMD1)` | OCR 一直是 busy 位 | 常见于 CMD1 参数/电压窗口问题 |
+| `cmd timeout state=…` | CMD 没响应 | 查 `PRESENT_STATE` 的 CMD_INHIBIT/DAT_ACTIVE 与引脚复用 |

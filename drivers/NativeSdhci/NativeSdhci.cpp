@@ -45,7 +45,7 @@
 #include "SdhciRegs.h"
 
 #define kSdhciBlockSize   512ULL
-#define kSdhciCmdLoops    200000U     /* 轮询上限（200000 轮 × 1 us = 200 ms 上限） */
+#define kSdhciCmdLoops    200000U     /* 轮询上限（200000 轮 × 1 us = 200 ms） */
 #define kSdhciDataLoops   4000000U    /* 数据阶段上限（约 4 s） */
 
 /* bring-up 版本标记：每改一次驱动就 +1
@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v7"
+#define kSdhciTag         "v8"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -527,8 +527,8 @@ bool NativeSdhci::enableGccClocks ()
 
 bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
 {
-    /* SOFTWARE_RESET 是 0x2F 的 8 位寄存器，落在 0x2C 这个 32 位字的最高字节里。
-     * 8 位访问在 SDCC 上会把 AHB 挂死（v5 实测），所以整字读写。 */
+    /* SOFTWARE_RESET 是 0x2F 的 8 位寄存器，落在 0x2C 这个 32 位字的最高字节里，
+     * 用整字读写访问（v6 起不再有任何 8 位访问）。 */
     uint32_t before = sdhciReadClockWord (fCore);
     sdhciWriteClockWord (fCore, (before & 0x00FFFFFFu) | (((uint32_t) which) << 24));
     IOLog ("NativeSdhci[" kSdhciTag "]: reset: assert=%02x word %08x -> %08x\n",
@@ -542,8 +542,19 @@ bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
         }
         sdhciDelayUs (10);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: reset: never cleared, word=%08x\n", sdhciReadClockWord (fCore));
-    return false;
+
+    /*
+     * v7 实测：写 RESET_ALL(0x01) 之后 200 ms 都不清零（读回 `01000003`），
+     * 而 ABL 交接时 CLOCK_CONTROL 已经是 `000f0007`（内部时钟已稳、卡时钟已开）——
+     * 全复位会把卡时钟关掉、在这套"bootloader 已经初始化好控制器"的环境里走不回来。
+     * 所以复位不再是致命错误：强制把复位位写回 0，然后继续做 power + clock + CMD。
+     */
+    uint32_t stuck = sdhciReadClockWord (fCore);
+    sdhciWriteClockWord (fCore, stuck & 0x00FFFFFFu);
+    uint32_t forced = sdhciReadClockWord (fCore);
+    IOLog ("NativeSdhci[" kSdhciTag "]: reset: never cleared (word=%08x), forced 0 -> %08x, continuing\n",
+           stuck, forced);
+    return true;
 }
 
 bool NativeSdhci::setBusPowerAndClock ()
@@ -577,7 +588,8 @@ bool NativeSdhci::setBusPowerAndClock ()
            hostCtrl2, sdhciReadHostWord (fCore));
 
     /* 超时计数器取最大（0x2E，在 0x2C 字的次高字节） */
-    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & ~0x00FF0000u) | (0x0Eu << 16));
+    /* 超时计数器取最大（0x2E，0x2C 字的次高字节）；复位字节保持 0 */
+    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0x0000FFFFu) | (0x0Eu << 16));
 
     /* 识别阶段 400 kHz：SDCLK = base / (2 * div)，base 由 enableGccClocks() 定成 19.2 MHz
      * → div = 19200000 / (2 * 400000) = 24 */
@@ -594,19 +606,21 @@ bool NativeSdhci::setSdclkDivider (uint32_t div)
     if (div > 0xff) {
         div = 0xff;
     }
-    /* 先停卡时钟再改分频，避免毛刺（只改低 16 位，保留 TIMEOUT/RESET 字节） */
-    sdhciWriteClockWord (fCore, sdhciReadClockWord (fCore) & 0xFFFF0000u);
+    /* 先停卡时钟再改分频，避免毛刺。只保留 TIMEOUT_CONTROL 字节，
+     * 复位字节一律写 0（v7 实测 RESET_ALL 会卡住，不能让残留的 1 挡住时钟）。 */
+    uint32_t tail = sdhciReadClockWord (fCore) & 0x00FF0000u;
+    sdhciWriteClockWord (fCore, tail);
     sdhciDelayUs (100);
 
     uint16_t clk = (uint16_t) (SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8));
-    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0xFFFF0000u) | clk);
+    sdhciWriteClockWord (fCore, tail | clk);
     if (!sdhciWaitClock (fCore, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
         IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u word=%08x)\n",
                div, sdhciReadClockWord (fCore));
         return false;
     }
     clk = (uint16_t) (clk | SDHCI_CLOCK_CARD_EN);
-    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0xFFFF0000u) | clk);
+    sdhciWriteClockWord (fCore, tail | clk);
     sdhciDelayUs (1000);
     IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) word=%08x stable\n", div,
            (unsigned) (R11_SDCLK_BASE_HZ / (2 * div * 1000)),
@@ -1059,21 +1073,23 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
 
-    /* 时间基准自检：v6 实测 IODelay(100) 不返回（`delay probe: begin` 之后再无 `done`，
-     * 而内核其它线程照跑），所以现在改用 CNTPCT_EL0 自旋。这两行日志确认计数器在走。
+    /* 时间基准自检：v6 实测 IODelay(100) 不返回，v7 改用 CNTPCT_EL0 自旋。
+     * 日志按 32 位两段打印，因为 IOLog 的 %llu 在本内核里输出不可信。
      * 单独起一个作用域：C++ 不允许 goto 跳过带初始化的局部变量。 */
     {
-        uint64_t probeFreq = sdhciCounterFreq ();
-        uint64_t probeTicks = sdhciCounter ();
-        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%llu cntpct=%llu)\n",
-               probeFreq, probeTicks);
+        uint32_t freq = (uint32_t) sdhciCounterFreq ();
+        uint64_t startTicks = sdhciCounter ();
+        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%u cntpct=%08x%08x)\n",
+               freq, (uint32_t) (startTicks >> 32), (uint32_t) startTicks);
         sdhciDelayUs (100);
-        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%llu ticks)\n",
-               sdhciCounter () - probeTicks);
+        uint64_t delta = sdhciCounter () - startTicks;
+        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%08x%08x)\n",
+               (uint32_t) (delta >> 32), (uint32_t) delta);
     }
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (0x2C word)\n");
-    if (!softReset (SDHCI_RESET_ALL, kSdhciCmdLoops)) {
+    /* 只复位 CMD/DATA 状态机：全复位会关掉卡时钟并且在本平台卡住（v7 实测） */
+    IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (CMD|DATA, 0x2C word)\n");
+    if (!softReset (SDHCI_RESET_CMD | SDHCI_RESET_DATA, kSdhciCmdLoops)) {
         IOLog ("NativeSdhci[" kSdhciTag "]: reset timed out\n");
         goto fail;
     }
