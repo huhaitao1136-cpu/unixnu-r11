@@ -4567,3 +4567,72 @@ AHB 挂死，连 log 都打不出来。
 下一版就把它恢复；如果两份几乎一样，说明问题不在寄存器配置，而在
 TLMM 引脚复用（DAT 线可能没接到 SDC）或外部电平转换器 —— 那时再 map
 TLMM（`pinctrl@03000000`）逐个 pin 打印。
+
+## 3.75 NativeSdhci v28：after dump 读出两个硬伤（总线电源被关、IO pad EN 没置）
+
+v27 的 `after` dump 一屏把数据阶段的现场拍下来了，直接把问题缩到两个寄存器上。
+
+### 3.75.1 after dump 的读数（4 个 32 位字一行）
+
+```
+after 020: 00000000 01f80af6 00000010 000e0007
+           0x20     0x24     0x28     0x2C
+after 200: 0785642c 00000000 0000001c 00010a0e
+           0x200    0x204    0x208    0x20C
+after 240: 00000000 00000000 00000000 00000001
+           0x240    0x244    0x248    0x24C
+after 250: 02626440 00008000 00000000 00004073
+           0x250    0x254    0x258    0x25C
+after 318: 1000006b 00000000 00f04003 0007f800
+           0x318    0x31C    0x320    0x324
+```
+
+| 寄存器 | 值 | 含义 |
+|---|---|---|
+| `HOST_CONTROL(0x28)` | `0x10` | DMA select = 2（ADMA2-32），低字节没毛病 |
+| `POWER_CONTROL(0x29)` | `0x00` | **总线电源是关的** |
+| `CLOCK_CONTROL(0x2C)` | `0x000e0007` | `INT_CLK_STABLE=1`、`CARD_CLK_EN=1`、TIMEOUT=0x0e、复位字节=0 → 时钟本身是好的 |
+| `VENDOR_SPEC(0x20C)` | `0x00010a0e` | `MCLK_SEL=2`✓、`IO_PAD_PWR_SWITCH(bit16)=1`，但 **`IO_PAD_PWR_SWITCH_EN(bit15)=0`** |
+| `CORE_PWRCTL_CTL(0x24C)` | `0x00000001` | `BUS_OFF` |
+| `DLL_CONFIG(0x200)` / `DLL_STATUS(0x208)` | `0x0785642c` / `0x1c` | `DLL_EN=1`，但没有 lock 位 |
+| `DDR_CONFIG(0x25C)` | `0x00004073` | 还是 ABL 留下的 DDR 配置 |
+| `MCI_VERSION(0x318)` | `0x1000006b` | core 1.6b（与启动日志一致） |
+| `MCI_STATUS(0x324)` | `0x0007f800` | 无错误位 |
+
+### 3.75.2 两个硬伤
+
+1. **`POWER_CONTROL = 0`。** `setBusPowerAndClock()` 里写过
+   `SDHCI_POWER_ON | SDHCI_POWER_330`（那一版的 `word28=0000ff18`，低字节 `0x18`、
+   次字节 `0x0f` = `POWER_330|POWER_ON`）。但随后 `recoverCommandState()` 的
+   `RESET_CMD|RESET_DATA` 与时钟设置路径把它又清回了 0，之后没人再置位。
+2. **`IO_PAD_PWR_SWITCH_EN(bit15)` 一直是 0。** Linux `sdhci_msm_set_vmmc()`
+   （`sdhci-msm.c:2160-2177`）明确**先置 EN 位**，再按电压置/清 `SWITCH(bit16)`；
+   只有 `SWITCH` 没有 `EN`，1.8V 选择根本不生效 —— 而 R11 的 VCCQ 就是 1.8V。
+
+这两条都能解释"命令通道全通（CMD1/CMD2/CMD3/CMD7/CMD13 的 R1 干净）、
+但数据线一个字节都不动（`DAT[3:0]` 恒为 1111）"。
+
+### 3.75.3 v28 的两处改动
+
+* `dumpRegs()` 改成 **快照 + diff**：`kSdhciDumpOffsets[]` 43 个对齐偏移，
+  第一次调用（`abl`）只存快照打 `===== snapshot abl: 43 regs held =====`；
+  之后只打印"变了的" `%03x: %08x -> %08x` + `changed=%u/%u`，再补三行固定关注项
+  （`host28/clk2c/state24`、`dll200/dllst208/vs20c`、`pwr240/pwr24c/ddr25c/mstat324`）。
+  一屏看完，拍照不用拼图。
+* 新增 `ensureBusState(const char *why)`：每次发数据命令（CMD8 / CMD17）之前，
+  1) 把 `0x28` 字的次字节重写为 `SDHCI_POWER_ON|SDHCI_POWER_330`、低字节保持 1-bit
+  （清 `8BITBUS|4BITBUS`）；
+  2) 把 `0x20C` 的 `bit15|bit16` 一起置上。
+  打 `bus[cmd8] host28=… -> … vs0=… -> …`。
+
+### 3.75.4 下一刷判读表
+
+| 现象 | 结论 |
+|---|---|
+| `bus[cmd8] host28=00000010 -> 00000f10` | 电源位置上了（`0x0f` = `POWER_330|POWER_ON`） |
+| `vs0=00010a0e -> 00018a0e` | IO pad EN 置上了（bit15=1） |
+| `diff after` 里 `028: 00000f10 -> 00000010` | 电源位又被复位吃掉了 → 要在复位之后、每条命令之前都补 |
+| `pio got 512 words` 里 `first` 非 0 | **数据通了**，接着看 `w52/w53`（`SEC_COUNT`） |
+| 仍然全 0，且 `diff` 显示 `20c` 没变 | 写 `IO_PAD_PWR_SWITCH` 被硬件忽略 → 转 TLMM（`0x03000000`）查 DAT 引脚配置 |
+| 仍然全 0，`diff` 里 `2c` 掉到 `000e0003` | `CARD_CLK_EN` 被清 → 时钟在命令后掉了，需在命令前重开 |
+

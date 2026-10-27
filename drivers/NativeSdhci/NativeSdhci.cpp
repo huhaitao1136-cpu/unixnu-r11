@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v27"
+#define kSdhciTag         "v28"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -300,7 +300,8 @@ private:
     bool     endDmaRead (void *dst, UInt32 bytes);
     bool     readCsd ();
     bool     logCardStatus (const char *who);   /* v26: CMD13，问卡在什么状态 */
-    void     dumpRegs (const char *tag);        /* v27: 全表 dump，找数据路径缺的那块 */
+    void     dumpRegs (const char *tag);        /* v27/v28: 快照 + diff */
+    void     ensureBusState (const char *why);  /* v28: 数据命令前重新拉起电源/IO pad */
     bool     readExtCsd ();
     bool     probeMedia ();
 
@@ -1014,22 +1015,85 @@ bool NativeSdhci::logCardStatus (const char *who)
     return true;
 }
 
+static const uint32_t kSdhciDumpOffsets[] = {
+    /* SDHCI 标准寄存器（core 窗口） */
+    0x000, 0x004, 0x008, 0x00C, 0x010, 0x014, 0x018, 0x01C, 0x024, 0x028,
+    0x02C, 0x030, 0x034, 0x038, 0x03C, 0x040, 0x044, 0x048, 0x054, 0x058,
+    /* MSM vendor 窗口（sdhci_msm_v5_offset） */
+    0x200, 0x204, 0x208, 0x20C, 0x210, 0x21C, 0x220, 0x240, 0x244, 0x248,
+    0x24C, 0x250, 0x254, 0x258, 0x25C, 0x260, 0x300, 0x304, 0x308, 0x30C,
+    0x318, 0x324, 0x328
+};
+#define kSdhciDumpCount (sizeof (kSdhciDumpOffsets) / sizeof (kSdhciDumpOffsets[0]))
+
+static uint32_t gSdhciSnapshot[kSdhciDumpCount];
+static bool     gSdhciSnapshotValid = false;
+
 void NativeSdhci::dumpRegs (const char *tag)
 {
-    /* 全部 4 字节对齐的偏移 —— 错位 32 位读会把 AHB 挂死（见 docs §3.50） */
-    IOLog ("NativeSdhci[" kSdhciTag "]: ===== dump %s: core 0x000..0x0FC =====\n", tag);
-    for (uint32_t base = 0x000; base <= 0x0F0; base += 0x10) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x %08x %08x %08x\n", tag,
-               base, sdhciRead32 (fCore, base + 0x0), sdhciRead32 (fCore, base + 0x4),
-               sdhciRead32 (fCore, base + 0x8), sdhciRead32 (fCore, base + 0xC));
+    if (!gSdhciSnapshotValid) {
+        for (size_t i = 0; i < kSdhciDumpCount; i++) {
+            gSdhciSnapshot[i] = sdhciRead32 (fCore, kSdhciDumpOffsets[i]);
+        }
+        gSdhciSnapshotValid = true;
+
+        IOLog ("NativeSdhci[" kSdhciTag "]: ===== snapshot %s: %u regs held =====\n",
+               tag, (unsigned) kSdhciDumpCount);
+        return;
     }
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: ===== dump %s: vendor 0x200..0x330 =====\n", tag);
-    for (uint32_t base = 0x200; base <= 0x330; base += 0x10) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x %08x %08x %08x\n", tag,
-               base, sdhciRead32 (fCore, base + 0x0), sdhciRead32 (fCore, base + 0x4),
-               sdhciRead32 (fCore, base + 0x8), sdhciRead32 (fCore, base + 0xC));
+    /* 第二次起只打"变了的"，一屏看得完 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: ===== diff %s (only changed regs) =====\n", tag);
+    uint32_t changes = 0;
+    for (size_t i = 0; i < kSdhciDumpCount; i++) {
+        uint32_t now = sdhciRead32 (fCore, kSdhciDumpOffsets[i]);
+        if (now != gSdhciSnapshot[i]) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x -> %08x\n",
+                   tag, kSdhciDumpOffsets[i], gSdhciSnapshot[i], now);
+            changes++;
+        }
     }
+    IOLog ("NativeSdhci[" kSdhciTag "]: %s changed=%u/%u\n", tag, changes,
+           (unsigned) kSdhciDumpCount);
+
+    /* 固定关注项：总线电源、IO pad、时钟、DLL、DDR、MCI 电源控制 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: %s key host28=%08x clk2c=%08x state24=%08x\n", tag,
+           sdhciRead32 (fCore, 0x028), sdhciRead32 (fCore, 0x02C),
+           sdhciRead32 (fCore, 0x024));
+    IOLog ("NativeSdhci[" kSdhciTag "]: %s key dll200=%08x dllst208=%08x vs20c=%08x\n", tag,
+           sdhciRead32 (fCore, 0x200), sdhciRead32 (fCore, 0x208),
+           sdhciRead32 (fCore, 0x20C));
+    IOLog ("NativeSdhci[" kSdhciTag "]: %s key pwr240=%08x pwr24c=%08x ddr25c=%08x mstat324=%08x\n",
+           tag, sdhciRead32 (fCore, 0x240), sdhciRead32 (fCore, 0x24C),
+           sdhciRead32 (fCore, 0x25C), sdhciRead32 (fCore, 0x324));
+}
+
+void NativeSdhci::ensureBusState (const char *why)
+{
+    /* 1) HOST_CONTROL(0x28) 低字节与 POWER_CONTROL(0x29) 同一个 32 位字，一起写。
+     *    POWER_CONTROL 缺 SDHCI_POWER_ON 就等于把总线电源关了。 */
+    uint32_t word = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
+    uint32_t hostCtrl = word & 0xFFu;
+
+    hostCtrl &= ~(uint32_t) (SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);   /* 1-bit */
+    uint32_t newWord = (word & 0xFFFF0000u)
+                     | ((uint32_t) (SDHCI_POWER_ON | SDHCI_POWER_330) << 8)
+                     | hostCtrl;
+
+    if (newWord != word) {
+        sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, newWord);
+    }
+
+    /* 2) IO pad 1.8V：bit15(EN) 必须置上，bit16(1.8V) 才生效 */
+    uint32_t vs0 = sdhciRead32 (fCore, 0x20Cu);
+    uint32_t want = vs0 | 0x00008000u | 0x00010000u;
+    if (want != vs0) {
+        sdhciWrite32 (fCore, 0x20Cu, want);
+    }
+
+    IOLog ("NativeSdhci[" kSdhciTag "]: bus[%s] host28=%08x -> %08x vs0=%08x -> %08x\n",
+           why, word, sdhciRead32 (fCore, SDHCI_HOST_CONTROL),
+           vs0, sdhciRead32 (fCore, 0x20Cu));
 }
 
 bool NativeSdhci::readCsd ()
@@ -1248,6 +1312,7 @@ bool NativeSdhci::readExtCsd ()
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
                       (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
+        ensureBusState ("cmd8");
         IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
@@ -1538,6 +1603,7 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
     }
 
     for (uint32_t attempt = 0; attempt < 2; attempt++) {
+        ensureBusState ("cmd17");
         sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
         /* v25：不用 DMA。v19 的 PIO 至少拿到过 BUFFER_READ_READY，而 ADMA2/SDMA
