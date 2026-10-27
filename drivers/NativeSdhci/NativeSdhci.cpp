@@ -153,7 +153,9 @@ static void sdhciDelayUs (uint32_t us)
 {
     uint64_t freq = sdhciCounterFreq ();
     if (freq == 0 || freq > 1000000000ULL) {
-        for (volatile uint32_t i = 0; i < us * 64u; i++) {
+        /* 计数器不可用：固定次数 yield 自旋（asm volatile 保证循环不被优化掉） */
+        uint32_t spins = us * 64u;
+        for (uint32_t i = 0; i < spins; i++) {
             __asm__ volatile ("yield");
         }
         return;
@@ -1058,14 +1060,17 @@ bool NativeSdhci::start (IOService *provider)
     }
 
     /* 时间基准自检：v6 实测 IODelay(100) 不返回（`delay probe: begin` 之后再无 `done`，
-     * 而内核其它线程照跑），所以现在改用 CNTPCT_EL0 自旋。这两行日志确认计数器在走。 */
-    uint64_t probeFreq = sdhciCounterFreq ();
-    uint64_t probeTicks = sdhciCounter ();
-    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%llu cntpct=%llu)\n",
-           probeFreq, probeTicks);
-    sdhciDelayUs (100);
-    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%llu ticks)\n",
-           sdhciCounter () - probeTicks);
+     * 而内核其它线程照跑），所以现在改用 CNTPCT_EL0 自旋。这两行日志确认计数器在走。
+     * 单独起一个作用域：C++ 不允许 goto 跳过带初始化的局部变量。 */
+    {
+        uint64_t probeFreq = sdhciCounterFreq ();
+        uint64_t probeTicks = sdhciCounter ();
+        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%llu cntpct=%llu)\n",
+               probeFreq, probeTicks);
+        sdhciDelayUs (100);
+        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%llu ticks)\n",
+               sdhciCounter () - probeTicks);
+    }
 
     IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (0x2C word)\n");
     if (!softReset (SDHCI_RESET_ALL, kSdhciCmdLoops)) {
