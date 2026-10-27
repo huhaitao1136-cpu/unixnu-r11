@@ -3162,3 +3162,97 @@ v6 换成整字读写之后仍然停在 `delay probe`，正好把这两件事分
 | `cardInit: OCR=…` | CMD 线通、卡有响应 | 等 `CMD2/CMD3/CMD9` → `EXT_CSD … SEC_COUNT` |
 | `card never left busy (CMD1)` | OCR 一直是 busy 位 | 常见于 CMD1 参数/电压窗口问题 |
 | `cmd timeout state=…` | CMD 没响应 | 查 `PRESENT_STATE` 的 CMD_INHIBIT/DAT_ACTIVE 与引脚复用 |
+
+## 3.54 NativeSdhci v9：SDCLK 由 GCC 决定，SDHCI 分频器在 MSM 上是死的 —— 这就是 CMD1 超时的原因（2026-10-27）
+
+### 3.54.1 v8 真机日志（大突破）
+
+```
+NativeSdhci[v8]: state=01f800f0
+NativeSdhci[v8]: ver=02 caps=742dc8b2 caps1=0000008f
+NativeSdhci[v8]: delay probe: begin (cntfrq=19200000 cntpct=ffffffff007b0700)
+NativeSdhci[v8]: delay probe: done (advanced=…)
+NativeSdhci[v8]: start: asserting software reset (CMD|DATA, 0x2C word)
+NativeSdhci[v8]: reset: assert=06 word 000f0007 -> 000f0007
+NativeSdhci[v8]: reset: cleared after 0 polls, word=000f0007
+NativeSdhci[v8]: start: reset done
+NativeSdhci[v8]: bus: hostctl2=0000 word28=0000ff18 (1-bit, 3.3V)
+NativeSdhci[v8]: clock: div=24 (400 kHz) word=000e1805 stable
+NativeSdhci[v8]: start: clock done
+NativeSdhci[v8]: cardInit: CMD0
+NativeSdhci[v8]: cardInit: CMD1 (op cond)
+NativeSdhci[v8]: cmd error int=0000 err=0001
+NativeSdhci[v8]: CMD1 transfer failed (i=0)
+NativeSdhci[v8]: card init failed at step 2 (state=01f800f0 err=0000)
+```
+
+- `CMD|DATA` 复位立刻就清零（`cleared after 0 polls`），不再卡 200 ms：**§3.53 的改法正确**。
+- `delay probe` 两段 32 位打印也对上了（`cntfrq=19200000`）。
+- 但 `CMD1` 直接**命令超时**（`err=0001`，Error Interrupt Status bit0 = Command Timeout）。
+  注意这次内核没停：`card init failed at step 2` 之后 `NativeSdhci::start()` 正常返回失败，
+  后面的 `dlil_init` / `Skylwalk` / `bsd_autoconf` 照常跑。
+
+### 3.54.2 根因：MSM 的 SDHCI 没有内部分频器
+
+`drivers/mmc/host/sdhci-msm.c`（v6.6）里两处原文：
+
+```
+/*
+ * __sdhci_msm_set_clock - sdhci_msm clock control.
+ * MSM controller does not use internal divider and
+ * instead directly control the GCC clock as per
+ * HW recommendation.
+ */
+```
+
+以及 `msm_set_clock_rate_for_bus_mode()` 走的是 `clk_set_rate(core_clk, …)`，**不是**写
+`SDHCI_CLOCK_CONTROL` 的分频字段。也就是说我们一直写的 `div=24` 完全无效，
+真正的 SDCLK = GCC 里 `sdcc1_apps_clk_src` 的输出 = 19.2 MHz。
+
+而 eMMC 在 CMD1 之前，卡的响应是**开漏驱动**（只有上拉 + 卡的下拉），规范要求
+此时时钟 ≤ 400 kHz；19.2 MHz 下必然采不到响应 → Command Timeout。
+这正好解释了为什么 `state=01f800f0` 里 CARD_INSERTED/CARD_STABLE 都在、CMD 线却是超时而不是别的错。
+
+### 3.54.3 顺带把 RCG 的编码搞清楚
+
+`clk-rcg2.c` 的 `calc_rate()`：
+
+```c
+if (hid_div)     rate = rate * 2 / (hid_div + 1);
+if (mode)        rate = rate * m / n;          /* mode = CFG[13:12] == 2 即 dual-edge */
+```
+
+`__clk_rcg2_configure()` 写寄存器时三个值都取反码：
+
+| 寄存器 | 写入值 |
+|---|---|
+| `M_REG` | `m` |
+| `N_REG` | `~(n - m)` |
+| `D_REG` | `~clamp(n, m, 2(n-m))` |
+| `CFG_REG` | `hid_div`（bit0..4） + `src_sel`（bit8..10） + `mode`（bit12..13） |
+
+所以 400 kHz（父时钟 XO 19.2 MHz）= `m/n = 1/48`：
+`M=0x01`、`N=~47=0xD0`、`D=~48=0xCF`、`CFG=0x2000`（dual-edge、src=XO、不分频）。
+
+### 3.54.4 v9 改动
+
+1. 新增 `setGccSdccRate(m, n, hidDiv)`：关根 → 写 M/N/D 反码 → 写 CFG → `CMD_UPDATE` →
+   `CMD_ROOT_EN` → 轮询 `CMD_ROOT_OFF`，最后**按 calc_rate 回读自检**并打印
+   `gcc: m/n/hid=… -> … Hz`。
+2. `setSdclkDivider()` 换成 `setBusClock(hz)`：按目标频率算出 `m/n`（400 kHz → 1/48，
+   19.2 MHz → 1/1），然后 `CLOCK_CONTROL` 只写 `INT_CLK_EN|CARD_EN`、**分频字段恒 0**
+   （照 msm 驱动的做法）。`INT_CLK_STABLE` 只记录，不再当致命错误。
+3. 识别阶段 400 kHz，`cardInit()` 成功后升到 19.2 MHz（原来写的是 `div=1`）。
+4. `CMD1` 参数改成 `0x40FF8000`（HCS + 3.2–3.4V），并且**去掉 `SDHCI_CMD_CRC`** ——
+   R3 响应没有 CRC，带 CRC 检查只会误判。
+
+### 3.54.5 判读表（v9）
+
+| 屏幕出现 | 结论 |
+|---|---|
+| `gcc: m/n/hid=1/48/0 -> 400000 Hz` | GCC 真的输出 400 kHz |
+| `clock: 400000 Hz …` | 控制器时钟门已开 |
+| `cardInit: OCR=…` | **CMD1 通了，卡在应答** |
+| `CMD1 transfer failed (i=0)` + `err=0001` | 还是超时：查 CMD 引脚/上拉、或 GCC 频率没生效 |
+| `cmd error … err=0004`（CRC） | 参数/CRC 设置问题（R3 不该带 CRC） |
+| `cardInit: CMD2 (cid)` 之后继续 | 识别链走通，只差 CMD3/CMD9/CMD16 |

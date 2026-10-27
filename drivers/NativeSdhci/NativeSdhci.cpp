@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v8"
+#define kSdhciTag         "v9"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -235,18 +235,6 @@ static bool sdhciWaitSet (uintptr_t base, uint32_t off, uint32_t mask, uint32_t 
     return false;
 }
 
-/* 轮询 0x2C 那个 32 位字的低 16 位（CLOCK_CONTROL），不动 TIMEOUT/RESET 字节 */
-static bool sdhciWaitClock (uintptr_t base, uint16_t mask, uint32_t loops)
-{
-    for (uint32_t i = 0; i < loops; i++) {
-        if ((sdhciReadClockWord (base) & mask) == mask) {
-            return true;
-        }
-        sdhciDelayUs (1);
-    }
-    return false;
-}
-
 #if XNU_NATIVE_SDHCI_BLOCK_DEVICE
 class NativeSdhciBlock;
 #endif
@@ -272,7 +260,8 @@ private:
     bool     enableGccClocks ();
     bool     softReset (uint32_t which, uint32_t loops);
     bool     setBusPowerAndClock ();
-    bool     setSdclkDivider (uint32_t div);
+    bool     setGccSdccRate (uint32_t m, uint32_t n, uint32_t hidDiv);
+    bool     setBusClock (uint32_t hz);
     bool     cardInit ();
 
     bool     sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uint32_t *resp);
@@ -591,40 +580,121 @@ bool NativeSdhci::setBusPowerAndClock ()
     /* 超时计数器取最大（0x2E，0x2C 字的次高字节）；复位字节保持 0 */
     sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0x0000FFFFu) | (0x0Eu << 16));
 
-    /* 识别阶段 400 kHz：SDCLK = base / (2 * div)，base 由 enableGccClocks() 定成 19.2 MHz
-     * → div = 19200000 / (2 * 400000) = 24 */
-    return setSdclkDivider (24);
+    /* 识别阶段 400 kHz：靠 GCC 的 M/N(=1/48) 得到，SDHCI 分频器在本平台上无效 */
+    return setBusClock (400000);
 }
 
-/* SDHCI v3 时钟控制：bit0 INT_CLK_EN，bit2 SD_CLK_EN，bits[15:8] 分频值。
- * SDCLK = R11_SDCLK_BASE_HZ / (2 * div)。 */
-bool NativeSdhci::setSdclkDivider (uint32_t div)
+/* GCC 里 sdcc1_apps_clk_src 的输出频率按 clk-rcg2.c 的 calc_rate 反推：
+ *   rate = XO * 2/(hid+1) * m/n        （m != n 时走 dual-edge 模式）
+ * 400 kHz = 19.2 MHz * 1/48 → m=1, n=48, hid=0；19.2 MHz 就是 m/n=1/1（mode=0 时忽略 m/n）。
+ * M/N/D 三个寄存器存的都是反码：M=m、N=~(n-m)、D=~clamp(n, m, 2(n-m))。 */
+bool NativeSdhci::setGccSdccRate (uint32_t m, uint32_t n, uint32_t hidDiv)
 {
-    if (div < 1) {
-        div = 1;
+    OSSharedPtr<IOMemoryMap> gccMap;
+    uintptr_t gcc = sdhciMapPhys (R11_GCC_PHYS, R11_GCC_REG_SIZE, gccMap);
+    if (!gcc) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed, cannot set rate\n");
+        return false;
     }
-    if (div > 0xff) {
-        div = 0xff;
+    const uint32_t rcgr = GCC_SDCC1_APPS_RCGR;
+    const uint32_t mask = 0xFFu;
+
+    if (m == 0) {
+        m = 1;
     }
-    /* 先停卡时钟再改分频，避免毛刺。只保留 TIMEOUT_CONTROL 字节，
-     * 复位字节一律写 0（v7 实测 RESET_ALL 会卡住，不能让残留的 1 挡住时钟）。 */
+    if (n < m) {
+        n = m;
+    }
+
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CMD, 0);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_M, m & mask);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_N, (~(n - m)) & mask);
+
+    uint32_t dval = n;
+    uint32_t twice = (n - m) * 2;
+    if (twice > m && dval > twice) {
+        dval = twice;
+    }
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_D, (~dval) & mask);
+
+    uint32_t cfg = hidDiv & 0x1Fu;
+    if (m != n) {
+        cfg |= (0x2u << 12);        /* CFG_MODE_DUAL_EDGE */
+    }
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CFG, cfg);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CMD, GCC_RCG_CMD_UPDATE);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CMD, GCC_RCG_CMD_ROOT_EN);
+
+    for (uint32_t i = 0; i < 1000; i++) {
+        if ((sdhciRead32 (gcc, rcgr + GCC_RCG_CMD) & GCC_RCG_CMD_ROOT_OFF) == 0) {
+            break;
+        }
+        sdhciDelayUs (10);
+    }
+
+    /* 回读并按 calc_rate 自己算一遍，屏幕上看得到实际频率 */
+    uint32_t cfgNow = sdhciRead32 (gcc, rcgr + GCC_RCG_CFG);
+    uint32_t mNow   = sdhciRead32 (gcc, rcgr + GCC_RCG_M) & mask;
+    uint32_t nNow   = ((~sdhciRead32 (gcc, rcgr + GCC_RCG_N)) & mask) + mNow;
+    uint32_t hidNow = cfgNow & 0x1Fu;
+    uint32_t hz = R11_SDCLK_BASE_HZ;
+    if (hidNow) {
+        hz = (hz * 2) / (hidNow + 1);
+    }
+    if ((cfgNow & 0x3000u) && nNow) {
+        hz = (uint32_t) (((uint64_t) hz * mNow) / nNow);
+    }
+    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: m/n/hid=%u/%u/%u -> %u Hz (cfg=%08x m=%08x n=%08x d=%08x)\n",
+           mNow, nNow, hidNow, hz, cfgNow,
+           sdhciRead32 (gcc, rcgr + GCC_RCG_M),
+           sdhciRead32 (gcc, rcgr + GCC_RCG_N),
+           sdhciRead32 (gcc, rcgr + GCC_RCG_D));
+    return true;
+}
+
+/* 换 SD 总线时钟。**关键**：sdhci-msm.c 明确写着
+ * "MSM controller does not use internal divider and instead directly control
+ *  the GCC clock as per HW recommendation"，所以 SDHCI 的 CLOCK_CONTROL 分频字段
+ * 是无效的 —— 真正决定 SDCLK 的是 sdcc1_apps_clk_src 的 M/N/D（见上面 helper）。
+ * r11 上的父时钟只有 XO 19.2 MHz 是确定在跑的，所以用 m/n 凑频率。 */
+bool NativeSdhci::setBusClock (uint32_t hz)
+{
+    if (hz == 0) {
+        hz = R11_SDCLK_BASE_HZ;
+    }
+    uint32_t n = 1;
+    if (hz < R11_SDCLK_BASE_HZ) {
+        n = R11_SDCLK_BASE_HZ / hz;
+        if (n < 1) {
+            n = 1;
+        }
+        if (n > 255) {
+            n = 255;                /* mnd_width = 8 */
+        }
+    } else {
+        hz = R11_SDCLK_BASE_HZ;
+    }
+    uint32_t m = 1;                 /* 分子固定 1，靠 n 分频到目标频率 */
+
+    if (!setGccSdccRate (m, n, 0)) {
+        return false;
+    }
+
     uint32_t tail = sdhciReadClockWord (fCore) & 0x00FF0000u;
     sdhciWriteClockWord (fCore, tail);
     sdhciDelayUs (100);
-
-    uint16_t clk = (uint16_t) (SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8));
-    sdhciWriteClockWord (fCore, tail | clk);
-    if (!sdhciWaitClock (fCore, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u word=%08x)\n",
-               div, sdhciReadClockWord (fCore));
-        return false;
+    sdhciWriteClockWord (fCore, tail | SDHCI_CLOCK_INT_EN);
+    for (uint32_t i = 0; i < kSdhciCmdLoops; i++) {
+        if (sdhciReadClockWord (fCore) & SDHCI_CLOCK_INT_STABLE) {
+            break;
+        }
+        sdhciDelayUs (10);
     }
-    clk = (uint16_t) (clk | SDHCI_CLOCK_CARD_EN);
-    sdhciWriteClockWord (fCore, tail | clk);
+    uint32_t st = sdhciReadClockWord (fCore);
+    sdhciWriteClockWord (fCore, tail | SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN);
     sdhciDelayUs (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) word=%08x stable\n", div,
-           (unsigned) (R11_SDCLK_BASE_HZ / (2 * div * 1000)),
-           sdhciReadClockWord (fCore));
+    IOLog ("NativeSdhci[" kSdhciTag "]: clock: %u Hz (gcc m/n=%u/%u) int=%08x now=%08x\n",
+           hz, m, n, st, sdhciReadClockWord (fCore));
     return true;
 }
 
@@ -928,8 +998,10 @@ bool NativeSdhci::cardInit ()
     IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 (op cond)\n");
     bool ready = false;
     for (uint32_t i = 0; i < 1000; i++) {
-        if (!sendCommand (MMC_SEND_OP_COND, 0x40FF8080,
-                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
+        /* CMD1 的响应是 R3：**没有 CRC**。带 SDHCI_CMD_CRC 会被当成 CRC 错；
+         * 参数 0x40FF8000 = HCS(bit30, 支持高容量) + OCR 电压窗 3.2–3.4V。 */
+        if (!sendCommand (MMC_SEND_OP_COND, 0x40FF8000U,
+                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_INDEX, resp)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD1 transfer failed (i=%u)\n", i);
             return false;
         }
@@ -1107,9 +1179,9 @@ bool NativeSdhci::start (IOService *provider)
     IOLog ("NativeSdhci[" kSdhciTag "]: start: card init done\n");
 
     /* 识别完升频：19.2 MHz / 2 = 9.6 MHz，EXT_CSD 和 GPT 的读取会快一个数量级 */
-    if (!setSdclkDivider (1)) {
+    if (!setBusClock (19200000)) {
         IOLog ("NativeSdhci[" kSdhciTag "]: could not raise the transfer clock, staying at 400 kHz\n");
-        setSdclkDivider (24);
+        setBusClock (400000);
     }
 
     native_sdhci_step = 9;
