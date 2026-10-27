@@ -3874,3 +3874,60 @@ media probe failed at step 9
 | `got 256/512 words` | 卡按 1/2 KB 块在发 | CMD16 没生效，改用 CMD6 改 EXT_CSD 的块长 |
 | `got 4096 words`（顶到上限） | 多块开环传输 | 需要 CMD12 收尾 |
 | `first=00000000 00000000 …` | FIFO 给的是空数据 | 时钟/采样点问题，回到 400 kHz 以下继续降速验证 |
+
+## 3.65 NativeSdhci v19 真机结果：512 个字全是 0 → CPU 读 FIFO 这条路不通，v20 改 ADMA2（2026-10-27）
+
+### 3.65.1 v19 屏幕日志（CMD8 两轮 + CMD17 两轮）
+
+```
+CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff18 attempt=0
+cmd8 pre  state=01f000f0 adma=00000000
+cmd8 posted state=01f000f1
+cmd8 complete state=01e002f6
+CMD8 ok state=01e002f6 nis=00000000 eis=00000000 adma=00000000
+pio got 512 words (block=128) first=00000000 00000000 00000000 00000000 last=...
+pio after state=01f00af6 nis=00000020 eis=00000000
+data timeout nis=0020 eis=0000 state=01f00af6
+EXT_CSD transfer failed (attempt 0)
+...（attempt 1 相同）
+cmd17 ...（LBA0，两轮相同）
+LBA0 read FAILED
+media probe failed at step 9
+```
+
+### 3.65.2 三条硬结论
+
+1. **FIFO 端口被 CPU 读出来是 0，而且读 512 个字也不清 `BUFFER_READ_ENABLE(bit11)`**
+   —— 说明这条"CPU 直读 Buffer Data Port"的 PIO 路径在这块 MSM 控制器上不成立：
+   读不会推进 FIFO 指针（`first` 是四个 0，`bit11` 依旧为 1）。
+2. **错误寄存器全程为 0**（`eis=0000`），`DATA_END(bit1)` 从不出现 —— 控制器不认为
+   传输失败，只是永远不认为结束。这与"FIFO 交接由 DMA 引擎负责、CPU 侧读的是空壳"
+   的形态一致：ABL 交接时 `Host Control 1` 的 DMA Select 就是 `11`（ADMA2-64）。
+3. `cmd8 complete state=01e002f6` 说明命令阶段本身没问题，卡也确实开始发数据了
+   （`READ_TRANSFER_ACTIVE=1`、`DAT_LINE_ACTIVE=1`）。
+
+### 3.65.3 v20：改用 ADMA2（控制器原生的搬运方式）
+
+新增（`drivers/NativeSdhci/NativeSdhci.cpp`）：
+
+* 成员：`fDmaDesc` / `fDmaData`（`IOBufferMemoryDescriptor::withCapacity(..., kIODirectionOutIn, true)`，
+  物理连续）、`fDmaDescPhys` / `fDmaDataPhys`；
+* `setupDmaMemory()`：`start()` 里时钟就绪后、`cardInit()` 之前分配 2 页连续内存并取物理地址；
+* `beginDmaRead(bytes)`：填一条 64 位 ADMA2 描述符
+  （`word0 = (bytes<<16) | 0x27`（Valid|End|Int|TRAN）、`word1/2 = 数据物理地址低/高`），
+  `prepare()` 后把描述符物理地址写进 `SDHCI_ADMA_ADDRESS(0x58)`；
+* `endDmaRead(dst, bytes)`：`waitTransferComplete()` → 打印
+  `dma: done ok=… state/nis/eis/adma/err(0x214,0x218)` 与
+  `dma: data 前4字 | w52 w53(SEC_COUNT) w126 w127` → `complete()` → `memcpy` 给调用方；
+* `readExtCsd()` / `readBlocks()`：`TRANSFER_MODE` 置 `SDHCI_TRNS_DMA | READ | BLK_CNT_EN`，
+  命令前 `beginDmaRead()`、命令后 `endDmaRead()`；`pioTransfer()` 保留给写路径。
+
+### 3.65.4 下一刷的判读表
+
+| `dma: done` / `dma: data` | 结论 |
+|---|---|
+| `ok=1` 且 `data` 里 `w53` 非 0 | ADMA2 通了 → `EXT_CSD rev/SEC_COUNT` 会紧跟着打出来，LBA0 也能读到 |
+| `ok=1` 但 data 全 0 | DMA 完成但内容空 → 查描述符长度/属性、以及 `CORE_VENDOR_SPEC` 的 DMA 位 |
+| `ok=0` 且 `err=…` 指向描述符地址 | ADMA 取描述符失败（地址/对齐/缓存可见性） |
+| `ok=0` 且 `eis` 出现 `ADMA(bit9)` | 描述符链本身有问题 |
+| `dma: desc va=… phys=00000000` | `withCapacity` 拿不到物理地址，需要换 `IOMallocContiguous` 方案 |

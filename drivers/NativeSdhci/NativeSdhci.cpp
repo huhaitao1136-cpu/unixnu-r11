@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v19"
+#define kSdhciTag         "v20"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -82,6 +82,12 @@
  *      的 sdhci_msm_v5_offset）---- */
 #define CORE_VENDOR_SPEC           0x20cU
 #define CORE_VENDOR_SPEC3          0x250U
+#define CORE_ADMA_ERR_ADDR0      0x214U
+#define CORE_ADMA_ERR_ADDR1      0x218U
+
+/* ADMA2 用到的连续内存大小（描述符 1 条 = 16 字节，数据 1 块 = 512） */
+#define R11_DMA_DESC_SIZE        0x1000U
+#define R11_DMA_DATA_SIZE        0x1000U
 #define CORE_VENDOR_SPEC_CAP0      0x21cU
 #define CORE_MCI_VERSION_REG       0x318U
 #define CORE_MCI_STATUS_REG        0x324U
@@ -288,6 +294,9 @@ private:
     bool     waitCommandComplete ();
     bool     waitTransferComplete ();
     bool     pioTransfer (bool read, void *buffer, UInt32 bytes);
+    bool     setupDmaMemory ();
+    bool     beginDmaRead (UInt32 bytes);
+    bool     endDmaRead (void *dst, UInt32 bytes);
     bool     readCsd ();
     bool     readExtCsd ();
     bool     probeMedia ();
@@ -296,6 +305,12 @@ private:
     uintptr_t fVendor   = 0;
     OSSharedPtr<IOMemoryMap> fCoreMap;
     OSSharedPtr<IOMemoryMap> fVendorMap;
+
+    /* ADMA2：描述符与数据都必须是物理连续内存，start() 里一次性分配 */
+    IOBufferMemoryDescriptor *fDmaDesc     = nullptr;
+    IOBufferMemoryDescriptor *fDmaData     = nullptr;
+    IOPhysicalAddress         fDmaDescPhys = 0;
+    IOPhysicalAddress         fDmaDataPhys = 0;
     UInt16    fRca      = 0;
     UInt64    fBlockCount = 0;
 #if XNU_NATIVE_SDHCI_BLOCK_DEVICE
@@ -1016,6 +1031,91 @@ static void sdhciFormatGuid (const uint8_t *raw, char *out)
     out[k] = '\0';
 }
 
+/* ---- ADMA2 -------------------------------------------------------------
+ * 描述符格式（64 位 ADMA2，每条 16 字节）：
+ *   word0 = attribute(bits 0..15) | length(bits 16..31)
+ *   word1 = address[31:0]
+ *   word2 = address[63:32]
+ *   word3 = 保留
+ * attribute: bit0 Valid、bit1 End、bit2 Int、bits4..5 Act（0b10 = TRAN）
+ */
+bool NativeSdhci::setupDmaMemory ()
+{
+    if (fDmaDesc && fDmaData) {
+        return true;
+    }
+
+    fDmaDesc = IOBufferMemoryDescriptor::withCapacity (R11_DMA_DESC_SIZE, kIODirectionOutIn, true);
+    fDmaData = IOBufferMemoryDescriptor::withCapacity (R11_DMA_DATA_SIZE, kIODirectionOutIn, true);
+    if (!fDmaDesc || !fDmaData) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: dma: buffer allocation failed (desc=%p data=%p)\n",
+               fDmaDesc, fDmaData);
+        return false;
+    }
+
+    IOByteCount descLen = 0;
+    IOByteCount dataLen = 0;
+/* getPhysicalSegment 在部分 SDK 里带 deprecated 标记；这里确实要用物理地址，
+ * 而且它是最直接的接口，所以就地关掉这条告警（CI 用 -Werror）。 */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    fDmaDescPhys = fDmaDesc->getPhysicalSegment (0, &descLen, kIODirectionOut);
+    fDmaDataPhys = fDmaData->getPhysicalSegment (0, &dataLen, kIODirectionOut);
+#pragma clang diagnostic pop
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: desc va=%p phys=%08llx len=%llu / data va=%p phys=%08llx len=%llu\n",
+           fDmaDesc->getBytesNoCopy (), (unsigned long long) fDmaDescPhys,
+           (unsigned long long) descLen, fDmaData->getBytesNoCopy (),
+           (unsigned long long) fDmaDataPhys, (unsigned long long) dataLen);
+    return fDmaDescPhys != 0 && fDmaDataPhys != 0;
+}
+
+bool NativeSdhci::beginDmaRead (UInt32 bytes)
+{
+    if (bytes > R11_DMA_DATA_SIZE || !setupDmaMemory ()) {
+        return false;
+    }
+
+    uint32_t *desc = static_cast<uint32_t *> (fDmaDesc->getBytesNoCopy ());
+    desc[0] = (bytes << 16) | 0x27u;                        /* Valid|End|Int|TRAN */
+    desc[1] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
+    desc[2] = (uint32_t) ((uint64_t) fDmaDataPhys >> 32);
+    desc[3] = 0;
+
+    fDmaDesc->prepare (kIODirectionOut);
+    fDmaData->prepare (kIODirectionIn);
+
+    sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDescPhys & 0xFFFFFFFFu));
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed bytes=%u desc0=%08x %08x %08x adma=%08x\n",
+           bytes, desc[0], desc[1], desc[2], sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
+    return true;
+}
+
+bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
+{
+    bool ok = waitTransferComplete ();
+
+    uint32_t state = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
+    uint32_t nis   = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+    uint16_t eis   = sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS);
+    uint32_t ea0   = sdhciRead32 (fCore, CORE_ADMA_ERR_ADDR0);
+    uint32_t ea1   = sdhciRead32 (fCore, CORE_ADMA_ERR_ADDR1);
+    uint32_t *data = static_cast<uint32_t *> (fDmaData->getBytesNoCopy ());
+
+    fDmaData->complete (kIODirectionIn);
+
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: done ok=%u state=%08x nis=%08x eis=%04x adma=%08x err=%08x/%08x\n",
+           ok ? 1 : 0, state, nis, eis, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), ea0, ea1);
+    /* 前四个字 + EXT_CSD[212] 所在的第 53 个字（SEC_COUNT），一眼看出数据是不是真的 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x\n",
+           data[0], data[1], data[2], data[3], data[52], data[53], data[126], data[127]);
+
+    if (!ok || dst == nullptr) {
+        return false;
+    }
+    memcpy (dst, data, bytes);
+    return true;
+}
+
 bool NativeSdhci::readExtCsd ()
 {
     uint8_t ext[kSdhciBlockSize] __attribute__ ((aligned (64)));
@@ -1027,14 +1127,17 @@ bool NativeSdhci::readExtCsd ()
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
         /* BLK_CNT_EN 让控制器按 BLOCK_COUNT 字节数收尾（单块也要置位，
          * 否则某些 MSM 版本会按"开到 CMD12 为止"处理，DATA_END 永远不来）。 */
-        sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
+        sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
+                      (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
         IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
 
         bool ok = false;
-        if (!sendCommand (MMC_SEND_EXT_CSD, 0,
+        if (!beginDmaRead ((UInt32) kSdhciBlockSize)) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 dma setup failed (attempt %u)\n", attempt);
+        } else if (!sendCommand (MMC_SEND_EXT_CSD, 0,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                           nullptr)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
@@ -1048,7 +1151,7 @@ bool NativeSdhci::readExtCsd ()
                    sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
                    sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
                    sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
-            if (pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
+            if (endDmaRead (ext, (UInt32) kSdhciBlockSize)) {
                 ok = true;
             } else {
                 IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD transfer failed (attempt %u)\n", attempt);
@@ -1296,14 +1399,17 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
     for (uint32_t attempt = 0; attempt < 2; attempt++) {
         sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
-        sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
+        sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
+                      (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
-        if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
+        if (!beginDmaRead ((UInt32) kSdhciBlockSize)) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 dma setup failed (attempt %u)\n", attempt);
+        } else if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                           nullptr)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 lba=%llu failed (attempt %u)\n",
                    (unsigned long long) block, attempt);
-        } else if (pioTransfer (true, buffer, (UInt32) kSdhciBlockSize)) {
+        } else if (endDmaRead (buffer, (UInt32) kSdhciBlockSize)) {
             return kIOReturnSuccess;
         }
 
@@ -1401,6 +1507,10 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: start: clock done\n");
+    if (!setupDmaMemory ()) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: dma memory not available, giving up\n");
+        goto fail;
+    }
     if (!cardInit ()) {
         IOLog ("NativeSdhci[" kSdhciTag "]: card init failed at step %u (state=%08x err=%04x)\n",
                native_sdhci_step, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
@@ -1457,6 +1567,17 @@ void NativeSdhci::stop (IOService *provider)
         fBlockDevice = nullptr;
     }
 #endif
+    if (fDmaDesc) {
+        fDmaDesc->release ();
+        fDmaDesc = nullptr;
+    }
+    if (fDmaData) {
+        fDmaData->release ();
+        fDmaData = nullptr;
+    }
+    fDmaDescPhys = 0;
+    fDmaDataPhys = 0;
+
     fCoreMap.reset ();
     fVendorMap.reset ();
     fCore = 0;
@@ -1466,6 +1587,17 @@ void NativeSdhci::stop (IOService *provider)
 
 void NativeSdhci::free ()
 {
+    if (fDmaDesc) {
+        fDmaDesc->release ();
+        fDmaDesc = nullptr;
+    }
+    if (fDmaData) {
+        fDmaData->release ();
+        fDmaData = nullptr;
+    }
+    fDmaDescPhys = 0;
+    fDmaDataPhys = 0;
+
     fCoreMap.reset ();
     fVendorMap.reset ();
     IOService::free ();
