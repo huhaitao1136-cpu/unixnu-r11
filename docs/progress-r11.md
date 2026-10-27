@@ -3931,3 +3931,80 @@ media probe failed at step 9
 | `ok=0` 且 `err=…` 指向描述符地址 | ADMA 取描述符失败（地址/对齐/缓存可见性） |
 | `ok=0` 且 `eis` 出现 `ADMA(bit9)` | 描述符链本身有问题 |
 | `dma: desc va=… phys=00000000` | `withCapacity` 拿不到物理地址，需要换 `IOMallocContiguous` 方案 |
+
+## 3.66 上屏补丁不能再用固定地址：CI 导出符号表，补丁脚本按符号定位（2026-10-27）
+
+v20 刷机后内核零输出、屏幕停在 UniXNU 菜单帧。原因是 `patch-init-screen-gc.py`
+里两个 VA 是写死的：
+
+```python
+RET_VA     = 0xFFFFFFF0073BA7C8   # initialize_screen 的 ret
+GC_ENABLE_VA = 0xFFFFFFF0073BBC40 # gc_enable 的入口
+```
+
+v20 那轮内核重新链接后，`0x73BA7C8` 落在 `initialize_screen` 中间（内容是
+`ldr w8, [x19]` = `0xb9400268`），脚本打不上、直接失败：
+
+```
+空洞: 0xfffffff0079f1444
+0xfffffff0073ba7c8: 0xb9400268 (期望 0xd65f03c0)
+!! 指令不匹配
+```
+
+PAN / CPU 校验 / 输出开关 / serial_init / cons_ops_index 那些按指令编码找的补丁
+全部成功，只有这条按地址找的失败 —— 于是内核日志无处可去，屏幕就停在菜单帧。
+诊断确认内核本身是新的（`grep -c 'NativeSdhci\[v20\]' kernel.macho` = 93）。
+
+### 3.66.1 改法
+
+1. CI 在 `编译内核` 之后多跑一步，用 `llvm-nm` 把符号表导出到
+   `UniXNU/out/r11/kernel/kernel-symbols.txt`（已在 `r11-boot-artifacts` 的上传
+   清单里，跟着 artifact 一起下载）：
+
+   ```bash
+   NM=$(xcrun -f llvm-nm)
+   K=UniXNU/out/r11/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+   "$NM" --defined-only "$K" | awk 'NF>=3 {print $1, $2, $3}' > UniXNU/out/r11/kernel/kernel-symbols.txt
+   ```
+
+2. `patch-init-screen-gc.py` 重写成符号驱动：
+   * 必须传 `--symbols <nm.txt>`，固定地址模式删除；
+   * 在 `_PE_init_platform` 的起止范围内扫 `bl`（`(ins & 0xFC000000) == 0x94000000`，
+     `imm` 手动符号扩展），命中 `target == _initialize_screen` 的就是调用点；
+     找不到再退回扫整个 `__TEXT_EXEC`；
+   * 在 `__TEXT_EXEC` 的 NOP 空洞里写 6 条指令的跳板（24 字节）：
+
+     ```
+     stp  x29, x30, [sp, #-16]!
+     bl   _initialize_screen
+     mov  w0, #1
+     bl   _gc_enable
+     ldp  x29, x30, [sp], #16
+     ret
+     ```
+
+     然后把调用点那条 `bl _initialize_screen` 改成 `bl 跳板`。
+
+   与旧做法的区别：旧法在 `initialize_screen` 的尾声把 `ret` 换成跳转到
+   `gc_enable` 再返回，需要知道尾声地址；新法"包一层"，只依赖两个符号，语义
+   完全等价（仍然是 `initialize_screen` 返回之后、单线程、vinfo 完整）。
+
+3. `patch-payload-full.py` 增加 `--symbols`，并会在这些位置自动找符号表：
+   `/root/src/UniXNU/out/r11/kernel/kernel-symbols.txt`、payload 同目录、
+   `../kernel/kernel-symbols.txt`、`/tmp/art*/kernel/kernel-symbols.txt`。
+   找不到就明确报错，不再静默退化成"没打上屏补丁"。
+
+### 3.66.2 自测
+
+`E:\DeepSeekWorkspace\out\test-gc-symbols.py`：从真实内核里挑一条 `bl`，把它的
+目标当成 `_initialize_screen` 造符号表，跑脚本后检查
+
+* 命中同一条 `bl`；
+* 该处被改成 `bl 0xfffffff0079ec9a0`（跳板）；
+* 跳板 6 条指令 `a9bf7bfd 97e2356f 52800020 97e2366d a8c17bfd d65f03c0`，
+  其中两条 `bl` 的位移解出来正好是 `_initialize_screen` 与 `_gc_enable`。
+
+### 3.66.3 教训
+
+补丁脚本里只要出现"某个函数的尾部/某个不在 4 字节边界的寄存器"这类地址，就必须
+改成按符号或按指令编码定位 —— 内核每次重新链接，这些 VA 都会漂。

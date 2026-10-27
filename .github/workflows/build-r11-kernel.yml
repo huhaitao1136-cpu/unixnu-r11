@@ -86,6 +86,18 @@ jobs:
           ./unixnu build -D ../device kernel package 2>&1 | tee /tmp/kernel.log | tail -50
           echo "== 构建结束，log 大小 =="; wc -l /tmp/kernel.log
 
+      - name: 导出内核符号（给 payload 补丁按符号定位）
+        if: success()
+        run: |
+          set -e
+          NM=$(xcrun -f llvm-nm)
+          K=UniXNU/out/r11/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+          ls -l "$K"
+          mkdir -p UniXNU/out/r11/kernel
+          "$NM" --defined-only "$K" | awk 'NF>=3 {print $1, $2, $3}' > UniXNU/out/r11/kernel/kernel-symbols.txt
+          wc -l UniXNU/out/r11/kernel/kernel-symbols.txt
+          grep -E ' (_initialize_screen|_gc_enable)$' UniXNU/out/r11/kernel/kernel-symbols.txt || true
+
       - name: 把内核日志写进任务摘要
         if: always()
         run: |

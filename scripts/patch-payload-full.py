@@ -4,11 +4,15 @@
 流程：
   1. 从 payload.img 用 mtools 取出 kernel.macho
   2. 打内核补丁（PAN / CPU 校验 / 输出开关 / serial_init / cons_ops_index）
-  3. 打"initialize_screen 返回前调用 gc_enable(TRUE)"的跳板补丁
+  3. 打"initialize_screen 之后调用 gc_enable(TRUE)"的跳板补丁（需要符号表）
   4. 写回 payload.img
 
+符号表（kernel-symbols.txt）由 CI 用 llvm-nm 从
+`mach.development.bcm2837.unstripped.noctf` 导出，和 r11-boot-artifacts 一起下载。
+不传 --symbols 时会在几个常见位置自动找。
+
 用法:
-  python3 patch-payload-full.py <payload.img>
+  python3 patch-payload-full.py <payload.img> [--symbols <kernel-symbols.txt>]
 """
 import subprocess
 import sys
@@ -16,6 +20,12 @@ import tempfile
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
+
+# 自动找符号表的候选位置（按顺序）
+SYMBOL_HINTS = [
+    '/root/src/UniXNU/out/r11/kernel/kernel-symbols.txt',
+    'kernel-symbols.txt',
+]
 
 
 def run(cmd, quiet=False):
@@ -29,11 +39,36 @@ def run(cmd, quiet=False):
     return r
 
 
+def find_symbols(explicit, payload):
+    if explicit:
+        p = Path(explicit)
+        return p if p.is_file() else None
+    for c in SYMBOL_HINTS:
+        p = Path(c)
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    # payload 同目录、以及 /tmp/art*/kernel 下
+    for pat in ('kernel-symbols.txt', '../kernel/kernel-symbols.txt'):
+        for p in payload.parent.glob(pat):
+            if p.is_file():
+                return p
+    for p in sorted(Path('/tmp').glob('art*/kernel/kernel-symbols.txt')):
+        if p.is_file():
+            return p
+    return None
+
+
 def main() -> int:
-    if len(sys.argv) < 2:
+    argv = sys.argv[1:]
+    symbols = None
+    if '--symbols' in argv:
+        k = argv.index('--symbols')
+        symbols = argv[k + 1]
+        del argv[k:k + 2]
+    if not argv:
         print(__doc__)
         return 2
-    payload = Path(sys.argv[1])
+    payload = Path(argv[0])
     tmp = Path(tempfile.mkdtemp(prefix='r11k-'))
     kernel = tmp / 'kernel.macho'
 
@@ -45,7 +80,6 @@ def main() -> int:
             target = line.strip()
     print(f'payload 里的 kernel: {target}')
 
-    # 已知布局: /Payloads/kernel.macho 或 /kernel.macho，逐个试
     cands = ['::/EFI/UniXNU/Payloads/kernel.macho', '::/Payloads/kernel.macho', '::/kernel.macho']
     got = None
     for c in cands:
@@ -59,15 +93,21 @@ def main() -> int:
     print(f'已取出 {got} ({kernel.stat().st_size} B)')
 
     print('== 打内核补丁')
-    # 注意：必须用 patch-kernel-minimal.py 并带齐三组开关。
-    # patch-kernel-full.py 只认 msr PAN,#1（0xD500419F），漏掉了更常见的
-    # msr PAN,#0（0xD500409F，_copyout 里那条）—— 那正是真机上第一个
-    # Undefined kernel instruction 的位置。这里改成 minimal + 全开关。
+    # 必须用 patch-kernel-minimal.py 并带齐三组开关：patch-kernel-full.py 漏掉
+    # msr PAN,#0（0xD500409F，_copyout 里那条），那正是真机第一个 undefined instruction。
     if run(['python3', SCRIPTS / 'patch-kernel-minimal.py', kernel, kernel,
             '--with-validate', '--with-trapfix', '--with-mrs1']).returncode != 0:
         return 1
+
     print('== 打内核日志上屏补丁')
-    if run(['python3', SCRIPTS / 'patch-init-screen-gc.py', kernel]).returncode != 0:
+    sym = find_symbols(symbols, payload)
+    if sym is None:
+        print('!! 找不到 kernel-symbols.txt —— 请从 r11-boot-artifacts 里取出')
+        print('   或显式传 --symbols <path>（CI 的 导出内核符号 步骤会生成它）')
+        return 1
+    print(f'   符号表: {sym}')
+    if run(['python3', SCRIPTS / 'patch-init-screen-gc.py', kernel, kernel,
+            '--symbols', sym]).returncode != 0:
         return 1
 
     print('== 写回 payload')
