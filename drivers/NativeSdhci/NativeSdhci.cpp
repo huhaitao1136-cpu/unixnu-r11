@@ -1489,15 +1489,17 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
                    (unsigned long long) block, attempt);
         } else {
             bool drained = pioTransfer (true, buffer, (UInt32) kSdhciBlockSize);
-            /* buffer 是调用方给的，不保证 4 字节对齐 → 用逐字节拼装，别做强转 */
+            /* buffer 是调用方给的，不保证 4 字节对齐 → 用 sdhciCopyLe 逐字节拼装，
+             * 别强转成 uint32_t *。注意它的出参是 uint64_t。 */
             uint8_t *b = static_cast<uint8_t *> (buffer);
-            uint32_t w0 = 0, w1 = 0, w126 = 0, w127 = 0;
+            uint64_t w0 = 0, w1 = 0, w126 = 0, w127 = 0;
             sdhciCopyLe (&w0, b + 0, 4);
             sdhciCopyLe (&w1, b + 4, 4);
             sdhciCopyLe (&w126, b + 504, 4);
             sdhciCopyLe (&w127, b + 508, 4);
             IOLog ("NativeSdhci[" kSdhciTag "]: lba%llu w0=%08x w1=%08x w126=%08x w127=%08x drained=%u\n",
-                   (unsigned long long) block, w0, w1, w126, w127, drained ? 1u : 0u);
+                   (unsigned long long) block, (uint32_t) w0, (uint32_t) w1,
+                   (uint32_t) w126, (uint32_t) w127, drained ? 1u : 0u);
             if (drained || w0 != 0 || w127 != 0) {
                 return kIOReturnSuccess;
             }
