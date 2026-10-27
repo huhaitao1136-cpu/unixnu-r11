@@ -3399,3 +3399,80 @@ NativeSdhci[v10]: card init failed at step 2 (state=01f800f0 err=0000)
 | `cardInit: CMD1 resp[0]=c0ff8080` 之类（bit31=1） | 卡就绪，直接进 CMD2 |
 | `cardInit: CMD1 resp[0]=00000000` / `ffffffff` | 卡确实没应答 → 转查供电（PMIC vreg）/引脚复用/时钟到卡 |
 | `cardInit: OCR=…` 后跟 `CMD2 (cid)` 失败 | 回 CMD 线时序/CRC 标志 |
+
+## 3.57 NativeSdhci v11 真机结果：状态位自相矛盾 → v12 把判定顺序掉过来（2026-10-27）
+
+### 3.57.1 v11 屏幕日志
+
+```
+NativeSdhci[v11]: vendor: io18=1 mclk_sel=2 select_in=0 vs0=00018a0e vs3=02626440
+NativeSdhci[v11]: reset: cleared after 0 polls, word=000f0007
+NativeSdhci[v11]: bus: hostctl2=0000 word28=0000ff18 (1-bit, 3.3V)
+NativeSdhci[v11]: gcc: m/n/hid=1/48/0 -> 400000 Hz (cfg=00002000 m=00000001 n=000000d0 d=000000cf)
+NativeSdhci[v11]: clock: 400000 Hz (gcc m/n=1/48) int=000e0003 now=000e0005
+NativeSdhci[v11]: cardInit: CMD0
+NativeSdhci[v11]: cardInit: CMD1 (op cond)
+NativeSdhci[v11]: cmd error word=00008001 nis=8001 eis=0000
+NativeSdhci[v11]: CMD1 failed (1) state=01f800f0 norm=0001 err=0000 mstat=00007600
+NativeSdhci[v11]: cmd error word=00008001 nis=8001 eis=0000
+NativeSdhci[v11]: CMD1 failed (2) state=01f800f0 norm=0001 err=0000 mstat=00007600
+NativeSdhci[v11]: cmd error word=00008000 nis=8000 eis=0001
+NativeSdhci[v11]: CMD1 failed (3) state=01f800f0 norm=0000 err=0000 mstat=00007600
+NativeSdhci[v11]: card init failed at step 2 (state=01f800f0 err=0000)
+```
+
+### 3.57.2 读法：两条信息
+
+1. **32 位合并读与两次 16 位读的结果完全一致**（`word=00008001` ↔ `norm=0001 err=0000`），
+   说明 `0x30`/`0x32` 的位宽本身没读错，v11 的合并读是对的：
+   NIS 同时给出 **Command Complete(bit0) + Error 汇总位(bit15)**，而 EIS 是 0。
+   三次尝试里只有第 3 次 EIS 真的报了 `0001`（Command Timeout）。
+2. 但 v11 的代码逻辑在 `eis == 0` 时应该**落进 RESPONSE 分支返回成功**，
+   屏幕上却仍然是 `CMD1 failed`，而且 `resp[0]` 那行一次都没打出来。
+   也就是"合上的代码"和"跑出来的行为"对不上 —— 这种时候继续猜没有意义，
+   直接把**判定顺序**改成不依赖任何解释：先看 bit0。
+
+### 3.57.3 v12 改动（commit 48130e5）
+
+```c
+uint32_t word = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+uint16_t nis = (uint16_t) (word & 0xFFFFu);
+uint16_t eis = (uint16_t) (word >> 16);
+uint16_t eis16 = sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS);   /* 交叉验证 */
+
+if (nis & SDHCI_INT_RESPONSE) {          /* ← 先判"命令完成" */
+        if (nis & SDHCI_INT_ERROR) {
+                IOLog ("… cmd done, error flag ignored: word=%08x nis=%04x eis=%04x eis16=%04x\n", …);
+        }
+        sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, nis);          /* 清掉全部已置位 */
+        sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+        return true;
+}
+if (nis & SDHCI_INT_ERROR) {              /* 只有"没完成又报错"才算失败 */
+        IOLog ("… cmd error before complete: word=%08x nis=%04x eis=%04x eis16=%04x\n", …);
+        sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, nis);
+        sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+        return false;
+}
+```
+
+另外把 CMD1 的重试上限从 1000 次收到 300 次（每次 10 ms，最长 3 s），
+避免卡应答不上时把启动拖十秒。
+
+### 3.57.4 为什么这样改
+
+- `Command Complete` 是控制器自己说"这条命令走完了"，比 `Error` 汇总位更可靠；
+  汇总位在没有具体 EIS 位时是幽灵信号（MSM 上已知：真正的错误原因有时只写进
+  `CORE_MCI_STATUS`，不写 EIS）。
+- 只有 **"命令没完成 + 报错"** 才是真正需要中止的情况。
+- 这样一改，无论 EIS 是 0 还是幽灵值，CMD1 都会走到"读 RESPONSE"，
+  下一张照片必然能看到 `cardInit: CMD1 resp[0]=????????` 或 `OCR=`。
+
+### 3.57.5 判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `cmd done, error flag ignored …` 且随后有 `cardInit: CMD1 resp[0]=40ff8000` | 卡在应答（忙）→ 正常轮询即可 |
+| `cmd done, error flag ignored …` 但 `resp[0]=00000000/ffffffff` | 响应寄存器是空的 → 卡没驱动 CMD 线（供电/引脚/时钟到卡） |
+| `cmd error before complete: … eis16=0001` | 真的 Command Timeout |
+| `card never left busy (CMD1), last=…` | 卡一直忙 → 查 OCR 电压窗/供电 |
