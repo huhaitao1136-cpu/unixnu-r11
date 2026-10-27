@@ -4171,3 +4171,64 @@ if (isData) {
 | APFS 根卷 / 真 launchd | ⬜ |
 
 也就是说：**eMMC 卡识别这条路已经全通了**，只剩"把 512 字节数据搬进内存"这一步。
+
+## 3.69 v21 修好之后：ADMA2 条目布局错了（64 位要 16 字节条目）→ v22
+
+v21 真机日志，前三行就说明 v21 生效了：
+
+```
+CMD8 setup blksz=0200 cnt=0001 mode=0013 word28=0000ff18 attempt=0
+dma: armed bytes=512 desc0=02000027 aff2d000 00000000 adma=afd9e000
+cmd8 pre state=01f000f0 adma=afd9e000          <-- 描述符地址这次没被清零
+cmd8 posted state=01f000f1
+cmd done, error flag ignored: word=02000001 nis=0001 eis=0200 eis16=0200
+cmd8 complete state=01f002f6
+CMD8 ok state=01f002f6 nis=00000000 eis=00000000 adma=afd9e024
+data timeout nis=0000 eis=0000 state=01f002f6
+dma: done ok=0 state=01f002f6 nis=00000000 eis=0000 adma=afd9e024 err=00000000/00000000
+dma: data 00000000 00000000 00000000 00000000 | w52=00000000 w53=00000000 …
+```
+
+`eis=0x0200` 是 **EIS bit9 = ADMA Error**（命令阶段的错误位），
+`adma=afd9e024` 说明控制器真的开始走描述符表了，但搬出来全是 0。
+
+### 3.69.1 根因
+
+ABL 交接时 `Host Control 1 = 0x18` → **DMA Select = 3 = ADMA2 64 位**。
+64 位 ADMA 的条目是 **16 字节**：
+
+```
+word0 = attribute(16) | length(16)
+word1 = 保留（4 字节）
+word2 = address[31:0]
+word3 = address[63:32]
+```
+
+而 v20/v21 一直按 32 位的 **8 字节** 格式写：
+
+```
+word0 = attribute|length
+word1 = address[31:0]      <- 控制器在 64 位模式下把这里当"保留字"
+```
+
+于是控制器算出来的真正地址是 `desc[2..3] = 0` —— 它去往物理地址 0 搬数据，
+ADMA Error，数据自然是全 0。
+
+### 3.69.2 v22 改动
+
+* `beginDmaRead()` 先清 16 个字（避免读到上一次的残留条目），
+  再读 `Host Control 1` 的 `DMA Select`：
+  * `3` → 写 16 字节的 64 位条目（保留字补 0，地址放 `desc[2]/desc[3]`）；
+  * 其它 → 保持 8 字节的 32 位条目。
+* `dma: armed` 日志改成
+  `layout=%s select=%u bytes=%u desc0=… adma=…`，一眼能看出走的是哪种布局。
+* `kSdhciTag` = `v22`。
+
+### 3.69.3 这一刷的判据
+
+| 日志 | 结论 |
+|---|---|
+| `layout=64 select=3`，随后 `dma: done ok=1` + `dma: data` 有非 0 字 | ADMA2 通了 |
+| `layout=64` 但仍 `eis=0200` | 描述符地址/长度还有细节不对（看 `err=…`） |
+| `dma: done ok=1` 但 `dma: data` 全 0 | 地址对了但读的是别的内存，查 `fDmaDataPhys` 与 IOMMU |
+| 出现 `EXT_CSD rev=… SEC_COUNT=…` | 64 GB 容量第一次被内核读出来 |

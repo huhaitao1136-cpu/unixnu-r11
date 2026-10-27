@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v21"
+#define kSdhciTag         "v22"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1046,6 +1046,12 @@ static void sdhciFormatGuid (const uint8_t *raw, char *out)
  *   word2 = address[63:32]
  *   word3 = 保留
  * attribute: bit0 Valid、bit1 End、bit2 Int、bits4..5 Act（0b10 = TRAN）
+ *
+ * **布局取决于 Host Control 1 的 DMA Select（bit3..4）**：
+ *   - 2 = ADMA2 32 位：每个条目 8 字节（attr/len、地址低 32）
+ *   - 3 = ADMA2 64 位：每个条目 16 字节（attr/len、保留 4 字节、地址低 32、地址高 32）
+ * ABL 交接时这里是 3，v20/v21 却按 8 字节写，控制器把"地址低"当保留字，
+ * 实际读到的地址是 0 → eis=0x200（ADMA Error）、搬出来全是 0。
  */
 bool NativeSdhci::setupDmaMemory ()
 {
@@ -1080,18 +1086,36 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
     }
 
     uint32_t *desc = static_cast<uint32_t *> (fDmaDesc->getBytesNoCopy ());
-    desc[0] = (bytes << 16) | 0x27u;                        /* Valid|End|Int|TRAN */
-    desc[1] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
-    desc[2] = (uint32_t) ((uint64_t) fDmaDataPhys >> 32);
-    desc[3] = 0;
+
+    /* 先清掉整块描述符区：End 位置 1 理论上就会停，但万一控制器继续走，
+     * 读到上一次的残留条目比读到全 0 更难查。 */
+    for (uint32_t i = 0; i < 16; i++) {
+        desc[i] = 0;
+    }
+
+    const uint32_t hostWord  = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
+    const uint32_t dmaSelect = (hostWord >> 3) & 0x3u;
+    const char    *layout    = "32";
+
+    desc[0] = (bytes << 16) | 0x27u;                        /* Valid|End|Int|TRAN + 长度 */
+    if (dmaSelect == 3) {
+        desc[1] = 0;                                        /* 64 位 ADMA 的保留字 */
+        desc[2] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
+        desc[3] = (uint32_t) ((uint64_t) fDmaDataPhys >> 32);
+        layout  = "64";
+    } else {
+        desc[1] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
+        layout  = "32";
+    }
 
     fDmaDesc->prepare (kIODirectionOut);
     fDmaData->prepare (kIODirectionIn);
 
     sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDescPhys & 0xFFFFFFFFu));
     fDmaArmed = true;
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed bytes=%u desc0=%08x %08x %08x adma=%08x\n",
-           bytes, desc[0], desc[1], desc[2], sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed layout=%s select=%u bytes=%u desc0=%08x %08x %08x %08x adma=%08x\n",
+           layout, dmaSelect, bytes, desc[0], desc[1], desc[2], desc[3],
+           sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
     return true;
 }
 
