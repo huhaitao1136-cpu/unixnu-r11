@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v13"
+#define kSdhciTag         "v14"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -836,7 +836,10 @@ bool NativeSdhci::waitTransferComplete ()
         }
         sdhciDelayUs (1);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: data timeout state=%08x\n", sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
+    IOLog ("NativeSdhci[" kSdhciTag "]: data timeout nis=%04x eis=%04x state=%08x\n",
+           sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS),
+           sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
+           sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     return false;
 }
 
@@ -898,9 +901,10 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
 bool NativeSdhci::readCsd ()
 {
     uint32_t resp[4] = {0, 0, 0, 0};
-    /* CMD9 读 CSD：最高 3 位是 CSD_STRUCTURE，后 12 位是容量相关字段 */
+    /* CMD9 读 CSD：最高 3 位是 CSD_STRUCTURE，后 12 位是容量相关字段。
+     * 同样是 R2 长响应 → 不设 SDHCI_CMD_INDEX。 */
     if (!sendCommand (MMC_SEND_CSD, (uint32_t) fRca << 16,
-                      SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
+                      SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC, resp)) {
         return false;
     }
     /* 简化：从 CSD v1 的 C_SIZE 估算容量；HS400 卡通常是 CSD v2，留给 EXT_CSD */
@@ -1140,10 +1144,14 @@ bool NativeSdhci::cardInit ()
     /* CMD2：拿 CID（长响应）。这一步失败不致命 —— eMMC 的 RCA 由 host 指定，
      * CID 只是信息，真正必须的是 CMD3/CMD9/CMD7，所以失败也继续往下走，
      * 好让屏幕上看清到底是"136 位长响应这条路不通"还是"整条命令线不通"。 */
+    /* CMD2：拿 CID（136 位长响应）。**不设 SDHCI_CMD_INDEX** ——
+     * R2 的响应里没有命令索引字段，打开"Command Index Check"会让控制器
+     * 永远等一个不会出现的索引（v13 实测：CMD2/CMD9 卡在 CMD_INHIBIT、
+     * 既不完成也不报错，而 48 位 R1 的 CMD3/CMD7/CMD16 都正常）。 */
     native_sdhci_step = 3;
     IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 (cid)\n");
     if (!sendCommand (MMC_ALL_SEND_CID, 0,
-                      SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
+                      SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC, resp)) {
         IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 failed, continuing without CID\n");
         native_sdhci_cid0 = 0;
         recoverCommandState ("after CMD2 failure");
@@ -1312,17 +1320,19 @@ bool NativeSdhci::start (IOService *provider)
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: start: card init done\n");
 
-    /* 识别完升频：19.2 MHz / 2 = 9.6 MHz，EXT_CSD 和 GPT 的读取会快一个数量级 */
-    if (!setBusClock (19200000)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: could not raise the transfer clock, staying at 400 kHz\n");
-        setBusClock (400000);
-    }
-
     native_sdhci_step = 9;
-    /* bring-up 第一步：把卡信息 / LBA0 / GPT 分区表打在屏幕上 */
+    /* 先按 400 kHz 做介质探测：v13 实测在 19.2 MHz 下第一次数据读
+     * （CMD8 SEND_EXT_CSD）会 data timeout，先用最低速把链路跑通，
+     * 探测成功之后再升频。 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: start: probing media at 400 kHz\n");
     if (!probeMedia ()) {
         IOLog ("NativeSdhci[" kSdhciTag "]: media probe failed at step %u\n", native_sdhci_step);
         goto fail;
+    }
+    /* 探测通了再升频：19.2 MHz（M/N = 1/1），给后续块读取用 */
+    if (!setBusClock (19200000)) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: could not raise the transfer clock, staying at 400 kHz\n");
+        setBusClock (400000);
     }
 
 #if XNU_NATIVE_SDHCI_BLOCK_DEVICE

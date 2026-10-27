@@ -3536,3 +3536,74 @@ NativeSdhci[v12]: card init failed at step 3 (state=01f000f1 err=0000)
 | CMD2 仍卡、但 **CMD3 成功** | 只有 136 位长响应（R2）这条路不通 → 查 RESPONSE 读取宽度/CRC 标志 |
 | CMD2 卡 + **CMD3 也卡** | 带 CRC 的命令都不通 → 查 CMD 线 CRC 状态（DAT0-7 无关）或卡仍处于 busy |
 | 出现 `CMD9 (csd)` / `CMD7 (select)` / `CMD16 (blklen 512)` | 识别阶段基本完成，下一步读 EXT_CSD、GPT |
+
+## 3.59 NativeSdhci v13 真机结果：R2 长响应卡死、数据阶段超时 → v14（2026-10-27）
+
+### 3.59.1 v13 屏幕日志
+
+```
+cardInit: CMD0
+cardInit: CMD1 (op cond)
+cmd done, error flag ignored: word=00008001 nis=8001 eis=0000 eis16=0000
+cardInit: CMD1 resp[0]=40ff8000 state=01f000f0
+cardInit: CMD1 resp[1]=c0ff8000 state=01f000f0
+cardInit: OCR=c0ff8000
+recover: after CMD1 (stale error latch) (state=01f000f0 nis=8000 eis=0000 mstat=00007600)
+reset: cleared after 0 polls, word=000e0007
+recover: done (state=01f000f0)
+cardInit: CMD2 (cid)
+cmd error before complete: word=00008000 nis=8000 eis=0000 eis16=0000
+cardInit: CMD2 failed, continuing without CID
+recover: done (state=01f000f0)
+cardInit: CMD3 (rca=1), cid0=00000000
+cardInit: CMD9 (csd)
+cmd error before complete: word=00008000 nis=8000 eis=0000 eis16=0000
+cardInit: CMD7 (select)
+cardInit: CMD16 (blklen 512)
+start: card init done
+gcc: m/n/hid=1/1/0 -> 19200000 Hz (cfg=00000000 m=00000001 n=000000ff d=000000ff)
+clock: 19200000 Hz (gcc m/n=1/1) int=000e0003 now=000e0007
+data timeout state=01f08af6
+EXT_CSD transfer failed
+data timeout state=01f08af6
+LBA0 read FAILED
+media probe failed at step 9
+```
+
+### 3.59.2 三条新结论
+
+1. **"幽灵错误锁存"假说被否掉**：CMD1 之后我们做了 `softReset(CMD|DATA)`，
+   `recover: done (state=01f000f0)` 干净，CMD2 依然不完成。
+2. **失败的命令只有 R2（136 位长响应）这一类**：CMD2（ALL_SEND_CID）和
+   CMD9（SEND_CSD）都卡住；而 **CMD3（R1+CRC）、CMD7（R1b）、CMD16（R1）都过了**
+   （屏幕上没有任何 CMD3/CMD7/CMD16 的错误行）。48 位响应全部正常，只有 136 位不正常。
+3. **数据阶段另有一个独立问题**：升到 19.2 MHz 后 CMD8（SEND_EXT_CSD，512 字节数据）
+   走到 `data timeout state=01f08af6`（`DATA_INHIBIT=1`、`DAT_LINE_ACTIVE=1`），
+   而且 PIO 的 128 个字都读出来了（没有 `pio read starved`），只是 **DATA_END 位没来**。
+
+### 3.59.3 根因（R2）
+
+R2（136 位响应）的响应帧里 **没有命令索引字段**：136 位 = 起始位 + 传输位 +
+6 位命令索引 + 127 位数据……虽然帧里确有索引，但 SDHCI 规范对 R2 的第 4 位
+（Command Index Check Enable）要求是 **0**；Linux 的 `mmc_resp_type()`
+对 `MMC_RSP_R2` 只给 `MMC_RSP_PRESENT|MMC_RSP_136|MMC_RSP_CRC`，**没有 `MMC_RSP_OPCODE`**，
+所以 sdhci 不会设置索引校验位。我们一直带着 `SDHCI_CMD_INDEX`，
+控制器就在等一个"索引校验结果"，136 位响应下这个校验不会成立 →
+`CMD_INHIBIT` 挂住、不完成、也不报错，与实测完全一致。
+
+### 3.59.4 v14 改动
+
+1. CMD2 / CMD9 的标志改成 `SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC`（去掉 `SDHCI_CMD_INDEX`）。
+2. **探测阶段保持 400 kHz**：`start()` 里改成先 `probeMedia()`，成功后再
+   `setBusClock (19200000)`；v13 的 19.2 MHz 数据超时很可能只是"太快 + 尚未验证",
+   先用最低速把第一次块读跑通。
+3. `waitTransferComplete()` 超时日志补上 `nis` 与 `eis`：`data timeout nis=%04x eis=%04x state=%08x`。
+
+### 3.59.5 下一刷的判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `cardInit: CMD2 (cid)` 后出现 `cardInit: CMD3 (rca=1), cid0=…` 且 cid0≠0 | R2 修好了，识别阶段打通 |
+| `cardInit: CMD2` 之后再无错误行、直接进 CMD3 | 同上（CID 值本来就可能为 0，看有没有 `cmd error`） |
+| `EXT_CSD rev=… SEC_COUNT=…` | **数据读通了**，下一步就是 GPT |
+| `data timeout nis=…` 仍出现 | 数据阶段另有问题：按 `nis` 的 DATA_END/DATA_AVAIL 位与 `state` 继续查 |
