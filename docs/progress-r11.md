@@ -3607,3 +3607,72 @@ R2（136 位响应）的响应帧里 **没有命令索引字段**：136 位 = �
 | `cardInit: CMD2` 之后再无错误行、直接进 CMD3 | 同上（CID 值本来就可能为 0，看有没有 `cmd error`） |
 | `EXT_CSD rev=… SEC_COUNT=…` | **数据读通了**，下一步就是 GPT |
 | `data timeout nis=…` 仍出现 | 数据阶段另有问题：按 `nis` 的 DATA_END/DATA_AVAIL 位与 `state` 继续查 |
+
+## 3.60 NativeSdhci v15：R2 修好、CID 读出来了；数据阶段卡在 DMA Select（2026-10-27）
+
+### 3.60.1 v14 屏幕日志
+
+```
+cardInit: CMD2 (cid)
+cardInit: CMD3 (rca=1), cid0=00150100      <- CID 非 0，且 CMD2/CMD9 一条错都没有
+cardInit: CMD9 (csd)
+cardInit: CMD7 (select)
+cardInit: CMD16 (blklen 512)
+start: card init done
+start: probing media at 400 kHz
+data timeout nis=0020 eis=0000 state=01f00af6
+EXT_CSD transfer failed
+data timeout nis=0000 eis=0000 state=01f00af6
+LBA0 read FAILED
+media probe failed at step 9
+```
+
+**识别阶段已经完全打通**：CMD0 → CMD1（OCR=c0ff8000）→ CMD2（CID=00150100）→
+CMD3 → CMD9 → CMD7 → CMD16 全过，连 400 kHz 都保持在最低速。
+R2 的根因（`SDHCI_CMD_INDEX` 用在 136 位响应上）确认。
+
+### 3.60.2 数据阶段的现场解读
+
+`state=01f00af6` 逐位读：
+
+| 位 | 名字 | 值 | 含义 |
+|---|---|---|---|
+| 1 | DATA_INHIBIT | 1 | 数据线忙 |
+| 2 | DAT_LINE_ACTIVE | 1 | 卡还在驱动 DAT0（数据没结束） |
+| 4 | WRITE_TRANSFER_ACTIVE | 1 |  |
+| 5 | READ_TRANSFER_ACTIVE | 1 | 读传输没结束 |
+| 11 | BUFFER_READ_ENABLE | 1 | **控制器认为 FIFO 里还有数据没取** |
+
+而 `nis=0020` 只有 bit5（BUFFER_READ_READY），**没有 bit1（DATA_END）**。
+也就是说：我们把 128 个字读完了，控制器却仍然认为还有数据 —— 传输量对不上。
+
+### 3.60.3 根因候选：HOST_CONTROL 的 DMA Select 还是 ADMA2(64-bit)
+
+`bus: hostctl2=0000 word28=0000ff18`：低字节 `0x18` = bit3|bit4 = **DMA Select = 11
+（ADMA2, 64-bit addressing）**，这是 ABL 用 DMA 读系统时留下的配置。我们全程走 PIO
+（`TRANSFER_MODE` 的 DMA Enable = 0），但 MSM 的 SDCC 在 DMA Select 非 0 时，
+数据引擎仍然会使用 `SDHCI_ADMA_ADDRESS(0x58)` 里的描述符地址 —— 而我们从没写过这个寄存器，
+里面是 ABL 留下的野值。数据阶段于是"卡在搬运、永不收尾"，与实测完全一致。
+
+### 3.60.4 v15 改动
+
+1. `setBusPowerAndClock()`：`hostCtrl &= ~(0x18u | 0x20u)` —— 清 DMA Select（bits 3-4）
+   与扩展 DMA 位（bit5），把控制器按 SDMA/PIO 语义配置。
+2. `readExtCsd()` / `readBlocks()` 的 `TRANSFER_MODE` 改用
+   `SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN`：显式告诉控制器"按 BLOCK_COUNT 收尾",
+   避免被当作"开到 CMD12 为止"的多块传输。
+3. 数据阶段仪表化：
+   * CMD8 之前打 `CMD8 setup blksz=… cnt=… mode=… word28=… attempt=…`（回读四个寄存器）；
+   * `pioTransfer()` 读满后打 `pio read %u words state=… nis=… eis=…`；
+   * 读 FIFO 饿死时打 `state`/`nis`；
+   * `readExtCsd()` 与 `readBlocks()` 都加了"失败就 `recoverCommandState()` 再重试一次"。
+4. `kSdhciTag` = `v15`。
+
+### 3.60.5 下一刷的判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `EXT_CSD rev=… SEC_COUNT=…` | 数据读通，下一步直接 GPT |
+| `pio read 128 words state=…` 里 bit11 变成 0 且随后成功 | DMA Select 就是根因 |
+| `data timeout` 仍出现、`pio read ... state` 的 bit11 仍为 1 | 传输量确实不符：查 BLOCK_SIZE 回读值与 `blkcnt` |
+| `pio read starved at word N` | FIFO 供数中断：查 DAT0 线/时钟占空比/`TIMEOUT_CONTROL` |

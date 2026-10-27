@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v14"
+#define kSdhciTag         "v15"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -602,6 +602,14 @@ bool NativeSdhci::setBusPowerAndClock ()
     uint32_t hostCtrl = hostWord & 0xFFu;
     hostCtrl &= ~(uint32_t) (SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);
 
+    /* ABL 交接时把 HOST_CONTROL 的 DMA Select 配成了 ADMA2(64-bit)（v6~v14 实测 0x18）。
+     * 我们全程用 PIO（TRANSFER_MODE 的 DMA Enable = 0），但 DMA Select 非 0 时
+     * MSM 的数据引擎仍会去 SDHCI_ADMA_ADDRESS(0x58) 取描述符，而那里是 ABL 留下的
+     * 野指针 —— 数据阶段会挂住、永远不产生 DATA_END（v13/v14 的
+     * `data timeout nis=0020 state=01f00af6`）。这里把 DMA Select(bits 3-4) 与
+     * 扩展 DMA 位(bit5) 一起清零，强制 SDMA/PIO 语义。 */
+    hostCtrl &= ~(uint32_t) (0x18u | 0x20u);
+
     uint16_t hostCtrl2 = sdhciRead16 (fCore, SDHCI_HOST_CONTROL2);
     hostCtrl2 &= (uint16_t) ~(SDHCI_CTRL_VDD_180 | SDHCI_CTRL_UHS_MASK);
     sdhciWrite16 (fCore, SDHCI_HOST_CONTROL2, hostCtrl2);
@@ -881,11 +889,20 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
     if (read) {
         for (UInt32 i = 0; i < count; i++) {
             if (!sdhciWaitSet (fCore, SDHCI_PRESENT_STATE, SDHCI_DATA_AVAILABLE, kSdhciDataLoops)) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: pio read starved at word %u\n", i);
+                IOLog ("NativeSdhci[" kSdhciTag "]: pio read starved at word %u/%u state=%08x nis=%08x\n",
+                       i, count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                       sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
                 return false;
             }
             words[i] = sdhciRead32 (fCore, SDHCI_BUFFER);
         }
+        /* 读满之后立刻把现场打出来：DATA_END 有没有来、FIFO 是不是还有数据。
+         * 若 BUFFER_READ_ENABLE(bit11) 仍为 1，说明控制器认为数据还没取完
+         * （即 BLOCK_SIZE/BLOCK_COUNT 与实际传输量不符）。 */
+        IOLog ("NativeSdhci[" kSdhciTag "]: pio read %u words state=%08x nis=%08x eis=%08x\n",
+               count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+               sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
+               sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS));
     } else {
         for (UInt32 i = 0; i < count; i++) {
             if (!sdhciWaitSet (fCore, SDHCI_PRESENT_STATE, SDHCI_SPACE_AVAILABLE, kSdhciDataLoops)) {
@@ -962,33 +979,49 @@ static void sdhciFormatGuid (const uint8_t *raw, char *out)
 bool NativeSdhci::readExtCsd ()
 {
     uint8_t ext[kSdhciBlockSize] __attribute__ ((aligned (64)));
-    memset (ext, 0, sizeof (ext));
 
-    sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
-    sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
-    sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
+    for (uint32_t attempt = 0; attempt < 2; attempt++) {
+        memset (ext, 0, sizeof (ext));
 
-    if (!sendCommand (MMC_SEND_EXT_CSD, 0,
-                      SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-                      nullptr)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed\n");
-        return false;
-    }
-    if (!pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD transfer failed\n");
-        return false;
+        sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
+        sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
+        /* BLK_CNT_EN 让控制器按 BLOCK_COUNT 字节数收尾（单块也要置位，
+         * 否则某些 MSM 版本会按"开到 CMD12 为止"处理，DATA_END 永远不来）。 */
+        sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
+
+        IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
+               sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
+               sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
+
+        bool ok = false;
+        if (!sendCommand (MMC_SEND_EXT_CSD, 0,
+                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+                          nullptr)) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
+        } else if (pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
+            ok = true;
+        } else {
+            IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD transfer failed (attempt %u)\n", attempt);
+        }
+
+        if (!ok) {
+            recoverCommandState ("after CMD8 data failure");
+            continue;
+        }
+
+        /* EXT_CSD[212..215] = SEC_COUNT（512 B 扇区总数，eMMC 4.0+） */
+        uint64_t secCount = 0;
+        sdhciCopyLe (&secCount, ext + 212, 4);
+        if (secCount) {
+            fBlockCount = secCount;
+        }
+        IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD rev=%u SEC_COUNT=%llu (%llu MiB) BUS_WIDTH=%u HS_TIMING=%u\n",
+               ext[192], (unsigned long long) secCount,
+               (unsigned long long) (secCount / 2048), ext[183], ext[185]);
+        return true;
     }
 
-    /* EXT_CSD[212..215] = SEC_COUNT（512 B 扇区总数，eMMC 4.0+） */
-    uint64_t secCount = 0;
-    sdhciCopyLe (&secCount, ext + 212, 4);
-    if (secCount) {
-        fBlockCount = secCount;
-    }
-    IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD rev=%u SEC_COUNT=%llu (%llu MiB) BUS_WIDTH=%u HS_TIMING=%u\n",
-           ext[192], (unsigned long long) secCount,
-           (unsigned long long) (secCount / 2048), ext[183], ext[185]);
-    return true;
+    return false;
 }
 
 bool NativeSdhci::probeMedia ()
@@ -1208,19 +1241,24 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
     if (count != 1) {
         return kIOReturnUnsupported;   /* TODO: CMD18 + 多块 PIO/ADMA2 */
     }
-    sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
-    sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
-    sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
 
-    if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
-                      SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-                      nullptr)) {
-        return kIOReturnTimeout;
+    for (uint32_t attempt = 0; attempt < 2; attempt++) {
+        sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
+        sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
+        sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
+
+        if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
+                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+                          nullptr)) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 lba=%llu failed (attempt %u)\n",
+                   (unsigned long long) block, attempt);
+        } else if (pioTransfer (true, buffer, (UInt32) kSdhciBlockSize)) {
+            return kIOReturnSuccess;
+        }
+
+        recoverCommandState ("after CMD17 data failure");
     }
-    if (!pioTransfer (true, buffer, (UInt32) kSdhciBlockSize)) {
-        return kIOReturnError;
-    }
-    return kIOReturnSuccess;
+    return kIOReturnError;
 }
 
 IOReturn NativeSdhci::writeBlocks (UInt64 block, UInt32 count, const void *buffer)
