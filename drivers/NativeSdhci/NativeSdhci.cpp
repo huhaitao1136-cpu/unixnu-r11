@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v24"
+#define kSdhciTag         "v25"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1189,17 +1189,17 @@ bool NativeSdhci::readExtCsd ()
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
         /* BLK_CNT_EN 让控制器按 BLOCK_COUNT 字节数收尾（单块也要置位，
          * 否则某些 MSM 版本会按"开到 CMD12 为止"处理，DATA_END 永远不来）。 */
+        /* v25：不用 DMA。v19 的 PIO 至少拿到过 BUFFER_READ_READY，而 ADMA2/SDMA
+         * 都是数据引擎直接冻结；先确认"数据到底有没有进 FIFO"。 */
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
-                      (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
+                      (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
         IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
 
         bool ok = false;
-        if (!beginDmaRead ((UInt32) kSdhciBlockSize)) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 dma setup failed (attempt %u)\n", attempt);
-        } else if (!sendCommand (MMC_SEND_EXT_CSD, 0,
+        if (!sendCommand (MMC_SEND_EXT_CSD, 0,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                           nullptr)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
@@ -1223,7 +1223,13 @@ bool NativeSdhci::readExtCsd ()
                    sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
                    sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
                    sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
-            if (endDmaRead (ext, (UInt32) kSdhciBlockSize)) {
+            bool drained = pioTransfer (true, ext, (UInt32) kSdhciBlockSize);
+            uint32_t *w = reinterpret_cast<uint32_t *> (ext);
+            IOLog ("NativeSdhci[" kSdhciTag "]: ext w0=%08x w1=%08x w52=%08x w53=%08x w126=%08x w127=%08x drained=%u\n",
+                   w[0], w[1], w[52], w[53], w[126], w[127], drained ? 1u : 0u);
+            /* EXT_CSD 前 16 字节本来就是 0，只看 w53（SEC_COUNT 低 32 位）
+             * 有没有内容来判断数据是不是真的到了。 */
+            if (drained || w[53] != 0) {
                 ok = true;
             } else {
                 IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD transfer failed (attempt %u)\n", attempt);
@@ -1471,18 +1477,30 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
     for (uint32_t attempt = 0; attempt < 2; attempt++) {
         sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
+        /* v25：不用 DMA。v19 的 PIO 至少拿到过 BUFFER_READ_READY，而 ADMA2/SDMA
+         * 都是数据引擎直接冻结；先确认"数据到底有没有进 FIFO"。 */
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
-                      (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
+                      (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
-        if (!beginDmaRead ((UInt32) kSdhciBlockSize)) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 dma setup failed (attempt %u)\n", attempt);
-        } else if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
+        if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                           nullptr)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 lba=%llu failed (attempt %u)\n",
                    (unsigned long long) block, attempt);
-        } else if (endDmaRead (buffer, (UInt32) kSdhciBlockSize)) {
-            return kIOReturnSuccess;
+        } else {
+            bool drained = pioTransfer (true, buffer, (UInt32) kSdhciBlockSize);
+            /* buffer 是调用方给的，不保证 4 字节对齐 → 用逐字节拼装，别做强转 */
+            uint8_t *b = static_cast<uint8_t *> (buffer);
+            uint32_t w0 = 0, w1 = 0, w126 = 0, w127 = 0;
+            sdhciCopyLe (&w0, b + 0, 4);
+            sdhciCopyLe (&w1, b + 4, 4);
+            sdhciCopyLe (&w126, b + 504, 4);
+            sdhciCopyLe (&w127, b + 508, 4);
+            IOLog ("NativeSdhci[" kSdhciTag "]: lba%llu w0=%08x w1=%08x w126=%08x w127=%08x drained=%u\n",
+                   (unsigned long long) block, w0, w1, w126, w127, drained ? 1u : 0u);
+            if (drained || w0 != 0 || w127 != 0) {
+                return kIOReturnSuccess;
+            }
         }
 
         recoverCommandState ("after CMD17 data failure");

@@ -4361,3 +4361,70 @@ Linux 的 `sdhci_enable()` 第一步就是 `sdhci_writew(SDHCI_INT_ENABLE, …)`
 | `trace` 里 `state` 从 `01f002f6` 变成 `01f000f6`/`…`，`nis` 出现 `0001`(DATA_END) | 中断使能就是那个开关，直接通 |
 | `trace` 全程一模一样 | 数据引擎确实没推进，下一步查 DAT 线/时钟/卡侧模式 |
 | 出现 `EXT_CSD rev=… SEC_COUNT=…` | 64 GB 容量读出来了 |
+
+## 3.72 NativeSdhci v25：从 DMA 退回 PIO，不再猜收尾位，直接看 FIFO 里到底有没有东西（2026-10-27）
+
+### 3.72.1 为什么又退回 PIO
+
+v20 → v22 三轮都在 ADMA2 上撞墙，最后靠读 CAPABILITIES 才明白方向错了：
+
+```
+caps=742dc8b2 = 0111 0100 0010 1101 1100 1000 1011 0010
+bit28=1  64 位系统总线
+bit27=0  ADMA2 不支持      <- v20/v21/v22 一直在撞这条
+bit26=1  SDMA 支持
+```
+
+v23 改成 SDMA 之后 `eis=0x200`（ADMA Error）确实消失了，按说模式选对了，
+但 v23/v24 的数据引擎仍然彻底冻结：
+
+```
+v23:  cmd8 complete state=01f002f6 → CMD8 ok state=01f002f6 nis=00000000 eis=00000000 adma=ffffffff
+      data timeout nis=0000 eis=0000 state=01f002f6
+v24:  trace 0..7 state=01f002f6 nis=00000000   （8 次采样一模一样）
+      dma: ctx blksz=0200 cnt=0000 mode=0013 hostctl=0000ff00 vs0=000010a0e vs3=02626440 mstat=0007f880
+```
+
+`NIS` 里既没有 `DATA_END(bit1)` 也没有 `BUFFER_READ_READY(bit5)`，中断使能打开后
+也毫无变化（v24 第一次真正写了 `NORMAL/ERROR_INT_ENABLE`）。
+
+回头看，唯一"有反应"的一次其实是 **v19 的 PIO**：
+
+```
+pio got 512 words (block=128) first=00000000 00000000 00000000 00000000 last=…
+pio after state=01f00af6 nis=00000020
+```
+
+它拿到了 `BUFFER_READ_READY`，而且读满 128 个字之后 `BUFFER_READ_ENABLE(bit11)` 仍然是 1。
+当时把 `first` 全是 0 当成"FIFO 给空数据"，但 **EXT_CSD 的前 16 字节本来就是 0x00**——
+所以那个 0 什么都证明不了。真正能证明"数据到了"的是：
+
+| word | EXT_CSD 字节 | 内容 |
+|---|---|---|
+| `w0`/`w1` | [0..7] | 固定 0（无意义） |
+| `w52` | [208..211] | `EXT_CSD_REV` 附近 |
+| `w53` | [212..215] | **`SEC_COUNT` 低 32 位（容量）** |
+| `w126`/`w127` | [504..511] | 保留区 |
+
+### 3.72.2 v25 改动
+
+1. `readExtCsd()` 与 `readBlocks()` 的 `TRANSFER_MODE` 去掉 `SDHCI_TRNS_DMA`，
+   回到 `SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN`（两处）。
+2. 不再走 `beginDmaRead()/endDmaRead()`，改用 `pioTransfer(true, …)` 把 FIFO drain 掉。
+3. 无论收尾位如何，都把关键字打出来：
+   - EXT_CSD：`ext w0=%08x w1=%08x w52=%08x w53=%08x w126=%08x w127=%08x drained=%u`
+   - 数据块：`lba%llu w0=%08x w1=%08x w126=%08x w127=%08x drained=%u`
+4. 判定放宽：`drained || w53 != 0`（EXT_CSD）/ `drained || w0 != 0 || w127 != 0`（数据块）
+   即认为成功 —— 先把"能不能读到内容"和"收尾位对不对"这两件事拆开。
+5. `readBlocks()` 里 dump 用 `sdhciCopyLe()` 逐字节拼，不再把 `void *buffer`
+   强转成 `uint32_t *`（调用方不保证 4 字节对齐）。
+6. `kSdhciTag = "v25"`。
+
+### 3.72.3 下一刷判读表
+
+| 现象 | 结论 | 下一步 |
+|---|---|---|
+| `w53=0000xxxx`（非 0） | 数据一直在来，只是收尾判定不对 | 把收尾条件改成"FIFO 空且无新数据"，一路读到 GPT |
+| `drained=1` 但 `w53=0`、`w126/w127=0` | 卡确实没驱动 DAT 线 | 查 `vs0`/`mstat`、试 CMD13 读卡侧 `CURRENT_STATE`、降速到 400 kHz 重试 |
+| `pio read starved at word 0` | 一个字节都没到 FIFO | 回到 DMA 路线，查 `CORE_DLL_CONFIG(0x200)` 采样点/`CORE_DDR_CONFIG(0x25c)` |
+| 出现 `EXT_CSD rev=… SEC_COUNT=…` | PIO 打通 | 立刻接 `readBlocks(0)` 看 MBR/GPT |
