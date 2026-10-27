@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v30"
+#define kSdhciTag         "v31"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1360,22 +1360,54 @@ bool NativeSdhci::readExtCsd ()
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 r1=%08x current_state=%u (%s)\n",
                    r1[0], (r1[0] >> 9) & 0xFu, sdhciCardStateName ((r1[0] >> 9) & 0xFu));
 
-            /* v30：先排水！之前这里连采 8 次（间隔 5 ms，共 40 ms）才去读 FIFO，
-             * 400 kHz 下 512 字节只要 10–20 ms，等于把 FIFO 晾到溢出。 */
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 posted-to-drain state=%08x nis=%08x\n",
-                   sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
-                   sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
-            bool drained = pioTransfer (true, ext, (UInt32) kSdhciBlockSize);
-            for (uint32_t s = 0; s < 3; s++) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: trace %u state=%08x nis=%08x eis=%08x\n", s,
-                       sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
-                       sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
-                       sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
-                if ((sdhciRead32 (fCore, SDHCI_PRESENT_STATE) & SDHCI_DOING_READ) == 0) {
+            /* v31：时间线探针。每 500 µs 一步，共 60 步（≈30 ms），
+             * 只要 DATA_AVAILABLE 就取一个字，把"数据什么时候来"变成一条可读的时间线。 */
+            uint32_t *wp = reinterpret_cast<uint32_t *> (ext);
+            UInt32 got = 0;
+            for (UInt32 it = 0; it < 60 && got < (UInt32) (kSdhciBlockSize / 4); it++) {
+                if (it != 0) {
+                    sdhciDelayUs (500);
+                }
+                uint32_t st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
+                uint32_t ns = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+                if ((st & SDHCI_DATA_AVAILABLE) != 0) {
+                    /* 一步最多取 32 个字：真数据连续来就跟得上 400 kHz 的节奏；
+                     * 若 DATA_AVAILABLE 是假标志，这一步也会瞬间把 128 个字读成 0 —— 同样看得出来。 */
+                    for (UInt32 k = 0; k < 32; k++) {
+                        uint32_t v = sdhciRead32 (fCore, SDHCI_BUFFER);
+                        if (got < (UInt32) (kSdhciBlockSize / 4)) {
+                            wp[got] = v;
+                        }
+                        got++;
+                        if ((got & 7u) == 1u || v != 0) {
+                            IOLog ("NativeSdhci[" kSdhciTag "]: probe it=%u got=%u w=%08x state=%08x nis=%08x\n",
+                                   it, got, v, st, ns);
+                        }
+                        if (got >= (UInt32) (kSdhciBlockSize / 4)) {
+                            break;
+                        }
+                        st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
+                        if ((st & SDHCI_DATA_AVAILABLE) == 0) {
+                            break;
+                        }
+                    }
+                } else if ((it & 7u) == 0u) {
+                    IOLog ("NativeSdhci[" kSdhciTag "]: probe it=%u got=%u state=%08x nis=%08x (no data)\n",
+                           it, got, st, ns);
+                }
+                if ((ns & SDHCI_INT_DATA_END) != 0) {
+                    IOLog ("NativeSdhci[" kSdhciTag "]: probe DATA_END at it=%u got=%u\n", it, got);
                     break;
                 }
-                sdhciDelayUs (1000);
             }
+            IOLog ("NativeSdhci[" kSdhciTag "]: probe done got=%u/128 state=%08x nis=%08x eis=%08x\n",
+                   got, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                   sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
+                   sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
+            if (got == 0) {
+                IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 drained nothing; check DMA routing\n");
+            }
+            bool drained = (got >= (UInt32) (kSdhciBlockSize / 4));
             uint32_t *w = reinterpret_cast<uint32_t *> (ext);
             IOLog ("NativeSdhci[" kSdhciTag "]: ext w0=%08x w1=%08x w52=%08x w53=%08x w126=%08x w127=%08x drained=%u\n",
                    w[0], w[1], w[52], w[53], w[126], w[127], drained ? 1u : 0u);

@@ -4756,3 +4756,46 @@ sendCommand(CMD8) → 连采 8 次 state/nis（每次间隔 5 ms，共 ~40 ms）
 | `pio word 0` 有值、`pio word 32` 起变 0 且 `state` 掉 | FIFO 溢出/传输被截断，要缩到按 word 级别紧读（去掉一切日志） |
 | 全部 `pio word N = 00000000` | 数据真的没上总线，回到"卡侧/引脚"分支：下一版读 TLMM `0x9b000` 的 QDSD 控制字（`sdc2_data` 的 pull/drive 位在 9/0，`sdc2_cmd` 11/3，`sdc2_clk` 14/6，`pinctrl-sdm660.c:1396-1398`） |
 
+## 3.78 NativeSdhci v31：把"数据什么时候来"做成时间线探针
+
+### 3.78.1 v30 真机结果
+
+```
+pio word 0 = 00000000 state=01f80af6
+pio word 32 = 00000000 state=01f80af6
+pio word 64 = 00000000 state=01f80af6
+...
+pio got 512 words (block=128) first=00000000 00000000 00000000 00000000 last=00000000
+pio after state=01f80af6 nis=00000000 eis=00000000
+data timeout nis=0000 eis=0000 state=01f80af6
+```
+
+`state=01f80af6` 同时挂着 `DATA_INHIBIT(bit1)`、`DOING_READ(bit9)`、`DATA_AVAILABLE(bit11)`，
+而读 `SDHCI_BUFFER` 得到一片 0、读 512 次那个"有数据"位也不掉。
+
+两种解释互斥：
+
+* **(a) 我们排得太早**：CPU 全速读 512 个 32 位只要几十微秒，而 400 kHz 下卡要 10–20 ms
+  才把 512 字节送完 —— 相当于对着空 FIFO 猛读；
+* **(b) 数据被送去 DMA 引擎**：`SDHCI_ADMA_ADDRESS` 被 `sendCommand()` 清成 0，
+  Data Port 永远空，`DATA_AVAILABLE` 只是个假标志。
+
+### 3.78.2 v31 探针设计
+
+命令发完立刻开始，**每 500 µs 一步，共 60 步（≈30 ms）**：
+
+* 每步读 `PRESENT_STATE` 与 `NORMAL_INT_STATUS`；
+* 若 `DATA_AVAILABLE` 置位，则**一步最多取 32 个字**（真数据连续来就跟得上 400 kHz；
+  若标志是假的，这一步会瞬间把 128 字读成 0 —— 两种情况都能从日志里看出来）；
+* 每 8 个字或遇到非 0 值打一行 `probe it=%u got=%u w=%08x state=%08x nis=%08x`；
+* 看到 `DATA_END(bit1)` 立即收尾并打印。
+
+### 3.78.3 判读表
+
+| 现象 | 结论 |
+|---|---|
+| 前几十步 `(no data)`，某个 `it` 之后 `got` 开始涨、`w` 出现非 0 | **(a)** 成立：以前是自己排太早；直接按这个节奏写成正式读循环 |
+| `probe it=0 got=32 …` 一步就吃到 32 个字但全是 0 | **(b)** 成立：假的 `DATA_AVAILABLE`，数据在 DMA 侧；下一版武装 SDMA 并把数据写到真实物理地址 |
+| 60 步全是 `got=0 (no data)` | 卡真的一个字节都没发；转 TLMM `0x9b000` QDSD 控制字（`sdc2_data` pull/drive 位 9/0、`sdc2_cmd` 11/3、`sdc2_clk` 14/6）与卡侧状态 |
+| 出现 `probe DATA_END` 且 `got` 到 128 | 通了，直接看 `ext w53`（`SEC_COUNT` 低 32 位） |
+
