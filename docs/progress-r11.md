@@ -3020,3 +3020,74 @@ for (i < 200000) {
 | `bus: hostctl2=...` | 复位通过 | 看 `clock: div=24` 是否稳定 |
 | `cardInit: OCR=...` | CMD 线通 | 等 CMD2/CMD3/CMD9 全过 → `EXT_CSD ... SEC_COUNT` |
 | `GPT ok ... GPT[1] ...` | 全链路通 | 进入 Step 4：块设备注册（15 个 IOStorageFamily 符号的 `.set` 绑定） |
+
+## 3.52 NativeSdhci v7：`IODelay` 在本平台不返回 —— 改用 CNTPCT_EL0 自旋（2026-10-27）
+
+### 3.52.1 v6 真机结果：探针自证
+
+v6 只做了一件事就能定性：在 `ver=` 之后插一对 `delay probe` 日志。真机输出：
+
+```
+NativeSdhci[v6]: ver=02 caps=742dc8b2 caps1=0000000f
+NativeSdhci[v6]: delay probe: begin
+        ← 没有 delay probe: done
+dill_init: All the created dill kernel threads have been scheduled at least once
+Skylwalk: running self-tests ...
+bsd_autoconf: calling kminit
+...
+Waiting on <dict ... IOMedia ...>
+```
+
+结论（三条同时成立）：
+
+1. `delay probe: begin` 打出来了 → `ver=` 之后的 8 位寄存器访问**已经被 v6 的整字读写改掉**，不再是卡点；
+2. `delay probe: done` 没出现 → **`IODelay(100)` 不返回**；
+3. 内核其它线程继续跑、启动流程照常 → 停下的是 IOKit 匹配线程，不是整机。
+
+`v6` 之前所有 `IODelay` 调用都是"轮询首轮就命中"的路径，从来没真正执行过，所以这个缺陷一直没暴露。
+
+### 3.52.2 为什么 `IODelay` 会不返回
+
+`IODelay` 依赖内核已接管的时间基准（ARM generic timer 注册成功）。我们这套 ADT 里
+`pe_arm` 连中断控制器都没找到：
+
+```
+pe_arm_map_interrupt_controller: soc_phys: 0x17000000
+pe_arm_map_interrupt_controller: failed to find the interrupt-controller.
+pe_arm_init_debug: failed to find cpu-debug-interface
+```
+
+时间基准没有起来时，任何基于它的睡眠都会永久自旋。`IOSleep` 同理（它还多一层调度器依赖）。
+
+### 3.52.3 v7 做法
+
+自建延迟，不碰内核定时器：
+
+```c
+static inline uint64_t sdhciCounter (void)     { mrs x, cntpct_el0 }   /* 物理计数器 */
+static inline uint64_t sdhciCounterFreq (void) { mrs x, cntfrq_el0 }   /* 计数频率 */
+static void sdhciDelayUs (uint32_t us);
+```
+
+- 正常路径：`ticks = (freq / 1e6) * us + 1`，自旋 `yield` 直到 `cntpct` 差值达标；
+- 兜底路径：`freq` 为 0 或不合理时，退化成 `us * 64` 次 `yield` 自旋；
+- 再加一层 `guard`（40M 次）防止计数器真的不走时死循环。
+
+替换范围：`IODelay` 12 处、`IOSleep(10)` 2 处（`cardInit` 的 CMD1 重试）全部换成 `sdhciDelayUs`。
+`kSdhciTag` = `v7`；`delay probe` 日志升级为打印 `cntfrq` 与推进的 tick 数：
+
+```
+delay probe: begin (cntfrq=19200000 cntpct=...)
+delay probe: done (advanced=1920 ticks)      /* 100 us @ 19.2 MHz */
+```
+
+### 3.52.4 判读表（v7）
+
+| 最后一行 | 结论 | 下一步 |
+|---|---|---|
+| `delay probe: done (advanced=…)` | 延迟好了 | 继续看 `reset:` 系列日志 |
+| `delay probe: done (advanced=0)` | 计数器不走 | ADT 缺 timer 节点，要补 CNTFRQ/中断 |
+| `delay probe: begin` 后断 | 连 `mrs cntpct_el0` 都trap | 查 HCR_EL2/串口级 EL 状态（几乎不可能） |
+| `reset: cleared after N polls` | 软复位通过 | 看 `bus:` 与 `clock:` |
+| `reset: never cleared` | 32 位写 0x2C 也不生效 | SDCC 复位被 SoC 侧保持，要看 CRG/复位控制器 |
+| `cardInit: OCR=...` | CMD 线通了 | 等 `CMD2/CMD3/CMD9` → `EXT_CSD ... SEC_COUNT` |

@@ -45,7 +45,7 @@
 #include "SdhciRegs.h"
 
 #define kSdhciBlockSize   512ULL
-#define kSdhciCmdLoops    200000U     /* 轮询上限（约 200 ms，IODelay(1) = 1 us） */
+#define kSdhciCmdLoops    200000U     /* 轮询上限（200000 轮 × 1 us = 200 ms 上限） */
 #define kSdhciDataLoops   4000000U    /* 数据阶段上限（约 4 s） */
 
 /* bring-up 版本标记：每改一次驱动就 +1
@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v6"
+#define kSdhciTag         "v7"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -123,6 +123,52 @@ volatile uint32_t native_sdhci_gcc_cfg     = 0;
  *   - 8 位寄存器一律不单独访问，凡是落在 4 字节对齐字里的（0x28..0x2B、0x2C..0x2F）
  *     都用一次对齐的 32 位读-改-写完成。
  */
+/*
+ * v7：不再用 IODelay / IOSleep。
+ *
+ * v6 的探针实测到 `delay probe: begin` 之后再没有 `delay probe: done` —— 而内核其它线程
+ * 照样在跑，说明 IODelay(100) 在这个平台上**不返回**。IODelay 依赖内核认可的时间基准
+ * （ARM generic timer 注册成功），而我们这套 ADT 里 pe_arm 连中断控制器都没找到
+ * （日志：pe_arm_map_interrupt_controller: failed to find the interrupt-controller），
+ * 时间基准没被接管，任何基于它的睡眠都会永久自旋。
+ *
+ * 这里直接用架构计数寄存器（CNTPCT_EL0 / CNTFRQ_EL0），不依赖内核的任何定时器状态。
+ * 计数器不走（freq 为 0）时退化成固定次数自旋，仍然能保证给控制器留出间隔。
+ */
+static inline uint64_t sdhciCounter (void)
+{
+    uint64_t v;
+    __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (v));
+    return v;
+}
+
+static inline uint64_t sdhciCounterFreq (void)
+{
+    uint64_t v;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (v));
+    return v;
+}
+
+static void sdhciDelayUs (uint32_t us)
+{
+    uint64_t freq = sdhciCounterFreq ();
+    if (freq == 0 || freq > 1000000000ULL) {
+        for (volatile uint32_t i = 0; i < us * 64u; i++) {
+            __asm__ volatile ("yield");
+        }
+        return;
+    }
+    uint64_t ticks = (freq / 1000000ULL) * (uint64_t) us + 1;
+    uint64_t start = sdhciCounter ();
+    uint32_t guard = 0;
+    while (sdhciCounter () - start < ticks) {
+        __asm__ volatile ("yield");
+        if (++guard > 40000000u) {
+            break;
+        }
+    }
+}
+
 static inline uint32_t sdhciRead32 (uintptr_t base, uint32_t off)
 {
     return *reinterpret_cast<volatile uint32_t *> (base + off);
@@ -182,7 +228,7 @@ static bool sdhciWaitSet (uintptr_t base, uint32_t off, uint32_t mask, uint32_t 
         if ((sdhciRead32 (base, off) & mask) == mask) {
             return true;
         }
-        IODelay (1);
+        sdhciDelayUs (1);
     }
     return false;
 }
@@ -194,7 +240,7 @@ static bool sdhciWaitClock (uintptr_t base, uint16_t mask, uint32_t loops)
         if ((sdhciReadClockWord (base) & mask) == mask) {
             return true;
         }
-        IODelay (1);
+        sdhciDelayUs (1);
     }
     return false;
 }
@@ -447,7 +493,7 @@ bool NativeSdhci::enableGccClocks ()
             rootOn = true;
             break;
         }
-        IODelay (10);
+        sdhciDelayUs (10);
     }
     uint32_t cmdNow = sdhciRead32 (gcc, rcgr + GCC_RCG_CMD);
     IOLog ("NativeSdhci[" kSdhciTag "]: gcc: root enabled -> cmd=%08x%s\n", cmdNow,
@@ -468,7 +514,7 @@ bool NativeSdhci::enableGccClocks ()
                 on = true;
                 break;
             }
-            IODelay (10);
+            sdhciDelayUs (10);
         }
         IOLog ("NativeSdhci[" kSdhciTag "]: gcc: branch %s=%08x%s\n", branches[i].name,
                sdhciRead32 (gcc, branches[i].off), on ? "" : "  (CLK_OFF stuck)");
@@ -492,7 +538,7 @@ bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
                    i, sdhciReadClockWord (fCore));
             return true;
         }
-        IODelay (10);
+        sdhciDelayUs (10);
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: reset: never cleared, word=%08x\n", sdhciReadClockWord (fCore));
     return false;
@@ -524,7 +570,7 @@ bool NativeSdhci::setBusPowerAndClock ()
      * R11 上 VCC/VCCQ 常开，这一步只是让控制器开始驱动时钟。 */
     hostWord = (hostWord & 0xFFFF0000u) | ((uint32_t) (SDHCI_POWER_ON | SDHCI_POWER_330) << 8) | hostCtrl;
     sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
-    IODelay (1000);
+    sdhciDelayUs (1000);
     IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl2=%04x word28=%08x (1-bit, 3.3V)\n",
            hostCtrl2, sdhciReadHostWord (fCore));
 
@@ -548,7 +594,7 @@ bool NativeSdhci::setSdclkDivider (uint32_t div)
     }
     /* 先停卡时钟再改分频，避免毛刺（只改低 16 位，保留 TIMEOUT/RESET 字节） */
     sdhciWriteClockWord (fCore, sdhciReadClockWord (fCore) & 0xFFFF0000u);
-    IODelay (100);
+    sdhciDelayUs (100);
 
     uint16_t clk = (uint16_t) (SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8));
     sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0xFFFF0000u) | clk);
@@ -559,7 +605,7 @@ bool NativeSdhci::setSdclkDivider (uint32_t div)
     }
     clk = (uint16_t) (clk | SDHCI_CLOCK_CARD_EN);
     sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0xFFFF0000u) | clk);
-    IODelay (1000);
+    sdhciDelayUs (1000);
     IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) word=%08x stable\n", div,
            (unsigned) (R11_SDCLK_BASE_HZ / (2 * div * 1000)),
            sdhciReadClockWord (fCore));
@@ -580,7 +626,7 @@ bool NativeSdhci::waitCommandComplete ()
             sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_RESPONSE);
             return true;
         }
-        IODelay (1);
+        sdhciDelayUs (1);
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: cmd timeout state=%08x\n", sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     return false;
@@ -600,7 +646,7 @@ bool NativeSdhci::waitTransferComplete ()
             sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_END);
             return true;
         }
-        IODelay (1);
+        sdhciDelayUs (1);
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: data timeout state=%08x\n", sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     return false;
@@ -613,7 +659,7 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
         if (!(sdhciRead32 (fCore, SDHCI_PRESENT_STATE) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT))) {
             break;
         }
-        IODelay (1);
+        sdhciDelayUs (1);
     }
 
     sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
@@ -859,7 +905,7 @@ bool NativeSdhci::cardInit ()
         IOLog ("NativeSdhci[" kSdhciTag "]: CMD0 failed\n");
         return false;
     }
-    IOSleep (10);
+    sdhciDelayUs (10000);
 
     /* CMD1：SEND_OP_COND，直到卡退出 busy（HCS=1 表示支持 1.8V 高容量） */
     native_sdhci_step = 2;
@@ -875,7 +921,7 @@ bool NativeSdhci::cardInit ()
             ready = true;
             break;
         }
-        IOSleep (10);
+        sdhciDelayUs (10000);
     }
     if (!ready) {
         IOLog ("NativeSdhci[" kSdhciTag "]: card never left busy (CMD1), last=%08x\n", resp[0]);
@@ -1011,12 +1057,15 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
 
-    /* IODelay 隔离探针：在此之前的 IODelay 大概率一次都没真正执行过（轮询首轮就命中），
-     * 所以"卡在 ver= 之后"既可能是 8 位寄存器访问，也可能是 IODelay 本身。
-     * 这一对日志能直接分开这两种可能。 */
-    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin\n");
-    IODelay (100);
-    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done\n");
+    /* 时间基准自检：v6 实测 IODelay(100) 不返回（`delay probe: begin` 之后再无 `done`，
+     * 而内核其它线程照跑），所以现在改用 CNTPCT_EL0 自旋。这两行日志确认计数器在走。 */
+    uint64_t probeFreq = sdhciCounterFreq ();
+    uint64_t probeTicks = sdhciCounter ();
+    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%llu cntpct=%llu)\n",
+           probeFreq, probeTicks);
+    sdhciDelayUs (100);
+    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%llu ticks)\n",
+           sdhciCounter () - probeTicks);
 
     IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (0x2C word)\n");
     if (!softReset (SDHCI_RESET_ALL, kSdhciCmdLoops)) {
