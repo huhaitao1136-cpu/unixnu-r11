@@ -4008,3 +4008,44 @@ PAN / CPU 校验 / 输出开关 / serial_init / cons_ops_index 那些按指令�
 
 补丁脚本里只要出现"某个函数的尾部/某个不在 4 字节边界的寄存器"这类地址，就必须
 改成按符号或按指令编码定位 —— 内核每次重新链接，这些 VA 都会漂。
+
+### 3.66.4 最终实现：挂尾声 ret（20 字节跳板），不再改调用点
+
+第一版按调用点改：扫 `bl _initialize_screen`，把它拐到跳板。在真内核上一试就
+发现问题 —— 有 **6 处** 调用（`0x73c06dc`、`0x794132c`、`0x7941354`、`0x794140c`、
+`0x7941d78`、`0x79896fc`），只改第一处等于只在某个调用者上生效，语义不对。
+
+改成挂函数尾声，和旧版行为一致、但地址是算出来的：
+
+1. 函数范围 = `[_initialize_screen, 下一个符号)`；这一版是
+   `0xfffffff0073bdec8 .. 0xfffffff0073be878`（0x9b0 字节）；
+2. 在范围里找 `ret`（`0xD65F03C0`）取最后一个 —— 这一版恰好只有 1 个：
+   `0xfffffff0073be7c8`；
+3. 跳板 5 条（20 字节）：`stp x29,x30,[sp,#-16]!` / `mov w0,#1` /
+   `bl _gc_enable` / `ldp x29,x30,[sp],#16` / `ret`；
+4. 把尾声那条 `ret` 换成 `b 跳板`。
+
+真机内核上的实际结果（WSL 里用 `llvm-nm` 现导符号表验证）：
+
+```
+符号: initialize_screen=0xfffffff0073bdec8 gc_enable=0xfffffff0073bfc40 函数结束=0xfffffff0073be878
+  函数体里 1 个 ret，用最后一个 0xfffffff0073be7c8
+空洞: 0xfffffff0079f1444
+  跳板写入 20 字节
+  0xfffffff0073be7c8: ret -> b 跳板(0x1418cb1f)
+```
+
+反解校验：`b` 落到 `0xfffffff0079f1444`，跳板是
+`a9bf7bfd 52800020 97e739fd a8c17bfd d65f03c0`，其中 `bl` 的目标正是
+`_gc_enable = 0xfffffff0073bfc40`。
+
+顺带一个好消息：内核 Mach-O **自带符号表**（`llvm-nm --defined-only` 出 70148 行），
+所以 WSL 里不必等 CI 的 `kernel-symbols.txt`：
+
+    llvm-nm --defined-only kernel.macho | awk 'NF>=3 {print $1, $2, $3}' | sort > kernel-symbols.txt
+
+`patch-payload-full.py` 现在会自己做这件事 —— 找不到符号表就用 `llvm-nm` 从
+卷里取出的内核现导一份，实在没有才报错。
+
+又一个教训：`xcrun` 是 macOS 的东西，WSL 里没有（`/usr/bin/xcrun` 是个会报
+`exec: -f: invalid option` 的壳），本地一律用 `llvm-nm`。

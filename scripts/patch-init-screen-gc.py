@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""在 initialize_screen 被调用的地方插一个跳板：先调 initialize_screen，
-再调 gc_enable(TRUE)。
+"""在 initialize_screen 的尾声挂钩：先 initialize_screen 正常返回，再 gc_enable(TRUE)。
 
-为什么不再用固定地址：VAs 会随内核布局漂移（v20 那轮内核一变，
-0x73BA7C8 就不是 `ret` 了，补丁直接失败）。现在改成按符号表定位：
+为什么不再用固定地址
+--------------------
+旧版把两个 VA 写死：
 
-  1. --symbols 给 llvm-nm 的输出（`<addr> <type> <name>`，名字带前导下划线）
-  2. 找到 `_initialize_screen` 与 `_gc_enable` 的地址
-  3. 在 `__TEXT_EXEC` 里（优先限定在 `_PE_init_platform` 范围内）找
-     `bl _initialize_screen` 那条指令，把它改成 `bl 跳板`
-  4. 跳板（__TEXT_EXEC 的 NOP 空洞里，24 字节）：
+    RET_VA       = 0xFFFFFFF0073BA7C8   # initialize_screen 的 ret
+    GC_ENABLE_VA = 0xFFFFFFF0073BBC40   # gc_enable 的入口
+
+内核每次重新链接这些地址都会漂。v20 那轮 `0x73BA7C8` 已经变成
+`ldr w8,[x19]`（0xb9400268），补丁直接失败，payload 于是没带上屏补丁，
+内核一个字都打不出来、屏幕停在 UniXNU 菜单帧。
+
+现在改成按符号表定位（`llvm-nm` 的 `<addr> <type> <name>` 输出）：
+
+  1. 取 `_initialize_screen` 与 `_gc_enable` 的地址；
+  2. 函数范围 = `[_initialize_screen, 下一个符号)`；
+  3. 在范围里找 `ret`（0xD65F03C0），取**最后一个**（尾声）；
+  4. 在 `__TEXT_EXEC` 的 NOP 空洞里写 20 字节跳板：
+
         stp  x29, x30, [sp, #-16]!
-        bl   _initialize_screen
         mov  w0, #1
         bl   _gc_enable
         ldp  x29, x30, [sp], #16
         ret
 
-不管是从 PE_init_platform 调还是别处调，语义都正确（等于"包一层"，时序仍在
-initialize_screen 之后、单线程、vinfo 已完整）。
+  5. 把尾声那条 `ret` 改成 `b 跳板`。
+
+语义与旧版完全一样：initialize_screen 的正文跑完、栈帧已弹开，然后
+gc_enable(TRUE)，再真正返回。因为挂在函数尾声，所有调用者都会经过它。
 
 用法:
   python3 patch-init-screen-gc.py <kernel.macho> [输出] --symbols <nm.txt>
@@ -28,10 +38,12 @@ import sys
 from pathlib import Path
 
 NOP = b'\x1f\x20\x03\xd5'
+RET = 0xD65F03C0
 
 
 def segments(d):
-    _, _, _, _, ncmds, _, _ = struct.unpack_from('<IiiIIII', d, 0)
+    """解析 Mach-O 的 LC_SEGMENT_64：[(name, vmaddr, vmsize, fileoff, filesize)]。"""
+    ncmds = struct.unpack_from('<I', d, 16)[0]
     off = 32
     out = []
     for _ in range(ncmds):
@@ -58,7 +70,15 @@ def enc_bl(from_va, to_va):
     return 0x94000000 | ((delta >> 2) & 0x3FFFFFF)
 
 
-def find_last_cave(d, segs, need=24):
+def enc_b(from_va, to_va):
+    delta = to_va - from_va
+    if abs(delta) >= (1 << 27):
+        raise ValueError('b 超出 ±128MB')
+    return 0x14000000 | ((delta >> 2) & 0x3FFFFFF)
+
+
+def find_last_cave(d, segs, need=20):
+    """在 __TEXT_EXEC 里找最后一段 >= need 字节的 NOP 空洞。"""
     best = None
     for name, vm, vs, fo, fs in segs:
         if name != '__TEXT_EXEC':
@@ -95,7 +115,7 @@ def parse_symbols(path):
 
 def symbol_addr(table, wanted):
     for addr, name in table:
-        if name == wanted or name == '_' + wanted:
+        if name == wanted or name == '_' + wanted or name.lstrip('_') == wanted.lstrip('_'):
             return addr
     return None
 
@@ -132,85 +152,52 @@ def main() -> int:
     if not init or not gc:
         print(f'!! 符号缺失: initialize_screen={init} gc_enable={gc}')
         return 1
-    print(f'符号: initialize_screen=0x{init:x} gc_enable=0x{gc:x}')
-
-    # 优先在 _PE_init_platform 范围内找调用点
-    callers = []
-    for fname in ('_PE_init_platform', '_IOService::initialize', '_kernel_bootstrap'):
-        base = symbol_addr(table, fname) if fname.startswith('_') else None
-        if base:
-            callers.append((fname, base, next_symbol(table, base)))
-            break
-
-    def scan(lo, hi):
-        found = []
-        o = va_to_off(segs, lo)
-        if o is None:
-            return found
-        end = min(hi, lo + 96 * 1024 * 1024)
-        n = (end - lo) // 4
-        for i in range(n):
-            ins = struct.unpack_from('<I', d, o + 4 * i)[0]
-            if (ins & 0xFC000000) != 0x94000000:
-                continue
-            imm = ins & 0x3FFFFFF
-            if imm & 0x2000000:
-                imm -= 0x4000000
-            if lo + 4 * i + imm * 4 == init:
-                found.append(lo + 4 * i)
-        return found
-
-    sites = []
-    if callers:
-        name, lo, hi = callers[0]
-        print(f'在 {name} (0x{lo:x}..0x{hi:x}) 里找 bl initialize_screen')
-        sites = scan(lo, hi)
-    if not sites:
-        print('退回到整个 __TEXT_EXEC 扫描')
-        for nm, vm, vs, fo, fs in segs:
-            if nm == '__TEXT_EXEC':
-                sites = scan(vm, vm + fs)
-                break
-    if not sites:
-        print('!! 找不到 bl initialize_screen')
+    end = next_symbol(table, init)
+    print(f'符号: initialize_screen=0x{init:x} gc_enable=0x{gc:x} 函数结束=0x{end:x}')
+    if end - init > 0x10000:
+        print('!! initialize_screen 范围过大，符号表可能不全')
         return 1
-    for s in sites:
-        print(f'  调用点 0x{s:x}')
 
-    site = sites[0]
-    if len(sites) > 1:
-        print(f'  有 {len(sites)} 处调用，只改第一处')
+    o = va_to_off(segs, init)
+    if o is None:
+        print('!! initialize_screen 不在任何段里')
+        return 1
+    rets = []
+    for i in range((end - init) // 4):
+        if struct.unpack_from('<I', d, o + 4 * i)[0] == RET:
+            rets.append(init + 4 * i)
+    if not rets:
+        print('!! 函数体里找不到 ret')
+        return 1
+    print(f'  函数体里 {len(rets)} 个 ret，用最后一个 0x{rets[-1]:x}')
+    ret_va = rets[-1]
+    roff = va_to_off(segs, ret_va)
 
     cave = find_last_cave(d, segs)
     if cave is None:
-        print('!! 找不到 >=24 字节空洞')
+        print('!! 找不到 >=20 字节空洞')
         return 1
     print(f'空洞: 0x{cave:x}')
     coff = va_to_off(segs, cave)
-    if coff is None:
-        print('!! 空洞不在文件内')
-        return 1
 
     insns = [
-        0xA9BF7BFD,                     # stp x29, x30, [sp, #-16]!
-        enc_bl(cave + 4, init),         # bl initialize_screen
-        0x52800020,                     # mov w0, #1
-        enc_bl(cave + 12, gc),          # bl gc_enable
-        0xA8C17BFD,                     # ldp x29, x30, [sp], #16
-        0xD65F03C0,                     # ret
+        0xA9BF7BFD,                 # stp x29, x30, [sp, #-16]!
+        0x52800020,                 # mov w0, #1
+        enc_bl(cave + 8, gc),       # bl gc_enable
+        0xA8C17BFD,                 # ldp x29, x30, [sp], #16
+        0xD65F03C0,                 # ret
     ]
     for k, ins in enumerate(insns):
         struct.pack_into('<I', d, coff + 4 * k, ins)
     print(f'  跳板写入 {len(insns) * 4} 字节')
 
-    soff = va_to_off(segs, site)
-    cur = struct.unpack_from('<I', d, soff)[0]
-    if (cur & 0xFC000000) != 0x94000000:
-        print(f'!! 0x{site:x} 不是 bl (0x{cur:08x})')
+    cur = struct.unpack_from('<I', d, roff)[0]
+    if cur != RET:
+        print(f'!! 0x{ret_va:x} 不是 ret (0x{cur:08x})')
         return 1
-    new = enc_bl(site, cave)
-    struct.pack_into('<I', d, soff, new)
-    print(f'  0x{site:x}: bl initialize_screen(0x{cur:08x}) -> bl 跳板(0x{new:08x})')
+    new = enc_b(ret_va, cave)
+    struct.pack_into('<I', d, roff, new)
+    print(f'  0x{ret_va:x}: ret -> b 跳板(0x{new:08x})')
 
     dst.write_bytes(d)
     print(f'输出: {dst}')

@@ -14,6 +14,7 @@
 用法:
   python3 patch-payload-full.py <payload.img> [--symbols <kernel-symbols.txt>]
 """
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,34 @@ def find_symbols(explicit, payload):
         if p.is_file():
             return p
     return None
+
+
+def make_symbols_from_kernel(kernel, out):
+    """内核 Mach-O 自带符号表，用 llvm-nm 现导一份，省掉从 CI 拿 kernel-symbols.txt。"""
+    nm = None
+    for cand in ('llvm-nm', 'llvm-nm-18', 'llvm-nm-19', 'llvm-nm-17', 'llvm-nm-16'):
+        p = shutil.which(cand)
+        if p:
+            nm = p
+            break
+    if nm is None:
+        return None
+    r = subprocess.run([nm, '--defined-only', str(kernel)], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    rows = []
+    for line in (r.stdout or '').splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                int(parts[0], 16)
+            except ValueError:
+                continue
+            rows.append(f'{parts[0]} {parts[1]} {parts[2]}')
+    if not rows:
+        return None
+    out.write_text('\n'.join(rows) + '\n')
+    return out
 
 
 def main() -> int:
@@ -102,7 +131,10 @@ def main() -> int:
     print('== 打内核日志上屏补丁')
     sym = find_symbols(symbols, payload)
     if sym is None:
-        print('!! 找不到 kernel-symbols.txt —— 请从 r11-boot-artifacts 里取出')
+        print('   没找到 kernel-symbols.txt，改用 llvm-nm 从内核自己导出')
+        sym = make_symbols_from_kernel(kernel, tmp / 'kernel-symbols.txt')
+    if sym is None:
+        print('!! 没有符号表，也没有 llvm-nm —— 请从 r11-boot-artifacts 里取出 kernel-symbols.txt')
         print('   或显式传 --symbols <path>（CI 的 导出内核符号 步骤会生成它）')
         return 1
     print(f'   符号表: {sym}')
