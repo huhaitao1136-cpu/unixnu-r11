@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v22"
+#define kSdhciTag         "v23"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1093,6 +1093,29 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
         desc[i] = 0;
     }
 
+    /* 这块控制器的 CAPABILITIES 是 0x742dc8b2：bit27(ADMA2)=0、bit26(SDMA)=1。
+     * v20~v22 一直在 ADMA2 上撞，也一直是 eis=0x200(ADMA Error)。既然它没广告
+     * ADMA2，就走它广告了的 SDMA：把 DMA Select 拨回 0，0x58 里直接放数据缓冲区
+     * 的物理地址（SDMA 没有描述符表）。 */
+    const uint32_t caps    = sdhciRead32 (fCore, SDHCI_CAPABILITIES);
+    const bool     hasAdma2 = (caps & (1u << 27)) != 0;
+    const bool     hasSdma  = (caps & (1u << 26)) != 0;
+
+    if (!hasAdma2 && hasSdma) {
+        uint32_t hostWord = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
+        hostWord &= ~0x18u;                                 /* DMA Select = 0 (SDMA) */
+        sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
+
+        fDmaDesc->prepare (kIODirectionOut);
+        fDmaData->prepare (kIODirectionIn);
+
+        sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu));
+        fDmaArmed = true;
+        IOLog ("NativeSdhci[" kSdhciTag "]: dma: sdma armed layout=sdma caps=%08x bytes=%u addr=%08x hostctl=%02x\n",
+               caps, bytes, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), hostWord & 0xFFu);
+        return true;
+    }
+
     const uint32_t hostWord  = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
     const uint32_t dmaSelect = (hostWord >> 3) & 0x3u;
     const char    *layout    = "32";
@@ -1113,8 +1136,8 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
 
     sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDescPhys & 0xFFFFFFFFu));
     fDmaArmed = true;
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed layout=%s select=%u bytes=%u desc0=%08x %08x %08x %08x adma=%08x\n",
-           layout, dmaSelect, bytes, desc[0], desc[1], desc[2], desc[3],
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed layout=%s select=%u caps=%08x bytes=%u desc0=%08x %08x %08x %08x adma=%08x\n",
+           layout, dmaSelect, caps, bytes, desc[0], desc[1], desc[2], desc[3],
            sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
     return true;
 }

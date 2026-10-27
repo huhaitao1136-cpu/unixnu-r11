@@ -4232,3 +4232,56 @@ ADMA Error，数据自然是全 0。
 | `layout=64` 但仍 `eis=0200` | 描述符地址/长度还有细节不对（看 `err=…`） |
 | `dma: done ok=1` 但 `dma: data` 全 0 | 地址对了但读的是别的内存，查 `fDmaDataPhys` 与 IOMMU |
 | 出现 `EXT_CSD rev=… SEC_COUNT=…` | 64 GB 容量第一次被内核读出来 |
+
+## 3.70 ADMA2 这块控制器根本没广告 → 改走 SDMA（v23）
+
+v22 把条目换成 16 字节的 64 位格式，日志是：
+
+```
+dma: armed layout=64 select=3 caps=… bytes=512 desc0=02000027 00000000 aff45000 00000000 adma=afdac000
+cmd8 pre state=01f000f0 adma=afdac000
+cmd done, error flag ignored: word=02000001 nis=0001 eis=0200 eis16=0200
+CMD8 ok state=01f002f6 nis=00000000 eis=00000000 adma=afdac024
+data timeout nis=0000 eis=0000 state=01f002f6
+dma: done ok=0 ... err=00000000/00000000
+dma: data 00000000 00000000 00000000 00000000 | w52=… w53=…
+```
+
+条目布局对了，`eis=0x200`（ADMA Error）却一次都没变。回头去看 CAPABILITIES：
+
+```
+ver=02 caps=742dc8b2 caps1=0000008f
+0x742dc8b2 = 0111 0100 0010 1101 1100 1000 1011 0010
+  bit28 = 1   64 位系统总线支持
+  bit27 = 0   ADMA2 不支持     <-- 就在等这一条
+  bit26 = 1   SDMA 支持
+```
+
+**这块 SDCC（ABL 交过来的配置下）压根没广告 ADMA2。** MSM 上的 ADMA 需要额外的
+vendor 侧配置（`CORE_VENDOR_SPEC` 里的 DMA 位 + 描述符表的物理约束），SDMA 才是
+开箱可用的那条路。v20~v22 一直在 ADMA2 上撞，所以 `eis=0x200` 从来不变。
+
+### 3.70.1 v23 改动
+
+`beginDmaRead()` 先读 `CAPABILITIES` 做路由：
+
+* `bit27` 有 → ADMA2（保留 v22 的 32/64 位两种条目布局）；
+* `bit27` 无、`bit26` 有 → **SDMA**：
+  * 把 `Host Control 1` 的 `DMA Select` 拨回 `0`；
+  * 直接把**数据缓冲区的物理地址**写进 `0x58`（SDMA 没有描述符表，这个寄存器
+    在 SDMA 模式下就是系统内存地址）；
+  * 日志 `dma: sdma armed layout=sdma caps=… bytes=… addr=… hostctl=…`。
+* `dma: armed` 顺带打印 `caps`，方便对照。
+
+### 3.70.2 判据
+
+| 日志 | 结论 |
+|---|---|
+| `dma: sdma armed … hostctl=00` + `dma: done ok=1` + 非 0 数据 | SDMA 通了 |
+| `dma: sdma armed` 但 `data timeout` 且 `adma` 没变 | SDMA 也没启动，回头查 `Host Control 1` 是否真被写进去 |
+| `dma: done ok=1` 但 `dma: data` 全 0 | 缓存/一致性：`prepare/complete` 没生效，需要 IODMACommand |
+| 出现 `EXT_CSD rev=… SEC_COUNT=…` | 64 GB 容量第一次被内核读出来 |
+
+顺便记一条经验：**先读 CAPABILITIES 判断硬件到底支持什么，再写驱动**。
+前几轮一直在"按 sdhci 通用流程实现 ADMA2"，却没验证这块控制器广告了 ADMA2 没有，
+白烧了三轮（v20/v21/v22）。
