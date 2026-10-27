@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v29"
+#define kSdhciTag         "v30"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -968,6 +968,10 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
                 break;
             }
             uint32_t w = sdhciRead32 (fCore, SDHCI_BUFFER);
+            if ((n & 31u) == 0) {
+                IOLog ("NativeSdhci[" kSdhciTag "]: pio word %u = %08x state=%08x\n",
+                       n, w, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
+            }
             if (n < 4) {
                 first[n] = w;
             }
@@ -1356,22 +1360,22 @@ bool NativeSdhci::readExtCsd ()
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 r1=%08x current_state=%u (%s)\n",
                    r1[0], (r1[0] >> 9) & 0xFu, sdhciCardStateName ((r1[0] >> 9) & 0xFu));
 
-            /* 数据引擎到底动没动？连采 8 次，间隔 5 ms。 */
-            for (uint32_t s = 0; s < 8; s++) {
-                uint32_t st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
-                uint32_t ns = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
-                IOLog ("NativeSdhci[" kSdhciTag "]: trace %u state=%08x nis=%08x\n", s, st, ns);
-                if ((st & (SDHCI_DATA_INHIBIT | SDHCI_DOING_READ)) == 0) {
+            /* v30：先排水！之前这里连采 8 次（间隔 5 ms，共 40 ms）才去读 FIFO，
+             * 400 kHz 下 512 字节只要 10–20 ms，等于把 FIFO 晾到溢出。 */
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 posted-to-drain state=%08x nis=%08x\n",
+                   sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                   sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
+            bool drained = pioTransfer (true, ext, (UInt32) kSdhciBlockSize);
+            for (uint32_t s = 0; s < 3; s++) {
+                IOLog ("NativeSdhci[" kSdhciTag "]: trace %u state=%08x nis=%08x eis=%08x\n", s,
+                       sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                       sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
+                       sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
+                if ((sdhciRead32 (fCore, SDHCI_PRESENT_STATE) & SDHCI_DOING_READ) == 0) {
                     break;
                 }
-                sdhciDelayUs (5000);
+                sdhciDelayUs (1000);
             }
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 ok state=%08x nis=%08x eis=%08x adma=%08x\n",
-                   sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
-                   sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
-                   sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
-                   sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
-            bool drained = pioTransfer (true, ext, (UInt32) kSdhciBlockSize);
             uint32_t *w = reinterpret_cast<uint32_t *> (ext);
             IOLog ("NativeSdhci[" kSdhciTag "]: ext w0=%08x w1=%08x w52=%08x w53=%08x w126=%08x w127=%08x drained=%u\n",
                    w[0], w[1], w[52], w[53], w[126], w[127], drained ? 1u : 0u);

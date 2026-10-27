@@ -4705,3 +4705,54 @@ path[cmd8] dll=0705642c -> … ddr=00004073 -> … vs0=… -> …
 | `pio got` 里出现非 0 字 | **数据通了**，接着看 `w52/w53`（`SEC_COUNT`） |
 | 仍然全 0 | 采数路径还是错，下一步把 `CORE_HC_SELECT_IN` 显式设成 1(2^0) / 2 / 4 逐个试，并读 DLL_STATUS 的 lock 位 |
 
+## 3.77 NativeSdhci v30：三处数据通路写全部生效，仍无数据 —— 先把"自己的 40 ms 延迟"排掉
+
+### 3.77.1 v29 真机结果
+
+```
+path[cmd8] dll=0705642c -> 070d642c ddr=00004073 -> 00000000 vs0=00018a0c -> 00018a0c
+after 200: 0705642c -> 070d642c        ← CDR_EXT_EN(bit19) 置上了
+after 20c: 00240a0e -> 00018a0c        ← IO pad bit15|bit16 置上、CLK_PWRSAVE(bit1) 清掉
+after 25c: 00004073 -> 00000000        ← DDR_CONFIG 清成 0
+after changed=14/43
+CMD8 r1=00000900 current_state=4 (tran)
+pio got 512 words (block=128) first=00000000 00000000 00000000 00000000 last=00000000
+data timeout nis=0000 eis=0000 state=01f80af6
+ext w0=… w52=00000000 w53=00000000 drained=0
+```
+
+三处写**全都被硬件接受了**（读回值都变了），但数据仍然是 0 字节。
+于是这条线（CDR / DDR 配置 / CLK_PWRSAVE）也排除了。
+
+### 3.77.2 新的嫌疑对象：我们自己的读 FIFO 时机
+
+之前的顺序是：
+
+```
+sendCommand(CMD8) → 连采 8 次 state/nis（每次间隔 5 ms，共 ~40 ms）→ pioTransfer()
+```
+
+400 kHz 下一个 512 字节块只需要 **10–20 ms**（eMMC SDR：1 bit/clk，4096 clk @ 400 kHz）。
+也就是说我们**先晾了 40 ms 才去读 FIFO**。如果 FIFO 深度小于一个块（很常见，128 B = 32 字），
+这段时间足够溢出；溢出之后：
+
+* 读 `SDHCI_BUFFER` 拿到一片 0；
+* `DATA_END` 不会再来（`nis=0000`）；
+* 数据本身已经丢了（卡的 `R1` 依然干净）。
+
+这和观察到的现象完全一致，而且**是我们自己的代码造成的**，跟硬件无关。
+
+### 3.77.3 v30 改动
+
+* `readExtCsd()`：`sendCommand` 之后**立刻** `pioTransfer()`，把 trace 挪到排水之后（3 次、1 ms 间隔）；
+* `pioTransfer()`：每 32 个字打一行 `pio word %u = %08x state=%08x`，
+  这样能直接区分"数据根本没来"和"来了一半就断了"。
+
+### 3.77.4 下一刷判读表
+
+| 现象 | 结论 |
+|---|---|
+| `pio word 0 = <非 0>` 且后面每 32 字都有值 | 数据其实一直能来，之前是自己晾坏了 → 继续读满 128 字并看 `w53`（`SEC_COUNT`） |
+| `pio word 0` 有值、`pio word 32` 起变 0 且 `state` 掉 | FIFO 溢出/传输被截断，要缩到按 word 级别紧读（去掉一切日志） |
+| 全部 `pio word N = 00000000` | 数据真的没上总线，回到"卡侧/引脚"分支：下一版读 TLMM `0x9b000` 的 QDSD 控制字（`sdc2_data` 的 pull/drive 位在 9/0，`sdc2_cmd` 11/3，`sdc2_clk` 14/6，`pinctrl-sdm660.c:1396-1398`） |
+
