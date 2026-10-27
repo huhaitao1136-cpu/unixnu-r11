@@ -3818,3 +3818,59 @@ cmd8 complete state=01e002f6
 | `pio read 128 words state=…` 且 bit11=1 | 卡在送更多的数据（传输量不符：查 BLOCK_SIZE/CMD16） |
 | `pio read starved at word N` | FIFO 断供（DAT0 信号质量/时钟/供电） |
 | `EXT_CSD rev=8 SEC_COUNT=…` | **数据阶段通了** |
+
+## 3.64 NativeSdhci v18 真机结果：数据真的在流，但 DATA_END 永远不来（2026-10-27）
+
+### 3.64.1 屏幕日志（v18，CMD8 两轮 + CMD17 两轮，形态完全一致）
+
+```
+CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff18 attempt=0
+cmd8 pre  state=01f000f0 adma=00000000
+cmd8 posted state=01f000f1
+cmd8 complete state=01e002f6
+CMD8 ok state=01e002f6 nis=00000020 eis=00000000 adma=00000000
+pio word 0   state=01f00af6 nis=00000020
+pio word 32  state=01f00af6 nis=00000020
+pio word 64  state=01f00af6 nis=00000020
+pio word 96  state=01f00af6 nis=00000020
+pio word 127 state=01f00af6 nis=00000020
+pio read 128 words state=01f00af6 nis=00000020 eis=00000000
+data timeout nis=0020 eis=0000 state=01f00af6
+EXT_CSD transfer failed (attempt 0)
+...（attempt 1 完全相同）
+cmd17 ...（LBA0 读，两轮，形态完全相同）
+LBA0 read FAILED
+media probe failed at step 9
+```
+
+### 3.64.2 这一屏确认的事
+
+1. **命令阶段完全正常**：`cmd8 pre/posted/complete` 三行都在，`adma=00000000`。
+2. **数据确实在进 FIFO**：`nis=0x20` 就是 NIS bit5 = Buffer Read Ready，
+   `state` 里 `READ_TRANSFER_ACTIVE(bit9)=1`、`DAT_LINE_ACTIVE(bit2)=1`。
+3. **128 个字（512 B）读完，`BUFFER_READ_ENABLE(bit11)` 仍然是 1** —— 控制器认为
+   还有数据没取；`DATA_END(NIS bit1)` 从头到尾没有出现过。
+4. 400 kHz 下 CMD17 与 CMD8 的表现一模一样 → 与"哪个命令"无关，
+   是**数据阶段的收尾条件**没满足。
+
+### 3.64.3 v19 改动：不再猜块长，直接量
+
+`pioTransfer()` 的读路径改成"有多少收多少"：
+
+* 循环条件不再固定 `count`，而是"FIFO 里还有数据（bit11）就继续读"，上限 4 倍块长；
+* 打完第一轮就打 `pio got %u words (block=%u) first=… last=…` ——
+  **这条直接把真实传输量量出来**：128 就是正常一块，256/512 就是块长不符，
+  4096 就是"开到 CMD12 为止"的多块；
+* 再打 `pio after state=… nis=… eis=…`，看收尾位；
+* `first=` 的前四个字还能顺便验证数据是不是真的（LBA0 应该看到 MBR/GPT 的内容，
+  全 0 就说明 FIFO 给的是空/垃圾）。
+
+### 3.64.4 下一刷的判读表
+
+| `pio got` 行 | 结论 | 下一步 |
+|---|---|---|
+| `got 128 words` 且 `after` 里 bit11=0 | 数据量正确、只是 DATA_END 位没置 | 直接改用"FIFO 空 + 不再有新数据"当收尾条件 |
+| `got 128 words` 且 bit11=1 | 控制器还想继续收 | 查 BLOCK_SIZE/CMD16/CSD 的 READ_BL_LEN |
+| `got 256/512 words` | 卡按 1/2 KB 块在发 | CMD16 没生效，改用 CMD6 改 EXT_CSD 的块长 |
+| `got 4096 words`（顶到上限） | 多块开环传输 | 需要 CMD12 收尾 |
+| `first=00000000 00000000 …` | FIFO 给的是空数据 | 时钟/采样点问题，回到 400 kHz 以下继续降速验证 |

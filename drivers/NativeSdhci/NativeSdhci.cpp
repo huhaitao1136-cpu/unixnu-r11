@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v18"
+#define kSdhciTag         "v19"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -908,26 +908,39 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
     const UInt32 count = bytes / 4;
 
     if (read) {
-        for (UInt32 i = 0; i < count; i++) {
+        /* 不再"读满块长就收工"：控制器愿意给多少字就收多少字（上限 4 倍块长），
+         * 这样能直接量出这次传输到底有多少数据 —— v18 实测读满 128 个字之后
+         * BUFFER_READ_ENABLE(bit11) 仍然是 1，说明控制器认为还有数据。 */
+        const UInt32 cap = count * 4;
+        UInt32 n = 0;
+        uint32_t first[4] = { 0, 0, 0, 0 };
+        uint32_t last = 0;
+
+        for (UInt32 i = 0; i < cap; i++) {
             if (!sdhciWaitSet (fCore, SDHCI_PRESENT_STATE, SDHCI_DATA_AVAILABLE, kSdhciDataLoops)) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: pio read starved at word %u/%u state=%08x nis=%08x\n",
-                       i, count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
-                       sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
-                return false;
+                if (n == 0) {
+                    IOLog ("NativeSdhci[" kSdhciTag "]: pio read starved at word 0/%u state=%08x nis=%08x\n",
+                           count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                           sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
+                    return false;
+                }
+                break;
             }
-            words[i] = sdhciRead32 (fCore, SDHCI_BUFFER);
-            /* 取几个采样点，看清 FIFO 是"一次给满"还是"慢慢滴出来" */
-            if (i == 0 || i == 32 || i == 64 || i == 96 || (i + 1) == count) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: pio word %u state=%08x nis=%08x\n",
-                       i, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
-                       sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
+            uint32_t w = sdhciRead32 (fCore, SDHCI_BUFFER);
+            if (n < 4) {
+                first[n] = w;
             }
+            if (n < count) {
+                words[n] = w;
+            }
+            last = w;
+            n++;
         }
-        /* 读满之后立刻把现场打出来：DATA_END 有没有来、FIFO 是不是还有数据。
-         * 若 BUFFER_READ_ENABLE(bit11) 仍为 1，说明控制器认为数据还没取完
-         * （即 BLOCK_SIZE/BLOCK_COUNT 与实际传输量不符）。 */
-        IOLog ("NativeSdhci[" kSdhciTag "]: pio read %u words state=%08x nis=%08x eis=%08x\n",
-               count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+
+        IOLog ("NativeSdhci[" kSdhciTag "]: pio got %u words (block=%u) first=%08x %08x %08x %08x last=%08x\n",
+               n, count, first[0], first[1], first[2], first[3], last);
+        IOLog ("NativeSdhci[" kSdhciTag "]: pio after state=%08x nis=%08x eis=%08x\n",
+               sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
                sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
     } else {
