@@ -3476,3 +3476,63 @@ if (nis & SDHCI_INT_ERROR) {              /* 只有"没完成又报错"才算失
 | `cmd done, error flag ignored …` 但 `resp[0]=00000000/ffffffff` | 响应寄存器是空的 → 卡没驱动 CMD 线（供电/引脚/时钟到卡） |
 | `cmd error before complete: … eis16=0001` | 真的 Command Timeout |
 | `card never left busy (CMD1), last=…` | 卡一直忙 → 查 OCR 电压窗/供电 |
+
+## 3.58 NativeSdhci v12 真机结果：**卡应答了**（OCRe=0xc0ff8000），卡在 CMD2（2026-10-27）
+
+### 3.58.1 v12 屏幕日志（里程碑）
+
+```
+NativeSdhci[v12]: clock: 400000 Hz (gcc m/n=1/48) int=000e0003 now=000e0005
+NativeSdhci[v12]: start: clock done
+NativeSdhci[v12]: cardInit: CMD0
+NativeSdhci[v12]: cardInit: CMD1 (op cond)
+NativeSdhci[v12]: cmd done, error flag ignored: word=00008001 nis=8001 eis=0000 eis16=0000
+NativeSdhci[v12]: cardInit: CMD1 resp[0]=40ff8000 state=01f000f0
+NativeSdhci[v12]: cmd done, error flag ignored: word=00008001 nis=8001 eis=0000 eis16=0000
+NativeSdhci[v12]: cardInit: CMD1 resp[1]=c0ff8000 state=01f000f0
+NativeSdhci[v12]: cardInit: OCR=c0ff8000
+NativeSdhci[v12]: cardInit: CMD2 (cid)
+NativeSdhci[v12]: cmd error before complete: word=00008000 nis=8000 eis=0000 eis16=0000
+NativeSdhci[v12]: card init failed at step 3 (state=01f000f1 err=0000)
+```
+
+**这是整条存储链第一次真机踩通的关键一步**：
+
+- `resp[1]=c0ff8000` 是实打实的 R3 响应：
+  - bit31 `BUSY=1` → 卡已完成初始化（第一次读到的 `40ff8000` 是 busy 还没退出）；
+  - bit30 `HCS=1` → 支持 1.8V 高容量；
+  - bit23..0 `0xFF8000` → OCR 电压窗 = 3.2–3.4V。
+- 也就是说：**GCC 400 kHz + 1-bit 总线 + 开漏 CMD + CMD0/CMD1 全部工作**，
+  卡在物理层被我们真正驱动起来了。前面 v3→v11 折腾的时钟、位宽、vendor 模式、
+  状态位判定，全是对的。
+
+### 3.58.2 新的卡点：CMD2 不完成、也不报错
+
+- CMD2（ALL_SEND_CID，136 位长响应 + CRC）下发后：
+  `word=00008000 nis=8000 eis=0000 eis16=0000`，`state=01f000f1`。
+  - `nis=0x8000` 只有 error 汇总位、**没有** Command Complete；
+  - EIS 全 0（32 位合并读与 16 位交叉读都是 0）；
+  - `state` 的 bit0 `CMD_INHIBIT=1` → 控制器认为命令还在进行中，卡住了。
+- 说明 CMD1 虽然"完成"，但硬件里留了一个**错误锁存**（NIS 的幽灵 bit15），
+  我们清 NIS 并不足以清掉控制器内部状态，于是下一条命令被卡住。
+
+### 3.58.3 v13 改动（本轮提交）
+
+1. 新增 `recoverCommandState (const char *why)`：先打印 `state/nis/eis/mstat`，
+   再写 `0xFFFF` 清 NIS+EIS，然后 `softReset (SDHCI_RESET_CMD | SDHCI_RESET_DATA)`
+   （只复位命令/数据状态机，不碰时钟电源），延时 1 ms 后打印复位结果。
+2. `cardInit()` 在读 OCR 之后立刻 `recoverCommandState ("after CMD1 (stale error latch)")`，
+   把 CMD1 留下的锁存清掉再发 CMD2 —— **这是本轮的主实验**。
+3. **CMD2 失败不再致命**：打 `CMD2 failed, continuing without CID` 后 `cid0 = 0` 继续。
+   eMMC 的 RCA 由 host 指定，CID 只是信息，所以即使 136 位长响应这条路不通，
+   也还能继续 CMD3/CMD9/CMD7，把"到底哪一段不通"暴露出来。
+4. CMD3 失败时先 `recoverCommandState` 再重试一次，两次都失败才放弃。
+
+### 3.58.4 下一刷的判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `recover: done (state=01f000f0)` 后 CMD2 成功并出现 `CMD3 (rca=1)` | 幽灵锁存是真的原因，继续走 |
+| CMD2 仍卡、但 **CMD3 成功** | 只有 136 位长响应（R2）这条路不通 → 查 RESPONSE 读取宽度/CRC 标志 |
+| CMD2 卡 + **CMD3 也卡** | 带 CRC 的命令都不通 → 查 CMD 线 CRC 状态（DAT0-7 无关）或卡仍处于 busy |
+| 出现 `CMD9 (csd)` / `CMD7 (select)` / `CMD16 (blklen 512)` | 识别阶段基本完成，下一步读 EXT_CSD、GPT |

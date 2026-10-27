@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v12"
+#define kSdhciTag         "v13"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -277,6 +277,7 @@ private:
     void     logGccState ();
     bool     enableGccClocks ();
     bool     softReset (uint32_t which, uint32_t loops);
+    void     recoverCommandState (const char *why);
     bool     setBusPowerAndClock ();
     bool     configureVendorSpec ();
     bool     setGccSdccRate (uint32_t m, uint32_t n, uint32_t hidDiv);
@@ -563,6 +564,25 @@ bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
     IOLog ("NativeSdhci[" kSdhciTag "]: reset: never cleared (word=%08x), forced 0 -> %08x, continuing\n",
            stuck, forced);
     return true;
+}
+
+/* 命令状态机复位：v12 真机实测，CMD1 完成时 NIS 里带着"幽灵 error 汇总位"，
+ * 我们清掉 NIS 之后控制器内部似乎还留着错误锁存，下一条命令（CMD2）就卡在
+ * CMD_INHIBIT 上既不完成也不报错。做法是先记日志，再复位 CMD/DATA 状态机
+ * 并清空两个中断状态寄存器，让后续命令能正常下发。 */
+void NativeSdhci::recoverCommandState (const char *why)
+{
+    IOLog ("NativeSdhci[" kSdhciTag "]: recover: %s (state=%08x nis=%04x eis=%04x mstat=%08x)\n",
+           why, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+           sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS),
+           sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
+           sdhciRead32 (fCore, CORE_MCI_STATUS_REG));
+    sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, (uint16_t) 0xFFFF);
+    sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, (uint16_t) 0xFFFF);
+    (void) softReset (SDHCI_RESET_CMD | SDHCI_RESET_DATA, kSdhciCmdLoops);
+    sdhciDelayUs (1000);
+    IOLog ("NativeSdhci[" kSdhciTag "]: recover: done (state=%08x)\n",
+           sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
 }
 
 bool NativeSdhci::setBusPowerAndClock ()
@@ -1113,14 +1133,23 @@ bool NativeSdhci::cardInit ()
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: OCR=%08x\n", resp[0]);
 
-    /* CMD2：拿 CID（长响应），顺便当作"卡还在"的探针 */
+    /* CMD1 完成时带着幽灵 error 汇总位（v12 实测 word=00008001），清掉 NIS 之后
+     * 控制器里可能还留着错误锁存，先复位一次命令状态机再发 CMD2。 */
+    recoverCommandState ("after CMD1 (stale error latch)");
+
+    /* CMD2：拿 CID（长响应）。这一步失败不致命 —— eMMC 的 RCA 由 host 指定，
+     * CID 只是信息，真正必须的是 CMD3/CMD9/CMD7，所以失败也继续往下走，
+     * 好让屏幕上看清到底是"136 位长响应这条路不通"还是"整条命令线不通"。 */
     native_sdhci_step = 3;
     IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 (cid)\n");
     if (!sendCommand (MMC_ALL_SEND_CID, 0,
                       SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
-        return false;
+        IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 failed, continuing without CID\n");
+        native_sdhci_cid0 = 0;
+        recoverCommandState ("after CMD2 failure");
+    } else {
+        native_sdhci_cid0 = resp[3];
     }
-    native_sdhci_cid0 = resp[3];
 
     /* CMD3：分配 RCA（eMMC 由 host 指定） */
     native_sdhci_step = 4;
@@ -1128,7 +1157,13 @@ bool NativeSdhci::cardInit ()
     IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 (rca=1), cid0=%08x\n", native_sdhci_cid0);
     if (!sendCommand (MMC_SET_RELATIVE_ADDR, (uint32_t) fRca << 16,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
-        return false;
+        IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 failed, retrying after recovery\n");
+        recoverCommandState ("after CMD3 failure");
+        if (!sendCommand (MMC_SET_RELATIVE_ADDR, (uint32_t) fRca << 16,
+                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 failed twice\n");
+            return false;
+        }
     }
     native_sdhci_rca = fRca;
 
