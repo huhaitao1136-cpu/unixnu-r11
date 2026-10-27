@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v20"
+#define kSdhciTag         "v21"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -312,6 +312,9 @@ private:
     IOBufferMemoryDescriptor *fDmaData     = nullptr;
     IOPhysicalAddress         fDmaDescPhys = 0;
     IOPhysicalAddress         fDmaDataPhys = 0;
+    /* beginDmaRead() 之后为 true：此时 SDHCI_ADMA_ADDRESS 里是我们自己的
+     * 描述符地址，sendCommand() 绝不能再清它（v20 就是在这里黑屏的）。 */
+    bool                      fDmaArmed = false;
     UInt16    fRca      = 0;
     UInt64    fBlockCount = 0;
 #if XNU_NATIVE_SDHCI_BLOCK_DEVICE
@@ -880,9 +883,13 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
     }
 
     if (isData) {
-        /* MSM 的 SDMA/ADMA 地址寄存器（0x58）在 ABL 之后是野值。DMA Enable 虽然是 0，
-         * 但保险起见每次数据命令之前清零，避免控制器拿野指针去搬运。 */
-        sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, 0);
+        /* MSM 的 SDMA/ADMA 地址寄存器（0x58）在 ABL 之后是野值，PIO 路径要在
+         * 发命令前清零。但读路径走 ADMA2 时 beginDmaRead() 已经写好了描述符
+         * 地址，这里再清就等于让控制器去读 NULL 描述符 —— v20 的黑屏就是这个。
+         * 用 fDmaArmed 区分：武装过 DMA 就先不碰。 */
+        if (!fDmaArmed) {
+            sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, 0);
+        }
         IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u pre state=%08x adma=%08x\n",
                index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
@@ -1082,6 +1089,7 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
     fDmaData->prepare (kIODirectionIn);
 
     sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDescPhys & 0xFFFFFFFFu));
+    fDmaArmed = true;
     IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed bytes=%u desc0=%08x %08x %08x adma=%08x\n",
            bytes, desc[0], desc[1], desc[2], sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
     return true;
@@ -1103,6 +1111,7 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
     IOLog ("NativeSdhci[" kSdhciTag "]: dma: done ok=%u state=%08x nis=%08x eis=%04x adma=%08x err=%08x/%08x\n",
            ok ? 1 : 0, state, nis, eis, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), ea0, ea1);
     /* 前四个字 + EXT_CSD[212] 所在的第 53 个字（SEC_COUNT），一眼看出数据是不是真的 */
+    fDmaArmed = false;
     IOLog ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x\n",
            data[0], data[1], data[2], data[3], data[52], data[53], data[126], data[127]);
 

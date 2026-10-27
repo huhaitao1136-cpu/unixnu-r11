@@ -4113,3 +4113,61 @@ PAN / CPU 校验 / 输出开关 / serial_init / cons_ops_index 那些按指令�
   上下文断言**定位，断言不过就跳过，绝不盲改；
 * 补丁脚本必须打印"改之前是什么、改完是什么、这个地址属于哪个符号"，出问题
   第一眼就能看出来。
+
+## 3.68 v20 黑屏的真凶：sendCommand() 把 ADMA 描述符地址清零了（2026-10-27，v21）
+
+补丁修好之后内核终于跑到了驱动，v20 的日志是：
+
+```
+NativeSdhci[v20]: dma: desc va=0xfffffff7a5a01d000 phys=afdb2000 len=4096 / data va=0xfffffff7a5065000 phys=aff42000 …
+NativeSdhci[v20]: cardInit: CMD0 / CMD1 (op cond) / OCR=c0ff8000 / CMD2 / CMD3 / CMD9 / CMD7 / CMD16
+NativeSdhci[v20]: start: card init done
+NativeSdhci[v20]: start: probing media at 400 kHz
+NativeSdhci[v20]: CMD8 setup blksz=0200 cnt=0001 mode=0013 word28=0000ff18 attempt=0
+NativeSdhci[v20]: dma: armed bytes=512 desc0=02000027 aff42000 00000000 adma=afdb2000
+NativeSdhci[v20]: cmd8 pre state=01f000f0 adma=00000000     <-- 描述符地址被抹掉了
+（之后黑屏）
+```
+
+`dma: armed` 里 `adma=afdb2000` 是我们写进去的描述符物理地址，
+下一行 `cmd8 pre … adma=00000000` 说明它被清掉了。元凶是 v17 加的这条：
+
+```c
+if (isData) {
+    /* v17：MSM 的 SDMA/ADMA 地址寄存器在 ABL 之后是野值，保险起见清零 */
+    sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, 0);
+    …
+}
+```
+
+那是 PIO 时代为了防野指针写的。v20 起读路径改走 ADMA2，`beginDmaRead()`
+已经把描述符地址写进 `0x58`，`sendCommand()` 再清零 → 控制器拿 NULL 描述符去
+搬数据 → 数据阶段直接挂死，屏幕黑掉。
+
+### 3.68.1 v21 改动
+
+* 新增成员 `bool fDmaArmed = false;`（`beginDmaRead()` 置位、`endDmaRead()` 清位）；
+* `sendCommand()` 里改成：
+
+  ```c
+  if (!fDmaArmed) {
+      sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, 0);
+  }
+  ```
+
+  即"PIO 路径照旧清零，DMA 路径不许碰"；
+* `kSdhciTag` = `v21`。
+
+### 3.68.2 这轮的收获（进度盘点）
+
+| 里程碑 | 状态 |
+|---|---|
+| GCC 时钟（`sdcc1_apps_clk_src` M/N/D + 分支） | ✅ v9 起稳定 |
+| 控制器探活（`ver=02 caps=742dc8b2`） | ✅ v5 起稳定 |
+| CMD0 / CMD1（`OCR=c0ff8000`）/ CMD2 / CMD3 / CMD9 / CMD7 / CMD16 | ✅ v14 起稳定 |
+| 400 kHz 识别时钟（GCC 1/48） | ✅ v9 起稳定 |
+| 数据阶段（EXT_CSD / LBA0） | 🚧 v20 首次用 ADMA2 真武装，被 sendCommand 清零打断 → v21 修 |
+| 块设备注册 / IOMedia | ⬜ 需 15 个 `IOStorageFamily` 符号的 `.set` 绑定 |
+| APFS 根卷 / 真 launchd | ⬜ |
+
+也就是说：**eMMC 卡识别这条路已经全通了**，只剩"把 512 字节数据搬进内存"这一步。
