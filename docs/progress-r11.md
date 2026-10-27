@@ -2943,3 +2943,80 @@ v3/v4 的 `sdhciRead32`/`sdhciWrite32` 对全部偏移一视同仁，于是：
 | `bus: hostctl=… power=…` | 总线配置通了 | 看 `cardInit: CMD0/CMD1(OCR=…)` |
 | `cardInit: OCR=…` / `CMD3 (rca=1)` | 卡识别成功 | 看 `EXT_CSD … SEC_COUNT` |
 | `GPT ok …` / `GPT[1] …` | **链路完全打通** | 进 Step 4：块设备注册 + IOMedia |
+
+## 3.51 NativeSdhci v6：8 位访问也会挂死总线 —— 全部改 32 位读-改-写（2026-10-27）
+
+### 3.51.1 真机 v5 结果（决定性一步）
+
+v5（寄存器位宽修正）刷机后，屏幕日志第一次读出了控制器身份：
+
+```
+NativeSdhci[v5]: start: probing SDCC @0x24 (32-bit, aligned)
+NativeSdhci[v5]: state=01f800f0
+NativeSdhci[v5]: start: probing SDCC @0xFE (16-bit)
+NativeSdhci[v5]: ver=02 caps=742dc8b2 caps1=0000000f
+```
+
+- `ver=02` → SD Host Controller Spec 3.0，控制器活着；
+- `state=01f800f0` → `CARD_INSERTED` + `CMD/DAT line` 状态都在（eMMC 焊在板上）；
+- `caps` 里的 base clock / 8-bit 支持位都在；
+- 关键对照：**32 位对齐读（0x24）与 16 位读（0xFE）都通**，v3/v4 的"整机静默"确实就是 `0xFE` 的错位 32 位读。
+
+但 `ver=` 之后**再无一条 `NativeSdhci` 日志**，而启动线程没有停：后面照样出现
+`dlil_init: All the created dill kernel threads…`、`Skylwalk: …`、`bsd_autoconf: calling kminit`，
+最终停在 `Waiting on <dict ... IOMedia ... {本轮 seed UUID}>`。
+
+也就是说 `NativeSdhci::start()` 在 `ver=` 之后卡死（不是 panic，不是失败返回 ——
+`fail:` 只 `return false` 不打日志，但那样内核会继续往下走而我们看到了 IOMedia 等待，
+说明 start 是在某个访问上永久停住）。
+
+### 3.51.2 定位：`ver=` 之后的第一件事是 8 位写
+
+`ver=` 到 `start: reset done` 之间只有一次 `softReset(SDHCI_RESET_ALL, kSdhciCmdLoops)`：
+
+```c
+sdhciWrite8 (fCore, SDHCI_SOFTWARE_RESET, which);   /* 0x2F，8 位 */
+for (i < 200000) {
+    if ((sdhciRead8 (fCore, SDHCI_SOFTWARE_RESET) & which) == 0) return true;
+    IODelay (10);
+}
+```
+
+`kSdhciCmdLoops = 200000`，每轮 `IODelay(10)` → 2 s 后必然打 `reset timed out`。
+日志里没有这句，所以卡在**写 0x2F 或第一次读 0x2F**。
+
+结论：**SDCC 的 AHB 从口对 8 位访问同样不应答**（32 位对齐、16 位都通，唯 8 位不通）。
+原因在 SoC 侧：SDCC 的 register block 是按 32 位字组织的，只有特定偏移（0xFE、0x0E、0x2C…）
+在硬件里真的接出了 16 位通道；纯 8 位事务没有对应的 AHB 子节拍，事务不完成 → CPU 停在 `ldr/strb`。
+
+### 3.51.3 v6 做法：不再有任何 8 位访问
+
+8 位寄存器全部落在两个 4 字节对齐的字里，改用整字读-改-写：
+
+| 字地址 | 字节 0 | 字节 1 | 字节 2 | 字节 3 |
+|---|---|---|---|---|
+| `0x28` | `HOST_CONTROL` (8b) | `POWER_CONTROL` (8b) | `BLOCK_GAP` (8b) | `WAKE_UP` (8b) |
+| `0x2C` | `CLOCK_CONTROL` (16b, 占 0x2C..0x2D) | `TIMEOUT_CONTROL` (8b, 0x2E) | `SOFTWARE_RESET` (8b, 0x2F) | — |
+
+改动清单（`drivers/NativeSdhci/NativeSdhci.cpp`，`kSdhciTag` = `v6`）：
+
+1. **删除** `sdhciRead8` / `sdhciWrite8`（函数整体移除，防止以后又被用上）。
+2. 新增 `sdhciReadHostWord()` / `sdhciReadClockWord()` / `sdhciWriteClockWord()`。
+3. `softReset()`：读 0x2C 字 → 把 `which` 写进 bits[31:24] → 轮询 `(word >> 24) & which == 0`；
+   日志 `reset: assert=%02x word %08x -> %08x` / `reset: cleared after N polls` / `reset: never cleared`。
+4. `setBusPowerAndClock()`：`HOST_CONTROL` + `POWER_CONTROL` 一次 32 位写（`word = (old & 0xFFFF0000) | (POWER<<8) | hostCtrl`）；
+   `TIMEOUT_CONTROL` 走 0x2C 字的 bits[23:16]；`HOST_CONTROL2` 仍是 16 位（0x3E，已验证通路）。
+5. `setSdclkDivider()`：只改 0x2C 字低 16 位，`sdhciWaitClock()` 轮询 `CLOCK_CONTROL` 稳定位。
+6. `start()` 在 `ver=` 之后插入 **IODelay 隔离探针**：`delay probe: begin` → `IODelay(100)` → `delay probe: done`。
+   之前的 `IODelay` 大概率一次都没真正执行过（轮询首轮就命中），所以必须单独验证这个 API。
+
+### 3.51.4 下一刷的判读表
+
+| 屏幕最后一行 | 结论 | 下一步 |
+|---|---|---|
+| `delay probe: begin` 之后断 | `IODelay` 在本平台不可用 | 换成自旋等待（读 CNTPCT_EL0） |
+| `reset: assert=01 word ...` 之后断 | 32 位写 0x2C 也不通 | 查 SDCC 复位源/电源域，而不是总线宽度 |
+| `reset: never cleared` | 复位位不自动清零 | 软复位被 SoC 侧保持，需要 CRG/复位控制器 |
+| `bus: hostctl2=...` | 复位通过 | 看 `clock: div=24` 是否稳定 |
+| `cardInit: OCR=...` | CMD 线通 | 等 CMD2/CMD3/CMD9 全过 → `EXT_CSD ... SEC_COUNT` |
+| `GPT ok ... GPT[1] ...` | 全链路通 | 进入 Step 4：块设备注册（15 个 IOStorageFamily 符号的 `.set` 绑定） |

@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v5"
+#define kSdhciTag         "v6"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -116,8 +116,12 @@ volatile uint32_t native_sdhci_gcc_cfg     = 0;
  *          0x3E HOST_CONTROL2、**0xFE HOST_VERSION（在 4 字节边界上错位 2 字节）**
  *    8 位：0x28 HOST_CONTROL、0x29 POWER_CONTROL、0x2A BLOCK_GAP、0x2B WAKE_UP、
  *          0x2E TIMEOUT_CONTROL、0x2F SOFTWARE_RESET
- * v3/v4 全程用 32 位读写，于是第一条 SDCC 访问就是 0xFE 的错位 32 位读 —— AHB 从口
- * 对错位访问不应答，整机永久挂死（连 panic 都打不出来，正是实测现象）。
+ * v3/v4 全程用 32 位读写，第一条 SDCC 访问就是 0xFE 的错位 32 位读，AHB 从口不应答，
+ * 整条总线永久挂死（连 panic 都打不出来）。v5 改成正确位宽后 ver/caps 读出来了，
+ * 但**8 位访问（0x2F SOFTWARE_RESET）又把总线挂死**，所以 v6 起：
+ *   - 16 位寄存器用 16 位访问（0xFE / 0x0E 已验证可用）；
+ *   - 8 位寄存器一律不单独访问，凡是落在 4 字节对齐字里的（0x28..0x2B、0x2C..0x2F）
+ *     都用一次对齐的 32 位读-改-写完成。
  */
 static inline uint32_t sdhciRead32 (uintptr_t base, uint32_t off)
 {
@@ -127,11 +131,6 @@ static inline uint32_t sdhciRead32 (uintptr_t base, uint32_t off)
 static inline uint16_t sdhciRead16 (uintptr_t base, uint32_t off)
 {
     return *reinterpret_cast<volatile uint16_t *> (base + off);
-}
-
-static inline uint8_t sdhciRead8 (uintptr_t base, uint32_t off)
-{
-    return *reinterpret_cast<volatile uint8_t *> (base + off);
 }
 
 static inline void sdhciWrite32 (uintptr_t base, uint32_t off, uint32_t value)
@@ -149,10 +148,21 @@ static inline void sdhciWrite16 (uintptr_t base, uint32_t off, uint16_t value)
     (void) sdhciRead16 (base, off);
 }
 
-static inline void sdhciWrite8 (uintptr_t base, uint32_t off, uint8_t value)
+/* 0x28..0x2B：HOST_CONTROL(8b) + POWER_CONTROL(8b) + BLOCK_GAP(8b) + WAKE_UP(8b) */
+static inline uint32_t sdhciReadHostWord (uintptr_t base)
 {
-    *reinterpret_cast<volatile uint8_t *> (base + off) = value;
-    (void) sdhciRead8 (base, off);
+    return sdhciRead32 (base, SDHCI_HOST_CONTROL);
+}
+
+/* 0x2C..0x2F：CLOCK_CONTROL(16b) + TIMEOUT_CONTROL(8b) + SOFTWARE_RESET(8b) */
+static inline uint32_t sdhciReadClockWord (uintptr_t base)
+{
+    return sdhciRead32 (base, SDHCI_CLOCK_CONTROL);
+}
+
+static inline void sdhciWriteClockWord (uintptr_t base, uint32_t word)
+{
+    sdhciWrite32 (base, SDHCI_CLOCK_CONTROL, word);
 }
 
 static uintptr_t sdhciMapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
@@ -177,11 +187,11 @@ static bool sdhciWaitSet (uintptr_t base, uint32_t off, uint32_t mask, uint32_t 
     return false;
 }
 
-/* 16 位版本：CLOCK_CONTROL(0x2C) 是 16 位寄存器，不能拿 32 位去轮询 */
-static bool sdhciWaitSet16 (uintptr_t base, uint32_t off, uint16_t mask, uint32_t loops)
+/* 轮询 0x2C 那个 32 位字的低 16 位（CLOCK_CONTROL），不动 TIMEOUT/RESET 字节 */
+static bool sdhciWaitClock (uintptr_t base, uint16_t mask, uint32_t loops)
 {
     for (uint32_t i = 0; i < loops; i++) {
-        if ((sdhciRead16 (base, off) & mask) == mask) {
+        if ((sdhciReadClockWord (base) & mask) == mask) {
             return true;
         }
         IODelay (1);
@@ -469,13 +479,22 @@ bool NativeSdhci::enableGccClocks ()
 
 bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
 {
-    sdhciWrite8 (fCore, SDHCI_SOFTWARE_RESET, (uint8_t) which);
+    /* SOFTWARE_RESET 是 0x2F 的 8 位寄存器，落在 0x2C 这个 32 位字的最高字节里。
+     * 8 位访问在 SDCC 上会把 AHB 挂死（v5 实测），所以整字读写。 */
+    uint32_t before = sdhciReadClockWord (fCore);
+    sdhciWriteClockWord (fCore, (before & 0x00FFFFFFu) | (((uint32_t) which) << 24));
+    IOLog ("NativeSdhci[" kSdhciTag "]: reset: assert=%02x word %08x -> %08x\n",
+           which, before, sdhciReadClockWord (fCore));
+
     for (uint32_t i = 0; i < loops; i++) {
-        if ((sdhciRead8 (fCore, SDHCI_SOFTWARE_RESET) & which) == 0) {
+        if (((sdhciReadClockWord (fCore) >> 24) & which) == 0) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: reset: cleared after %u polls, word=%08x\n",
+                   i, sdhciReadClockWord (fCore));
             return true;
         }
         IODelay (10);
     }
+    IOLog ("NativeSdhci[" kSdhciTag "]: reset: never cleared, word=%08x\n", sdhciReadClockWord (fCore));
     return false;
 }
 
@@ -492,22 +511,25 @@ bool NativeSdhci::setBusPowerAndClock ()
      * 之后才能用。所以识别阶段保持 1-bit，等 cardInit 成功再切（TODO）。
      * HOST_CONTROL2 的 1.8V Signaling Enable 是 SD 卡 UHS 用的，eMMC 不应置位。
      */
-    uint16_t hostCtrl = (uint16_t) sdhciRead8 (fCore, SDHCI_HOST_CONTROL);
-    hostCtrl &= (uint16_t) ~(SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);
+    uint32_t hostWord = sdhciReadHostWord (fCore);
+    uint32_t hostCtrl = hostWord & 0xFFu;
+    hostCtrl &= ~(uint32_t) (SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);
 
     uint16_t hostCtrl2 = sdhciRead16 (fCore, SDHCI_HOST_CONTROL2);
     hostCtrl2 &= (uint16_t) ~(SDHCI_CTRL_VDD_180 | SDHCI_CTRL_UHS_MASK);
     sdhciWrite16 (fCore, SDHCI_HOST_CONTROL2, hostCtrl2);
-    sdhciWrite8 (fCore, SDHCI_HOST_CONTROL, (uint8_t) hostCtrl);
 
-    /* 打开 SD 总线电源（R11 上 VCC/VCCQ 常开，这一步只是让控制器开始驱动时钟） */
-    sdhciWrite8 (fCore, SDHCI_POWER_CONTROL, (uint8_t) (SDHCI_POWER_ON | SDHCI_POWER_330));
+    /* HOST_CONTROL(0x28) 和 POWER_CONTROL(0x29) 都在 0x28 这个字里，一次 32 位写搞定：
+     * 低字节 = HOST_CONTROL，次字节 = POWER_CONTROL(BUS_POWER_ON|3.3V)。
+     * R11 上 VCC/VCCQ 常开，这一步只是让控制器开始驱动时钟。 */
+    hostWord = (hostWord & 0xFFFF0000u) | ((uint32_t) (SDHCI_POWER_ON | SDHCI_POWER_330) << 8) | hostCtrl;
+    sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
     IODelay (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%02x hostctl2=%04x power=%02x (1-bit, 3.3V)\n",
-           hostCtrl, hostCtrl2, sdhciRead8 (fCore, SDHCI_POWER_CONTROL));
+    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl2=%04x word28=%08x (1-bit, 3.3V)\n",
+           hostCtrl2, sdhciReadHostWord (fCore));
 
-    /* 超时计数器取最大 */
-    sdhciWrite8 (fCore, SDHCI_TIMEOUT_CONTROL, 0x0E);
+    /* 超时计数器取最大（0x2E，在 0x2C 字的次高字节） */
+    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & ~0x00FF0000u) | (0x0Eu << 16));
 
     /* 识别阶段 400 kHz：SDCLK = base / (2 * div)，base 由 enableGccClocks() 定成 19.2 MHz
      * → div = 19200000 / (2 * 400000) = 24 */
@@ -524,23 +546,23 @@ bool NativeSdhci::setSdclkDivider (uint32_t div)
     if (div > 0xff) {
         div = 0xff;
     }
-    /* 先停卡时钟再改分频，避免毛刺 */
-    sdhciWrite16 (fCore, SDHCI_CLOCK_CONTROL, 0);
+    /* 先停卡时钟再改分频，避免毛刺（只改低 16 位，保留 TIMEOUT/RESET 字节） */
+    sdhciWriteClockWord (fCore, sdhciReadClockWord (fCore) & 0xFFFF0000u);
     IODelay (100);
 
     uint16_t clk = (uint16_t) (SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8));
-    sdhciWrite16 (fCore, SDHCI_CLOCK_CONTROL, clk);
-    if (!sdhciWaitSet16 (fCore, SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u clk=%04x)\n",
-               div, sdhciRead16 (fCore, SDHCI_CLOCK_CONTROL));
+    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0xFFFF0000u) | clk);
+    if (!sdhciWaitClock (fCore, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u word=%08x)\n",
+               div, sdhciReadClockWord (fCore));
         return false;
     }
     clk = (uint16_t) (clk | SDHCI_CLOCK_CARD_EN);
-    sdhciWrite16 (fCore, SDHCI_CLOCK_CONTROL, clk);
+    sdhciWriteClockWord (fCore, (sdhciReadClockWord (fCore) & 0xFFFF0000u) | clk);
     IODelay (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) ctrl=%04x stable\n", div,
+    IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) word=%08x stable\n", div,
            (unsigned) (R11_SDCLK_BASE_HZ / (2 * div * 1000)),
-           sdhciRead16 (fCore, SDHCI_CLOCK_CONTROL));
+           sdhciReadClockWord (fCore));
     return true;
 }
 
@@ -989,6 +1011,14 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
 
+    /* IODelay 隔离探针：在此之前的 IODelay 大概率一次都没真正执行过（轮询首轮就命中），
+     * 所以"卡在 ver= 之后"既可能是 8 位寄存器访问，也可能是 IODelay 本身。
+     * 这一对日志能直接分开这两种可能。 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin\n");
+    IODelay (100);
+    IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done\n");
+
+    IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (0x2C word)\n");
     if (!softReset (SDHCI_RESET_ALL, kSdhciCmdLoops)) {
         IOLog ("NativeSdhci[" kSdhciTag "]: reset timed out\n");
         goto fail;
