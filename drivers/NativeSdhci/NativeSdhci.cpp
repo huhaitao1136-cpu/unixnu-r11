@@ -46,14 +46,14 @@
 
 #define kSdhciBlockSize   512ULL
 #define kSdhciCmdLoops    200000U     /* 轮询上限（200000 轮 × 1 us = 200 ms） */
-#define kSdhciDataLoops   4000000U    /* 数据阶段上限（约 4 s） */
+#define kSdhciDataLoops   400000U     /* 数据阶段上限（约 0.4 s；4 s 太长，屏幕上看不到超时行就以为卡死了） */
 
 /* bring-up 版本标记：每改一次驱动就 +1
  * v3 = 逐步日志 + GCC 时钟状态回读
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v15"
+#define kSdhciTag         "v16"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -895,6 +895,12 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
                 return false;
             }
             words[i] = sdhciRead32 (fCore, SDHCI_BUFFER);
+            /* 取几个采样点，看清 FIFO 是"一次给满"还是"慢慢滴出来" */
+            if (i == 0 || i == 32 || i == 64 || i == 96 || (i + 1) == count) {
+                IOLog ("NativeSdhci[" kSdhciTag "]: pio word %u state=%08x nis=%08x\n",
+                       i, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                       sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
+            }
         }
         /* 读满之后立刻把现场打出来：DATA_END 有没有来、FIFO 是不是还有数据。
          * 若 BUFFER_READ_ENABLE(bit11) 仍为 1，说明控制器认为数据还没取完
@@ -998,10 +1004,19 @@ bool NativeSdhci::readExtCsd ()
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                           nullptr)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
-        } else if (pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
-            ok = true;
         } else {
-            IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD transfer failed (attempt %u)\n", attempt);
+            /* 命令阶段成功的证据：DAT_LINE_ACTIVE 应该已起、ADMA_ADDRESS 应该是 0
+             * （清掉 DMA Select 之后硬件不该再去碰它）。 */
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 ok state=%08x nis=%08x eis=%08x adma=%08x\n",
+                   sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                   sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
+                   sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS),
+                   sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
+            if (pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
+                ok = true;
+            } else {
+                IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD transfer failed (attempt %u)\n", attempt);
+            }
         }
 
         if (!ok) {

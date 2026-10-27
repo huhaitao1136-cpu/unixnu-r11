@@ -3676,3 +3676,48 @@ R2 的根因（`SDHCI_CMD_INDEX` 用在 136 位响应上）确认。
 | `pio read 128 words state=…` 里 bit11 变成 0 且随后成功 | DMA Select 就是根因 |
 | `data timeout` 仍出现、`pio read ... state` 的 bit11 仍为 1 | 传输量确实不符：查 BLOCK_SIZE 回读值与 `blkcnt` |
 | `pio read starved at word N` | FIFO 供数中断：查 DAT0 线/时钟占空比/`TIMEOUT_CONTROL` |
+
+## 3.61 NativeSdhci v15 真机结果：DMA Select 已清、命令阶段通过，数据阶段依旧没有 DATA_END（2026-10-27）
+
+### 3.61.1 屏幕日志（v15）
+
+```
+cardInit: CMD2 (cid)
+cardInit: CMD3 (rca=1), cid0=00150100
+cardInit: CMD9 (csd)
+cardInit: CMD7 (select)
+cardInit: CMD16 (blklen 512)
+start: card init done
+start: probing media at 400 kHz
+bus: hostctl2=0000 word28=0000ff00 (1-bit, 3.3V)     <- 低字节 0x18 已清成 0x00
+CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff00 attempt=0
+                                                      <- 之后屏幕停在光标，无后续行
+```
+
+### 3.61.2 已确认
+
+1. **DMA Select 清零生效**：`word28` 从 `0000ff18` 变成 `0000ff00`。
+2. `blksz=0200`、`cnt=0001`、`mode=0012`（READ|BLK_CNT_EN）三个寄存器回读值都正确。
+3. CMD8 之后的 `CMD8 ok state=…` 行没有出现 —— 说明卡在 `sendCommand(CMD8)` 里，
+   即**命令阶段**（`CMD_INHIBIT` 等待或 `waitCommandComplete`）而不是数据阶段。
+
+### 3.61.3 v16 改动
+
+1. `kSdhciDataLoops` 4000000 → **400000**（4 s → 0.4 s）：4 秒太长，屏幕上看不到
+   超时行就以为卡死了。
+2. `readExtCsd()` 在 `sendCommand` 成功后立刻打
+   `CMD8 ok state=%08x nis=%08x eis=%08x adma=%08x` —— 把"命令阶段结束"与
+   "数据阶段开始"这两件事在日志上彻底分开，并顺带确认 ADMA_ADDRESS 为 0。
+3. `pioTransfer()` 在读 128 个字的过程中按 `word 0 / 32 / 64 / 96 / 127` 采样打印
+   `state`/`nis`，看清 FIFO 是"一次给满"还是"逐字滴出"。
+4. `kSdhciTag` = `v16`。
+
+### 3.61.4 下一刷的判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `CMD8 ok state=…` 出现在 `CMD8 setup` 之后 | 命令阶段通过，问题在数据阶段 |
+| `CMD8 setup` 之后直接 `CMD8 (SEND_EXT_CSD) failed` | 命令阶段超时：查 CMD 线/`CMD_INHIBIT` |
+| `pio word 0 state=…` 后 `pio read starved at word 1` | 只有 1 个字出来：DAT0 上有数据但没持续 |
+| `pio read 128 words state=…` 且 bit11 为 0 | 数据搬完了，接下来只差 DATA_END |
+| `EXT_CSD rev=8 SEC_COUNT=…` | 数据阶段通了 |
