@@ -3341,3 +3341,61 @@ else if ((io_level & REQ_IO_LOW) || (caps_0 & CORE_1_8V_SUPPORT))
 | `cardInit: OCR=…` | **CMD1 通了** |
 | `CMD1 failed (n) … err=0001` 三次 | 卡确实没在 CMD 线上应答 → 下一步查供电/引脚/时钟是否真的到卡 |
 | `CMD1 failed … err=0004` | CRC/索引错 → 响应有了，参数或标志要修 |
+
+## 3.56 NativeSdhci v10 真机结果：vendor 侧改对了，但 16 位状态读自相矛盾 → v11（2026-10-27）
+
+### 3.56.1 v10 屏幕日志
+
+```
+NativeSdhci[v10]: vendor: mci=1000006b (core 1.6b) vs0=00240a0e caps0=742dc8b2 vs3=02626440 mstat=00007600
+NativeSdhci[v10]: vendor: io18=1 mclk_sel=2 select_in=0 vs0=00018a0e vs3=02626440
+NativeSdhci[v10]: reset: assert=06 word 000f0007 -> 000f0007
+NativeSdhci[v10]: bus: hostctl2=0000 word28=0000ff18 (1-bit, 3.3V)
+NativeSdhci[v10]: gcc: m/n/hid=1/48/0 -> 400000 Hz (cfg=00002000 m=00000001 n=000000d0 d=000000cf)
+NativeSdhci[v10]: cardInit: CMD0
+NativeSdhci[v10]: cardInit: CMD1 (op cond)
+NativeSdhci[v10]: cmd error int=8001 err=0000
+NativeSdhci[v10]: CMD1 failed (1) state=01f800f0 norm=0001 err=0000 mstat=00007600
+NativeSdhci[v10]: cmd error int=8001 err=0000
+NativeSdhci[v10]: CMD1 failed (2) state=01f800f0 norm=0001 err=0000 mstat=00007600
+NativeSdhci[v10]: cmd error int=8000 err=0001
+NativeSdhci[v10]: CMD1 failed (3) state=01f800f0 norm=0000 err=0001 mstat=00007600
+NativeSdhci[v10]: card init failed at step 2 (state=01f800f0 err=0000)
+```
+
+### 3.56.2 读法
+
+- `vendor: mci=…` 说明 vendor 窗口（`0x20c` / `0x21c` / `0x250` / `0x318` / `0x324`）
+  **读得到** —— "`memCount=0` 所以用物理常量映射"这条路没问题。
+- `io18=1 mclk_sel=2 select_in=0`、`vs0` 从 `0x00240a0e` 变成 `0x00018a0e`：
+  **HS400 的时钟路径已经拨回默认模式，IO pad 也切到 1.8V 了**，v10 的目的达到了。
+- 但 CMD1 依旧不成功，而且方式变了：
+  - 第 1、2 次：`int=8001 err=0000` —— NIS 同时有 **Command Complete(bit0) + Error(bit15)**，
+    可 EIS（Error Interrupt Status）读出来是 **0**。这在 SDHCI 里是自相矛盾的：
+    bit15 是"任一错误位被置位"的汇总，EIS 不可能为空。
+  - 第 3 次：`err=0001` —— 这才是真正的 **Command Timeout**。
+  - `mstat=00007600` 三次完全一致，`state=01f800f0` 里 CMD/DATA INHIBIT 都是 0。
+- 结论：**16 位访问 `0x30`/`0x32` 这颗控制器上不可靠**（v9 之前已经吃过一次
+  "8 位访问把 AHB 挂死"的教训，这次是"16 位读状态读到假值"）。
+  必须按 §3.50 定下的规矩：**落在同一个 4 字节对齐字里的多个寄存器，用一次 32 位读写**。
+  `0x30`(NIS) 与 `0x32`(EIS) 正好是同一个字，低 16 位 NIS、高 16 位 EIS。
+
+### 3.56.3 v11 改动（commit e736a8a）
+
+1. `waitCommandComplete()` 改成一次 `sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS)`，
+   拆成 `nis = word & 0xFFFF`、`eis = word >> 16`，日志改成
+   `cmd error word=%08x nis=%04x eis=%04x`。
+2. **`eis == 0` 时不再判失败**：汇总位亮而没有具体错误源，按"命令已完成"处理，
+   让后续读 RESPONSE / 数据阶段去暴露真实问题（真错的命令在 CMD2/CMD3 会立刻崩）。
+3. CMD1 轮询里加 `cardInit: CMD1 resp[%u]=%08x state=%08x`（前 3 次 + 每 100 次一次），
+   这样下一张屏幕照片能直接看到 **OCR 到底是不是 0**。
+
+### 3.56.4 下一刷的判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `cmd error word=00010001 nis=0001 eis=0001` | 真正的错误，按 bit 查（bit0=Command Timeout） |
+| `cardInit: CMD1 resp[0]=40ff8000`（bit31=0） | **卡应答了！** 只是还在 busy，继续轮询即可 |
+| `cardInit: CMD1 resp[0]=c0ff8080` 之类（bit31=1） | 卡就绪，直接进 CMD2 |
+| `cardInit: CMD1 resp[0]=00000000` / `ffffffff` | 卡确实没应答 → 转查供电（PMIC vreg）/引脚复用/时钟到卡 |
+| `cardInit: OCR=…` 后跟 `CMD2 (cid)` 失败 | 回 CMD 线时序/CRC 标志 |
