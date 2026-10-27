@@ -2884,3 +2884,62 @@ NativeSdhci[v3]: gcc: rcg cfg=0x00000000 m/n/d=0x0000050f/0x00000001/0x000000fe
 | `ver=… caps=…` 出现 | **总线终于通了**，进入 SDHCI 协议层 |
 | `internal clock never stabilised` | SDCLK 没起来（分频/供电） |
 | `cardInit: OCR=…` | 卡识别成功，后面看 EXT_CSD/GPT |
+
+## 3.50 NativeSdhci v5：寄存器位宽错了 —— 0xFE 的错位 32 位读就是"整机静默"的根因（2026-10-27）
+
+v4 已经把 GCC 的 `sdcc1_apps_clk_src` 根时钟（`CMD_ROOT_EN`）和 ahb/apps 两个分支
+全部打开，实测日志也确认 `cmd=00000002`（`ROOT_OFF` 已清）、分支 `CLK_OFF=0`，
+但**第一条 SDCC 寄存器访问依然把整机挂死**（`start: reading version/caps` 之后无声无息）。
+这否定了"时钟没开"这条假设，把矛头指向访问方式本身。
+
+### 3.50.1 根因：全程用 32 位访问 8/16 位寄存器
+
+`SdhciRegs.h` 里的偏移都是**字节偏移**，但 SDHCI 规范里这些寄存器位宽不同：
+
+| 位宽 | 偏移 |
+| --- | --- |
+| 32 位 | `0x00` ARGUMENT、`0x10..0x1C` RESPONSE、`0x20` BUFFER、`0x24` PRESENT_STATE、`0x40` CAPABILITIES、`0x44` CAPABILITIES_1、`0x48` MAX_CURRENT、`0x58` ADMA_ADDRESS、`0xFC` SLOT_INT_STATUS |
+| 16 位 | `0x04` BLOCK_SIZE、`0x06` BLOCK_COUNT、`0x0C` TRANSFER_MODE、`0x0E` COMMAND、`0x2C` CLOCK_CONTROL、`0x30..0x36` 中断状态/使能、`0x3C` AUTO_CMD_STATUS、`0x3E` HOST_CONTROL2、`0xFE` HOST_VERSION |
+| 8 位 | `0x28` HOST_CONTROL、`0x29` POWER_CONTROL、`0x2A` BLOCK_GAP、`0x2B` WAKE_UP、`0x2E` TIMEOUT_CONTROL、`0x2F` SOFTWARE_RESET |
+
+v3/v4 的 `sdhciRead32`/`sdhciWrite32` 对全部偏移一视同仁，于是：
+
+1. **第一枪就打偏**：`sdhciRead32 (fCore, SDHCI_HOST_VERSION)` 是对 `0xFE` 的 32 位读 ——
+   `0xFE % 4 == 2`，这是一次**错位**访问。Snapdragon 的 SDCC AHB 从口不做错位访问的
+   拆分，事务永远不完成，CPU 停在那条 `ldr` 上，连 data abort 都不产生 → **整机静默**。
+   这就解释了为什么 `MACH Reboot`/panic 一条都没有。
+2. 即使读通了，后面每一步也是错的：写 `0x04` 会连带写掉 `BLOCK_COUNT`、写 `0x0C` 会
+   连带写掉 `COMMAND`、写 `0x2C` 会连带写掉 `TIMEOUT_CONTROL`/`SOFTWARE_RESET`、
+   写 `0x28` 会连带写掉 `POWER_CONTROL`/`BLOCK_GAP`/`WAKE_UP`。
+
+### 3.50.2 v5 的改动（`drivers/NativeSdhci/`）
+
+- `NativeSdhci.cpp` 新增 `sdhciRead16`/`sdhciRead8`/`sdhciWrite16`/`sdhciWrite8`；
+  写后回读改成**同一偏移、同一宽度**（`BUFFER` 例外，FIFO 回读会吃掉数据字）。
+- `sdhciWaitSet16`：`CLOCK_CONTROL` 是 16 位寄存器，不能拿 32 位轮询。
+- 逐点修正：`softReset`（0x2F，8 位）、`setBusPowerAndClock`（0x28/0x3E/0x2E/0x29）、
+  `setSdclkDivider`（0x2C）、`waitCommandComplete`/`waitTransferComplete`（0x30/0x32）、
+  `sendCommand`（0x0E，以及把 `0xFFFFFFFF` 改成 `0xFFFF`）、`readExtCsd`/`readBlocks`/
+  `writeBlocks`（0x04/0x06/0x0C）、`start` 的 version 读（0xFE，16 位）。
+- `start()` 的探活顺序改成"先对齐、后错位"：先打 `start: probing SDCC @0x24 (32-bit, aligned)`
+  读 `PRESENT_STATE`，再打 `start: probing SDCC @0xFE (16-bit)` 读 `HOST_VERSION`，
+  这样万一下一版还挂，从最后一行日志就能判断是"整块无响应"还是"只是 0xFE 那条不行"。
+- **总线宽度改回 1-bit**：eMMC 上电默认 1-bit，DAT1..DAT7 要等 CMD6 的
+  `EXT_CSD[183] BUS_WIDTH=2` 才可用。v4 在识别前就把 host 设成 8-bit，即使寄存器读通，
+  CMD8(SEND_EXT_CSD) 的数据也会因为卡只驱动 DAT0 而 CRC 错。
+- **`HOST_CONTROL2` 的 1.8V Signaling Enable 不再置位**：那是 SD 卡 UHS 用的位，eMMC 不用。
+- 新增 `POWER_CONTROL` 写 `SDHCI_POWER_ON | SDHCI_POWER_330`（`SdhciRegs.h` 里补了
+  `SDHCI_POWER_ON`/`SDHCI_POWER_330`/`SDHCI_POWER_300`/`SDHCI_POWER_180`），
+  并回读打印，确认控制器开始驱动时钟。
+- `#define kSdhciTag "v5"`，所有日志前缀跟着变成 `NativeSdhci[v5]:`。
+
+### 3.50.3 下一版判读表
+
+| 屏幕上最后一行 | 结论 | 下一步 |
+| --- | --- | --- |
+| `start: probing SDCC @0x24 (32-bit, aligned)` | 整块无响应（不是位宽问题） | 查 SDCC 复位/电源域，或从 UEFI 阶段先摸一次寄存器 |
+| `state=…` 但停在 `probing SDCC @0xFE` | 0xFE 那条还是不行 | 拆成两次 16 位半字读 / 改从 `fVendor` 窗口读 |
+| `ver=… caps=…` | 控制器活了 | 看 `reset done`/`clock: … stable` |
+| `bus: hostctl=… power=…` | 总线配置通了 | 看 `cardInit: CMD0/CMD1(OCR=…)` |
+| `cardInit: OCR=…` / `CMD3 (rca=1)` | 卡识别成功 | 看 `EXT_CSD … SEC_COUNT` |
+| `GPT ok …` / `GPT[1] …` | **链路完全打通** | 进 Step 4：块设备注册 + IOMedia |

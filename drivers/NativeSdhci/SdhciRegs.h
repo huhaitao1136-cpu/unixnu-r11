@@ -81,6 +81,12 @@
 #define SDHCI_PROG_CLOCK_MODE      0x0020
 #define SDHCI_CLOCK_SDCLK_DIV(_v)  ((_v) << 8)
 
+/* POWER_CONTROL (0x29)：bit0 BUS_POWER_ON，bits[3:1] 电压选择（3.3V = 0b111） */
+#define SDHCI_POWER_ON             0x01
+#define SDHCI_POWER_330            0x0E
+#define SDHCI_POWER_300            0x0C
+#define SDHCI_POWER_180            0x0A
+
 /* HOST_CONTROL */
 #define SDHCI_CTRL_LED             0x01
 #define SDHCI_CTRL_4BITBUS         0x02

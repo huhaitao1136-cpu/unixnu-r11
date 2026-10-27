@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v4"
+#define kSdhciTag         "v5"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -101,21 +101,58 @@ volatile uint32_t native_sdhci_step        = 0;
 volatile uint32_t native_sdhci_caps        = 0;
 volatile uint32_t native_sdhci_caps1       = 0;
 volatile uint32_t native_sdhci_version     = 0;
+volatile uint32_t native_sdhci_state       = 0;
 volatile uint32_t native_sdhci_rca         = 0;
 volatile uint32_t native_sdhci_cid0        = 0;
 volatile uint32_t native_sdhci_gcc_apps    = 0;
 volatile uint32_t native_sdhci_gcc_cfg     = 0;
 
+/*
+ * 访问位宽必须和寄存器定义一致，这一点在 Snapdragon 的 SDCC 上是致命的：
+ *   32 位：0x00 ARGUMENT、0x10..0x1C RESPONSE、0x20 BUFFER、0x24 PRESENT_STATE、
+ *          0x40 CAPABILITIES、0x44 CAPABILITIES_1、0x48 MAX_CURRENT、0x58 ADMA、0xFC SLOT_INT
+ *   16 位：0x04 BLOCK_SIZE、0x06 BLOCK_COUNT、0x0C TRANSFER_MODE、0x0E COMMAND、
+ *          0x2C CLOCK_CONTROL、0x30..0x36 中断状态/使能、0x3C AUTO_CMD_STATUS、
+ *          0x3E HOST_CONTROL2、**0xFE HOST_VERSION（在 4 字节边界上错位 2 字节）**
+ *    8 位：0x28 HOST_CONTROL、0x29 POWER_CONTROL、0x2A BLOCK_GAP、0x2B WAKE_UP、
+ *          0x2E TIMEOUT_CONTROL、0x2F SOFTWARE_RESET
+ * v3/v4 全程用 32 位读写，于是第一条 SDCC 访问就是 0xFE 的错位 32 位读 —— AHB 从口
+ * 对错位访问不应答，整机永久挂死（连 panic 都打不出来，正是实测现象）。
+ */
 static inline uint32_t sdhciRead32 (uintptr_t base, uint32_t off)
 {
     return *reinterpret_cast<volatile uint32_t *> (base + off);
 }
 
+static inline uint16_t sdhciRead16 (uintptr_t base, uint32_t off)
+{
+    return *reinterpret_cast<volatile uint16_t *> (base + off);
+}
+
+static inline uint8_t sdhciRead8 (uintptr_t base, uint32_t off)
+{
+    return *reinterpret_cast<volatile uint8_t *> (base + off);
+}
+
 static inline void sdhciWrite32 (uintptr_t base, uint32_t off, uint32_t value)
 {
     *reinterpret_cast<volatile uint32_t *> (base + off) = value;
-    /* 让写入先落地，避免后续的 status 轮询读到旧值 */
-    (void) sdhciRead32 (base, SDHCI_PRESENT_STATE);
+    /* 回读同一个寄存器让写入先落地；BUFFER 是 FIFO，回读会吃掉一个数据字 */
+    if (off != SDHCI_BUFFER) {
+        (void) sdhciRead32 (base, off);
+    }
+}
+
+static inline void sdhciWrite16 (uintptr_t base, uint32_t off, uint16_t value)
+{
+    *reinterpret_cast<volatile uint16_t *> (base + off) = value;
+    (void) sdhciRead16 (base, off);
+}
+
+static inline void sdhciWrite8 (uintptr_t base, uint32_t off, uint8_t value)
+{
+    *reinterpret_cast<volatile uint8_t *> (base + off) = value;
+    (void) sdhciRead8 (base, off);
 }
 
 static uintptr_t sdhciMapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
@@ -133,6 +170,18 @@ static bool sdhciWaitSet (uintptr_t base, uint32_t off, uint32_t mask, uint32_t 
 {
     for (uint32_t i = 0; i < loops; i++) {
         if ((sdhciRead32 (base, off) & mask) == mask) {
+            return true;
+        }
+        IODelay (1);
+    }
+    return false;
+}
+
+/* 16 位版本：CLOCK_CONTROL(0x2C) 是 16 位寄存器，不能拿 32 位去轮询 */
+static bool sdhciWaitSet16 (uintptr_t base, uint32_t off, uint16_t mask, uint32_t loops)
+{
+    for (uint32_t i = 0; i < loops; i++) {
+        if ((sdhciRead16 (base, off) & mask) == mask) {
             return true;
         }
         IODelay (1);
@@ -420,9 +469,9 @@ bool NativeSdhci::enableGccClocks ()
 
 bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
 {
-    sdhciWrite32 (fCore, SDHCI_SOFTWARE_RESET, which);
+    sdhciWrite8 (fCore, SDHCI_SOFTWARE_RESET, (uint8_t) which);
     for (uint32_t i = 0; i < loops; i++) {
-        if ((sdhciRead32 (fCore, SDHCI_SOFTWARE_RESET) & which) == 0) {
+        if ((sdhciRead8 (fCore, SDHCI_SOFTWARE_RESET) & which) == 0) {
             return true;
         }
         IODelay (10);
@@ -434,24 +483,31 @@ bool NativeSdhci::setBusPowerAndClock ()
 {
     /*
      * R11 上 VCC(2.95V)/VCCQ(1.8V) 都是常开（dmesg: "No vmmc regulator found"），
-     * 所以这里只需要：1.8V 信号 + 8-bit 总线 + SDCLK。
+     * 所以这里只需要：SD 总线电源 + 总线宽度 + SDCLK。
      * SDCLK 的父时钟来自 GCC（实测档位最高 384 MHz），先跑 400 kHz 做识别，
-     * 识别成功后再升到 200 MHz（HS200）——升频在 cardInit() 之后由 TODO 补。
+     * 识别成功后再升频（HS200 需要在 CMD6 之后，TODO）。
      */
-    uint16_t hostCtrl = (uint16_t) sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
-    hostCtrl |= SDHCI_CTRL_8BITBUS;
-    hostCtrl &= (uint16_t) ~SDHCI_CTRL_4BITBUS;
+    /*
+     * eMMC 上电默认是 1-bit 总线：DAT1..DAT7 要等 CMD6(SWITCH, EXT_CSD[183] BUS_WIDTH=2)
+     * 之后才能用。所以识别阶段保持 1-bit，等 cardInit 成功再切（TODO）。
+     * HOST_CONTROL2 的 1.8V Signaling Enable 是 SD 卡 UHS 用的，eMMC 不应置位。
+     */
+    uint16_t hostCtrl = (uint16_t) sdhciRead8 (fCore, SDHCI_HOST_CONTROL);
+    hostCtrl &= (uint16_t) ~(SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);
 
-    uint16_t hostCtrl2 = (uint16_t) sdhciRead32 (fCore, SDHCI_HOST_CONTROL2);
-    hostCtrl2 |= SDHCI_CTRL_VDD_180;             /* eMMC 在 1.8 V 上跑 HS200/HS400 */
-    hostCtrl2 &= (uint16_t) ~SDHCI_CTRL_UHS_MASK;
-    sdhciWrite32 (fCore, SDHCI_HOST_CONTROL2, hostCtrl2);
-    sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostCtrl);
-    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%04x hostctl2=%04x (8-bit, 1.8V)\n",
-           hostCtrl, hostCtrl2);
+    uint16_t hostCtrl2 = sdhciRead16 (fCore, SDHCI_HOST_CONTROL2);
+    hostCtrl2 &= (uint16_t) ~(SDHCI_CTRL_VDD_180 | SDHCI_CTRL_UHS_MASK);
+    sdhciWrite16 (fCore, SDHCI_HOST_CONTROL2, hostCtrl2);
+    sdhciWrite8 (fCore, SDHCI_HOST_CONTROL, (uint8_t) hostCtrl);
+
+    /* 打开 SD 总线电源（R11 上 VCC/VCCQ 常开，这一步只是让控制器开始驱动时钟） */
+    sdhciWrite8 (fCore, SDHCI_POWER_CONTROL, (uint8_t) (SDHCI_POWER_ON | SDHCI_POWER_330));
+    IODelay (1000);
+    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%02x hostctl2=%04x power=%02x (1-bit, 3.3V)\n",
+           hostCtrl, hostCtrl2, sdhciRead8 (fCore, SDHCI_POWER_CONTROL));
 
     /* 超时计数器取最大 */
-    sdhciWrite32 (fCore, SDHCI_TIMEOUT_CONTROL, 0x0E);
+    sdhciWrite8 (fCore, SDHCI_TIMEOUT_CONTROL, 0x0E);
 
     /* 识别阶段 400 kHz：SDCLK = base / (2 * div)，base 由 enableGccClocks() 定成 19.2 MHz
      * → div = 19200000 / (2 * 400000) = 24 */
@@ -469,37 +525,37 @@ bool NativeSdhci::setSdclkDivider (uint32_t div)
         div = 0xff;
     }
     /* 先停卡时钟再改分频，避免毛刺 */
-    sdhciWrite32 (fCore, SDHCI_CLOCK_CONTROL, 0);
+    sdhciWrite16 (fCore, SDHCI_CLOCK_CONTROL, 0);
     IODelay (100);
 
-    uint32_t clk = SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8);
-    sdhciWrite32 (fCore, SDHCI_CLOCK_CONTROL, clk);
-    if (!sdhciWaitSet (fCore, SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u clk=%08x)\n",
-               div, sdhciRead32 (fCore, SDHCI_CLOCK_CONTROL));
+    uint16_t clk = (uint16_t) (SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8));
+    sdhciWrite16 (fCore, SDHCI_CLOCK_CONTROL, clk);
+    if (!sdhciWaitSet16 (fCore, SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u clk=%04x)\n",
+               div, sdhciRead16 (fCore, SDHCI_CLOCK_CONTROL));
         return false;
     }
-    clk |= SDHCI_CLOCK_CARD_EN;
-    sdhciWrite32 (fCore, SDHCI_CLOCK_CONTROL, clk);
+    clk = (uint16_t) (clk | SDHCI_CLOCK_CARD_EN);
+    sdhciWrite16 (fCore, SDHCI_CLOCK_CONTROL, clk);
     IODelay (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) ctrl=%08x stable\n", div,
+    IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) ctrl=%04x stable\n", div,
            (unsigned) (R11_SDCLK_BASE_HZ / (2 * div * 1000)),
-           sdhciRead32 (fCore, SDHCI_CLOCK_CONTROL));
+           sdhciRead16 (fCore, SDHCI_CLOCK_CONTROL));
     return true;
 }
 
 bool NativeSdhci::waitCommandComplete ()
 {
     for (uint32_t i = 0; i < kSdhciCmdLoops; i++) {
-        uint32_t status = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+        uint16_t status = sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS);
         if (status & SDHCI_INT_ERROR) {
-            uint32_t err = sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS);
-            sdhciWrite32 (fCore, SDHCI_ERROR_INT_STATUS, err);
-            IOLog ("NativeSdhci[" kSdhciTag "]: cmd error int=%08x err=%08x\n", status, err);
+            uint16_t err = sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS);
+            sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, err);
+            IOLog ("NativeSdhci[" kSdhciTag "]: cmd error int=%04x err=%04x\n", status, err);
             return false;
         }
         if (status & SDHCI_INT_RESPONSE) {
-            sdhciWrite32 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_RESPONSE);
+            sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_RESPONSE);
             return true;
         }
         IODelay (1);
@@ -511,15 +567,15 @@ bool NativeSdhci::waitCommandComplete ()
 bool NativeSdhci::waitTransferComplete ()
 {
     for (uint32_t i = 0; i < kSdhciDataLoops; i++) {
-        uint32_t status = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+        uint16_t status = sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS);
         if (status & SDHCI_INT_ERROR) {
-            uint32_t err = sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS);
-            sdhciWrite32 (fCore, SDHCI_ERROR_INT_STATUS, err);
-            IOLog ("NativeSdhci[" kSdhciTag "]: data error int=%08x err=%08x\n", status, err);
+            uint16_t err = sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS);
+            sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, err);
+            IOLog ("NativeSdhci[" kSdhciTag "]: data error int=%04x err=%04x\n", status, err);
             return false;
         }
         if (status & SDHCI_INT_DATA_END) {
-            sdhciWrite32 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_END);
+            sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_END);
             return true;
         }
         IODelay (1);
@@ -538,10 +594,10 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
         IODelay (1);
     }
 
-    sdhciWrite32 (fCore, SDHCI_NORMAL_INT_STATUS, 0xFFFFFFFF);
-    sdhciWrite32 (fCore, SDHCI_ERROR_INT_STATUS, 0xFFFFFFFF);
+    sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+    sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, 0xFFFF);
     sdhciWrite32 (fCore, SDHCI_ARGUMENT, arg);
-    sdhciWrite32 (fCore, SDHCI_COMMAND, SDHCI_MAKE_CMD (index, flags));
+    sdhciWrite16 (fCore, SDHCI_COMMAND, SDHCI_MAKE_CMD (index, flags));
 
     if ((flags & SDHCI_CMD_RESP_MASK) == SDHCI_CMD_RESP_NONE) {
         return true;
@@ -648,9 +704,9 @@ bool NativeSdhci::readExtCsd ()
     uint8_t ext[kSdhciBlockSize] __attribute__ ((aligned (64)));
     memset (ext, 0, sizeof (ext));
 
-    sdhciWrite32 (fCore, SDHCI_BLOCK_SIZE, (uint32_t) kSdhciBlockSize);
-    sdhciWrite32 (fCore, SDHCI_BLOCK_COUNT, 1);
-    sdhciWrite32 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
+    sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
+    sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
+    sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
 
     if (!sendCommand (MMC_SEND_EXT_CSD, 0,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
@@ -857,9 +913,9 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
     if (count != 1) {
         return kIOReturnUnsupported;   /* TODO: CMD18 + 多块 PIO/ADMA2 */
     }
-    sdhciWrite32 (fCore, SDHCI_BLOCK_SIZE, (uint32_t) kSdhciBlockSize);
-    sdhciWrite32 (fCore, SDHCI_BLOCK_COUNT, 1);
-    sdhciWrite32 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
+    sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
+    sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
+    sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
 
     if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
@@ -877,9 +933,9 @@ IOReturn NativeSdhci::writeBlocks (UInt64 block, UInt32 count, const void *buffe
     if (count != 1) {
         return kIOReturnUnsupported;
     }
-    sdhciWrite32 (fCore, SDHCI_BLOCK_SIZE, (uint32_t) kSdhciBlockSize);
-    sdhciWrite32 (fCore, SDHCI_BLOCK_COUNT, 1);
-    sdhciWrite32 (fCore, SDHCI_TRANSFER_MODE, 0);
+    sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
+    sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
+    sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE, 0);
 
     if (!sendCommand (MMC_WRITE_BLOCK, (uint32_t) block,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
@@ -913,13 +969,19 @@ bool NativeSdhci::start (IOService *provider)
     }
     logGccState ();
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: reading version/caps\n");
-    native_sdhci_version = sdhciRead32 (fCore, SDHCI_HOST_VERSION) & 0xFF;
+    /* 第一次触 SDCC：先用 32 位、4 字节对齐的 PRESENT_STATE(0x24) 探活，
+     * 再用 16 位读 HOST_VERSION(0xFE)。v3/v4 在这里用 32 位读 0xFE 是错位访问，
+     * 总线直接不应答，所以连这行 log 都打不出来。 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: start: probing SDCC @0x24 (32-bit, aligned)\n");
+    native_sdhci_state = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
+    IOLog ("NativeSdhci[" kSdhciTag "]: state=%08x\n", native_sdhci_state);
+
+    IOLog ("NativeSdhci[" kSdhciTag "]: start: probing SDCC @0xFE (16-bit)\n");
+    native_sdhci_version = sdhciRead16 (fCore, SDHCI_HOST_VERSION) & 0xFF;
     native_sdhci_caps    = sdhciRead32 (fCore, SDHCI_CAPABILITIES);
     native_sdhci_caps1   = sdhciRead32 (fCore, SDHCI_CAPABILITIES_1);
-    IOLog ("NativeSdhci[" kSdhciTag "]: ver=%02x caps=%08x caps1=%08x state=%08x\n",
-           native_sdhci_version, native_sdhci_caps, native_sdhci_caps1,
-           sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
+    IOLog ("NativeSdhci[" kSdhciTag "]: ver=%02x caps=%08x caps1=%08x\n",
+           native_sdhci_version, native_sdhci_caps, native_sdhci_caps1);
 
     /* 0x00 / 0xff 都说明控制器没应答（时钟关或地址错），继续下去没意义 */
     if (native_sdhci_version == 0x00 || native_sdhci_version == 0xff) {
@@ -937,9 +999,9 @@ bool NativeSdhci::start (IOService *provider)
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: start: clock done\n");
     if (!cardInit ()) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: card init failed at step %u (state=%08x err=%08x)\n",
+        IOLog ("NativeSdhci[" kSdhciTag "]: card init failed at step %u (state=%08x err=%04x)\n",
                native_sdhci_step, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
-               sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS));
+               sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
         goto fail;
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: start: card init done\n");
