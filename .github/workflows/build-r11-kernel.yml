@@ -73,17 +73,45 @@ jobs:
 
       - name: 编译内核（耗时最长）
         working-directory: UniXNU
+        # macos-15 的 arm64 runner 只有 3 核 / 7 GB 内存，-j4 在链接 54 MB 内核时
+        # 容易把 runner 打爆（表现为进程收到 SIGTERM、exit code 143、日志全空）。
+        # 这里限成 -j2，并给这一步单独的超时，好把"步骤超时"和"runner 被杀"区分开。
+        timeout-minutes: 150
+        env:
+          JOBS: 2
         run: |
           set -o pipefail
+          echo "== runner =="; sw_vers; sysctl -n hw.ncpu hw.memsize
+          df -h / /tmp | sed -n '1,4p'
           ./unixnu build -D ../device kernel package 2>&1 | tee /tmp/kernel.log | tail -50
+          echo "== 构建结束，log 大小 =="; wc -l /tmp/kernel.log
+
+      - name: 把内核日志写进任务摘要
+        if: always()
+        run: |
+          {
+            echo '### kernel.log（末尾 200 行）'
+            echo '```'
+            tail -200 /tmp/kernel.log 2>/dev/null || echo '(没有 /tmp/kernel.log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 诊断（失败时重跑内核构建，输出完整 stderr）
         if: failure()
         working-directory: UniXNU/out/r11/tree
         continue-on-error: true
         run: |
+          echo "==== 上一次 kernel.log 的末尾（runner 被杀时这里是唯一线索）===="
+          wc -l /tmp/kernel.log 2>/dev/null || echo "(kernel.log 不存在：说明 unixnu 还没打印任何东西就被杀了)"
+          tail -100 /tmp/kernel.log 2>/dev/null || true
+          {
+            echo '### 失败现场'
+            echo '```'
+            tail -100 /tmp/kernel.log 2>/dev/null || echo '(kernel.log 不存在)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "==== 重跑 build-xnu-4k-baseline.sh，捕获完整输出 ===="
-          bash scripts/build-xnu-4k-baseline.sh > /tmp/diag.log 2>&1 || true
+          JOBS=2 bash scripts/build-xnu-4k-baseline.sh > /tmp/diag.log 2>&1 || true
           echo "---- 最后的错误相关行 ----"
           grep -n -i -E 'error|undefined|no rule|not found|ld: |clang: ' /tmp/diag.log | tail -60 || true
           echo "---- 末尾 120 行 ----"
