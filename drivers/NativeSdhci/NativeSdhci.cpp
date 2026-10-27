@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v17"
+#define kSdhciTag         "v18"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -929,7 +929,7 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
         IOLog ("NativeSdhci[" kSdhciTag "]: pio read %u words state=%08x nis=%08x eis=%08x\n",
                count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
-               sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS));
+               sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
     } else {
         for (UInt32 i = 0; i < count; i++) {
             if (!sdhciWaitSet (fCore, SDHCI_PRESENT_STATE, SDHCI_SPACE_AVAILABLE, kSdhciDataLoops)) {
@@ -1026,12 +1026,14 @@ bool NativeSdhci::readExtCsd ()
                           nullptr)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
         } else {
-            /* 命令阶段成功的证据：DAT_LINE_ACTIVE 应该已起、ADMA_ADDRESS 应该是 0
-             * （清掉 DMA Select 之后硬件不该再去碰它）。 */
+            /* 命令阶段成功的证据：DAT_LINE_ACTIVE 应该已起、ADMA_ADDRESS 应该是 0。
+             * 注意 EIS(0x32) **只能 16 位读** —— 0x32 % 4 == 2，用 32 位读是错位访问，
+             * Snapdragon 的 AHB 从口不会拆错位事务，会直接把总线挂死（v16 就是这样
+             * "打完 cmd8 complete 就静默"：死在这一行的参数求值里）。 */
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 ok state=%08x nis=%08x eis=%08x adma=%08x\n",
                    sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                    sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
-                   sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS),
+                   sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
                    sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
             if (pioTransfer (true, ext, (UInt32) kSdhciBlockSize)) {
                 ok = true;

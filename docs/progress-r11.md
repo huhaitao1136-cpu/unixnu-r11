@@ -3766,3 +3766,55 @@ CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff00 attempt=0
 | `cmd8 complete` 之后停住 | 命令完成，卡在数据 FIFO（回到 v14 的问题） |
 | `CMD8 ok … adma=00000000` | 命令与野指针都排除了，问题纯粹在数据通路 |
 | `EXT_CSD rev=8 SEC_COUNT=…` | 通了 |
+
+## 3.63 NativeSdhci v17 真机结果：静默是我们自己的错位 32 位读造成的（2026-10-27）
+
+### 3.63.1 屏幕日志（v17）
+
+```
+bus: hostctl=18 (DMA select=3, keep as-is)
+bus: hostctl2=0000 word28=0000ff18 (1-bit, 3.3V)
+...
+CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff18 attempt=0
+cmd8 pre  state=01f000f0 adma=00000000
+cmd8 posted state=01f000f1
+cmd8 complete state=01e002f6
+                                        <- 之后再无任何输出（整机静默）
+```
+
+### 3.63.2 定位
+
+`cmd8 complete` 打印之后，下一行本该是 v16 加的
+`CMD8 ok state=… nis=… eis=… adma=…`，它的四个参数里最后两个是
+`sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS)` —— 而 **`SDHCI_ERROR_INT_STATUS = 0x32`，
+`0x32 % 4 == 2`，这是错位 32 位读**。Snapdragon 的 AHB 从口不拆错位事务，
+于是事务不完成、CPU 停在 `ldr` 上，机器静默、无 panic、无日志。**这一屏的"挂死"
+是日志语句本身造成的，不是驱动逻辑。**
+
+这与 §3.50 的 `0xFE` 错位读是同一个坑：**任何 32 位访问都必须落在 4 字节对齐的偏移上**。
+
+### 3.63.3 附带收获
+
+`cmd8 complete state=01e002f6` 本身证明命令阶段是通的：
+`DATA_INHIBIT=1`、`DAT_LINE_ACTIVE=1`、`READ_TRANSFER_ACTIVE=1` —— 控制器已经在
+驱动 DAT0 收数据了。也就是说 v14 之后"数据阶段不启动"这个担心可以排除了。
+
+### 3.63.4 v18 改动
+
+1. 两处 `sdhciRead32 (fCore, SDHCI_ERROR_INT_STATUS)` → `sdhciRead16 (...)`（0x32 是 16 位对齐）。
+2. 新增静态检查脚本 `E:\DeepSeekWorkspace\out\check-alignment.py`：
+   解析 `SdhciRegs.h` 的偏移表，扫描 `NativeSdhci.cpp` 里所有
+   `sdhciRead/Write{8,16,32}(fCore, NAME)`，按 `offset % (width/8) == 0` 校验，
+   当前输出 **错位访问: 无**（99 个寄存器定义、30 个 32 位访问点全部对齐）。
+3. `kSdhciTag` = `v18`。
+
+### 3.63.5 下一刷的判读表
+
+| 屏幕 | 结论 |
+|---|---|
+| `CMD8 ok state=… nis=… eis=… adma=00000000` | 命令阶段通过、野指针排除 |
+| `pio word 0/32/64/96/127 state=…` 都有 | FIFO 持续供数，数据通路正常 |
+| `pio read 128 words state=…` 且 bit11=0 | 数据搬完，只差 DATA_END |
+| `pio read 128 words state=…` 且 bit11=1 | 卡在送更多的数据（传输量不符：查 BLOCK_SIZE/CMD16） |
+| `pio read starved at word N` | FIFO 断供（DAT0 信号质量/时钟/供电） |
+| `EXT_CSD rev=8 SEC_COUNT=…` | **数据阶段通了** |
