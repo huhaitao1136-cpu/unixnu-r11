@@ -4428,3 +4428,67 @@ pio after state=01f00af6 nis=00000020
 | `drained=1` 但 `w53=0`、`w126/w127=0` | 卡确实没驱动 DAT 线 | 查 `vs0`/`mstat`、试 CMD13 读卡侧 `CURRENT_STATE`、降速到 400 kHz 重试 |
 | `pio read starved at word 0` | 一个字节都没到 FIFO | 回到 DMA 路线，查 `CORE_DLL_CONFIG(0x200)` 采样点/`CORE_DDR_CONFIG(0x25c)` |
 | 出现 `EXT_CSD rev=… SEC_COUNT=…` | PIO 打通 | 立刻接 `readBlocks(0)` 看 MBR/GPT |
+
+## 3.73 NativeSdhci v26：数据一个字节都不来 —— 先把卡的 CURRENT_STATE 问出来（2026-10-27）
+
+### 3.73.1 v25 真机结果：控制器开着数据引擎，等待卡发数据，卡没有发
+
+```
+CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff18 attempt=0
+cmd8 pre state=01f800f0 adma=00000000
+cmd8 posted state=01f800f1
+cmd8 complete state=01f80af6
+trace 0..7 state=01f80af6 nis=00000000
+CMD8 ok state=01f80af6 nis=00000000 eis=00000000 adma=00000000
+pio got 512 words (block=128) first=00000000 00000000 00000000 00000000 last=00000000
+pio after state=01f80af6 nis=00000000 eis=00000000
+data timeout nis=0000 eis=0000 state=01f80af6
+ext w0=00000000 w1=00000000 w52=00000000 w53=00000000 w126=00000000 w127=00000000 drained=0
+```
+
+把 `state=01f80af6` 拆开：
+
+| 位 | 名字 | 值 |
+|---|---|---|
+| bit1 | `DATA_INHIBIT` | 1（控制器认为数据阶段没结束） |
+| bit2 | `DAT_LINE_ACTIVE` | 1 |
+| bit9 | `READ_TRANSFER_ACTIVE` | 1 |
+| bit11 | `BUFFER_READ_ENABLE` | 1 |
+| bits20..23 | `DAT[3:0]` 电平 | `1111` = 四条数据线全是空闲高电平 |
+| bit24 | `CMD_LINE_LEVEL` | 1 |
+
+也就是说：**控制器把数据引擎打开了、DAT 线一直空闲、卡一个字节都没发**；
+而命令阶段是干净的（`cmd8 complete`、`nis=0`、`eis=0`），说明卡 ACK 了 CMD8。
+
+这排除了"FIFO 读法错"和"收尾位错"两种可能 —— 数据根本没到。PIO 读 512 次
+（`pio got 512 words`）全部读到 0，也印证 FIFO 里是空的，控制器只是按
+`BUFFER_READ_READY` 反复给 0。
+
+### 3.73.2 唯一还没看过的东西：R1
+
+一路以来 `waitCommandComplete()` 只关心"命令完成没完成"，**从来没看 R1 的内容**。
+eMMC 在 R1 里报告 `CARD_IS_LOCKED`、`ILLEGAL_COMMAND`、`ADDRESS_OUT_OF_RANGE`、
+`CURRENT_STATE` 等标志；如果卡认为自己不处于 `tran` 状态，它 ACK 命令之后
+**按规范不会发数据** —— 完全对应上面的现象。
+
+### 3.73.3 v26 改动（纯观测）
+
+1. `CMD8` / `CMD17` 的 `sendCommand()` 传入 `r1[4]`，命令完成后打印
+   `CMD8 r1=%08x current_state=%u (%s)`。
+2. 新增 `bool NativeSdhci::logCardStatus (const char *who)`：发 **CMD13（SEND_STATUS，
+   arg = RCA<<16，R1）**，打印 `status(%s) r1=%08x current_state=%u (%s) ready=%u`。
+3. 调用点：`CMD16` 之后（初始化完成、进入数据阶段之前）一次；`CMD8`、`CMD17`
+   每次数据阶段失败后各一次。
+4. 新增 `static const char * sdhciCardStateName (uint32_t)`：0 idle / 1 ready /
+   2 ident / 3 stby / 4 tran / 5 data / 6 rcv / 7 prg。
+5. `kSdhciTag = "v26"`。
+
+### 3.73.4 下一刷判读表
+
+| 屏幕上的行 | 结论 | 下一步 |
+|---|---|---|
+| `status(after CMD16) … current_state=4 (tran)` 且 `CMD8 r1=00000900`(bit8 READY_FOR_DATA) | 卡状态正常，问题在数据线/采样 | 查 `CORE_DLL_CONFIG(0x200)` 采样点、`CORE_DDR_CONFIG`，或把 SDCLK 降到 100 kHz 试 |
+| `current_state` 不是 4 | 卡没进入传输态 | 按状态补命令（如 `stby` 就重发 CMD7；`data`/`rcv` 先 CMD12 abort） |
+| `CMD8 r1` 的 bit5(`ILLEGAL_COMMAND`) 置位 | 卡不认 CMD8，或 RCA 不对 | 重做 CMD3（发新 RCA）/检查 `fRca` |
+| `CMD8 r1` 的 bit25(`CARD_IS_LOCKED`) 置位 | 卡被锁 | 需要先解密码，这条基本走死 |
+| `status(...) CMD13 failed` | 连 CMD13 都发不出去 | 回到命令线/时钟问题 |

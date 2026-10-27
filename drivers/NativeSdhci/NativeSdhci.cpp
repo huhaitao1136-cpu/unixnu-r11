@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v25"
+#define kSdhciTag         "v26"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -299,6 +299,7 @@ private:
     bool     beginDmaRead (UInt32 bytes);
     bool     endDmaRead (void *dst, UInt32 bytes);
     bool     readCsd ();
+    bool     logCardStatus (const char *who);   /* v26: CMD13，问卡在什么状态 */
     bool     readExtCsd ();
     bool     probeMedia ();
 
@@ -870,6 +871,21 @@ bool NativeSdhci::waitTransferComplete ()
     return false;
 }
 
+static const char * sdhciCardStateName (uint32_t state)
+{
+    switch (state) {
+    case 0: return "idle";
+    case 1: return "ready";
+    case 2: return "ident";
+    case 3: return "stby";
+    case 4: return "tran";
+    case 5: return "data";
+    case 6: return "rcv";
+    case 7: return "prg";
+    default: return "?";
+    }
+}
+
 bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uint32_t *resp)
 {
     const bool isData = (flags & SDHCI_CMD_DATA) != 0;
@@ -976,6 +992,25 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
         }
     }
     return waitTransferComplete ();
+}
+
+bool NativeSdhci::logCardStatus (const char *who)
+{
+    uint32_t r1[4] = { 0, 0, 0, 0 };
+
+    /* CMD13 = SEND_STATUS，R1（48 位），arg = RCA << 16 */
+    if (!sendCommand (13 /* SEND_STATUS */, (uint32_t) fRca << 16,
+                      SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, r1)) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: status(%s) CMD13 failed state=%08x\n",
+               who, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
+        return false;
+    }
+
+    /* R1 低 8 位是错误/状态标志，bits 12..9 是 CURRENT_STATE */
+    IOLog ("NativeSdhci[" kSdhciTag "]: status(%s) r1=%08x current_state=%u (%s) ready=%u\n",
+           who, r1[0], (r1[0] >> 9) & 0xFu,
+           sdhciCardStateName ((r1[0] >> 9) & 0xFu), (r1[0] >> 8) & 1u);
+    return true;
 }
 
 bool NativeSdhci::readCsd ()
@@ -1199,15 +1234,20 @@ bool NativeSdhci::readExtCsd ()
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
 
         bool ok = false;
+        uint32_t r1[4] = { 0, 0, 0, 0 };
+
         if (!sendCommand (MMC_SEND_EXT_CSD, 0,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-                          nullptr)) {
+                          r1)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
         } else {
             /* 命令阶段成功的证据：DAT_LINE_ACTIVE 应该已起、ADMA_ADDRESS 应该是 0。
              * 注意 EIS(0x32) **只能 16 位读** —— 0x32 % 4 == 2，用 32 位读是错位访问，
              * Snapdragon 的 AHB 从口不会拆错位事务，会直接把总线挂死（v16 就是这样
              * "打完 cmd8 complete 就静默"：死在这一行的参数求值里）。 */
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 r1=%08x current_state=%u (%s)\n",
+                   r1[0], (r1[0] >> 9) & 0xFu, sdhciCardStateName ((r1[0] >> 9) & 0xFu));
+
             /* 数据引擎到底动没动？连采 8 次，间隔 5 ms。 */
             for (uint32_t s = 0; s < 8; s++) {
                 uint32_t st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
@@ -1237,6 +1277,7 @@ bool NativeSdhci::readExtCsd ()
         }
 
         if (!ok) {
+            (void) logCardStatus ("after CMD8 data failure");
             recoverCommandState ("after CMD8 data failure");
             continue;
         }
@@ -1461,6 +1502,8 @@ bool NativeSdhci::cardInit ()
         return false;
     }
 
+    (void) logCardStatus ("after CMD16");
+
     /* TODO: CMD6(SWITCH) 切 EXT_CSD 的 BUS_WIDTH=8 / HS_TIMING=2(HS200)，再升 SDCLK。
      *       现在保持在默认速度，够读第一个块验证链路。 */
 
@@ -1482,12 +1525,16 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
                       (uint16_t) (SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
+        uint32_t r1[4] = { 0, 0, 0, 0 };
+
         if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-                          nullptr)) {
+                          r1)) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 lba=%llu failed (attempt %u)\n",
                    (unsigned long long) block, attempt);
         } else {
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 r1=%08x current_state=%u (%s)\n",
+                   r1[0], (r1[0] >> 9) & 0xFu, sdhciCardStateName ((r1[0] >> 9) & 0xFu));
             bool drained = pioTransfer (true, buffer, (UInt32) kSdhciBlockSize);
             /* buffer 是调用方给的，不保证 4 字节对齐 → 用 sdhciCopyLe 逐字节拼装，
              * 别强转成 uint32_t *。注意它的出参是 uint64_t。 */
@@ -1505,6 +1552,7 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
             }
         }
 
+        (void) logCardStatus ("after CMD17 data failure");
         recoverCommandState ("after CMD17 data failure");
     }
     return kIOReturnError;
