@@ -2841,3 +2841,46 @@ provider 选 `IOPlatformDevice`：ADT 里 `sdhci` 节点是 `arm-io` 的子节�
 3. `build-stage1.sh` 出 `boot.img`（7,864,320 B）→ `dd` 刷入 → 看 `NativeSdhci: matched DT node`。
 4. 若 personality 生效但 `Waiting on IOMedia` 仍在最前面：给 payload 加回一个最小 Data ramdisk，
    让根卷等待有解，内核才会继续走到 exec。
+
+## 3.49 NativeSdhci v4：根时钟 CMD_ROOT_EN=0 才是"读寄存器整机挂死"的根因（2026-10-27）
+
+v3 的真机日志停在 `start: reading version/caps`，一行 panic 都没有 —— 说明不是 aborts，
+而是 AXI 事务没有响应、CPU 静默卡住。v3 顺带打出的 GCC 状态直接指认了原因：
+
+```
+NativeSdhci[v3]: gcc: apps=0x00004221 ahb=0x20008001 ice=0x00004220
+NativeSdhci[v3]: gcc: rcg cfg=0x00000000 m/n/d=0x0000050f/0x00000001/0x000000fe
+```
+
+* 分支门控（`gcc_sdcc1_apps_clk` 0x16004、`gcc_sdcc1_ahb_clk` 0x16008）的 bit31
+  （`CBCR_CLK_OFF`）都是 0，看着"已开"；
+* 但 `0x1602c` 读出来是 0，而按 `drivers/clk/qcom/clk-rcg2.c` 的布局，
+  `cmd_rcgr + 0x00` 是 **CMD_RCGR**（bit0=CMD_UPDATE、bit1=CMD_ROOT_EN、bit31=CMD_ROOT_OFF），
+  `+0x04` 才是 CFG。所以真值是 **CMD_ROOT_EN=0** —— `sdcc1_apps_clk_src` 的根时钟没有输出。
+* 分支放行但输入无时钟 ⇒ SDCC 整个模块没有时钟 ⇒ 读 SDCC 寄存器时总线不响应，整机静默挂死。
+  （顺带纠正：v3 日志把 CFG/M/N/D 读错位了一格，现在按 clk-rcg2 的偏移重读。）
+
+### v4 的改动
+
+1. 新增 `enableGccClocks()`，完全按 `clk_rcg2` 的顺序自开根时钟：
+   `CMD=0`（关根）→ `CFG=0`（SRC_SEL=XO、SRC_DIV=1、MODE=0）→ `M/N/D=0` →
+   `CMD=CMD_UPDATE` → `CMD=CMD_ROOT_EN` → 轮询 `CMD_ROOT_OFF` 清零；
+   再对 ahb/apps 两个 CBCR 读改写置 bit0，并轮询 `CLK_OFF` 清零。任一步失败即放弃，
+   **绝不在没有时钟的情况下读 SDCC**。
+2. 父时钟固定用 **XO 19.2 MHz**（板上晶振，永远在跑），不赌 GPLL0/GPLL4 是否已配置 ——
+   bring-up 阶段要自给自足。基础时钟因此是 19.2 MHz。
+3. 新增 `setSdclkDivider(div)`：`SDCLK = 19.2 MHz / (2 * div)`。
+   识别用 `div=24`（400 kHz），`cardInit()` 成功后升到 `div=1`（9.6 MHz）再读 EXT_CSD/GPT。
+   （v3 之前写死 `div=62` 且假定 base 50 MHz，是错的。）
+4. 版本标记升到 `v4`，屏幕上看 `NativeSdhci[v4]:` 即确认刷进去了。
+
+### 判定表（v4）
+
+| 日志 | 结论 |
+|---|---|
+| `gcc clocks not ready` | 根时钟打不开（电源域/地址/父时钟问题），要查 GCC 或 SDCC 电源域 |
+| `root enabled -> cmd=…` 后没了 | 分支仍无时钟，或 SDCC 本身还需解复位 |
+| `branch ahb=… (CLK_OFF stuck)` | 该分支被别的子系统占用/硬件门控 |
+| `ver=… caps=…` 出现 | **总线终于通了**，进入 SDHCI 协议层 |
+| `internal clock never stabilised` | SDCLK 没起来（分频/供电） |
+| `cardInit: OCR=…` | 卡识别成功，后面看 EXT_CSD/GPT |

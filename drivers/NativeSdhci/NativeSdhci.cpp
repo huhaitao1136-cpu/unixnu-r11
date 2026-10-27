@@ -48,23 +48,51 @@
 #define kSdhciCmdLoops    200000U     /* 轮询上限（约 200 ms，IODelay(1) = 1 us） */
 #define kSdhciDataLoops   4000000U    /* 数据阶段上限（约 4 s） */
 
-/* bring-up 版本标记：每改一次驱动就 +1（v3 = 加逐步日志 + GCC 时钟状态回读）。
- * 屏幕上的 `NativeSdhci[v3]:` 前缀就是"刷进去的是这一版"的证据，省得再靠 UUID 猜。 */
-#define kSdhciTag         "v3"
+/* bring-up 版本标记：每改一次驱动就 +1
+ * v3 = 逐步日志 + GCC 时钟状态回读
+ * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
+ *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
+ * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
+#define kSdhciTag         "v4"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
  *   gcc_sdcc1_apps_clk   enable_reg 0x16004 bit0（parent = sdcc1_apps_clk_src）
  *   gcc_sdcc1_ahb_clk    enable_reg 0x16008 bit0
  *   gcc_sdcc1_ice_core_clk enable_reg 0x1600c bit0
- *   sdcc1_apps_clk_src   cmd_rcgr 0x1602c（CFG_RCGR/M/N/D/CMD_RCGR = +0/+4/+8/+0xC/+0x10）
- * XNU 没有时钟框架，这里先只**读**状态，判断"寄存器访问挂死"是不是因为时钟被门控。 */
+ *   sdcc1_apps_clk_src   cmd_rcgr 0x1602c
+ * 寄存器布局取自 drivers/clk/qcom/clk-rcg2.c（clk_rcg2）：
+ *   CMD_RCGR +0x00  bit0=CMD_UPDATE bit1=CMD_ROOT_EN bit31=CMD_ROOT_OFF
+ *   CFG_RCGR +0x04  bits[4:0]=SRC_DIV bits[10:8]=SRC_SEL bits[13:12]=MODE
+ *   M +0x08 / N +0x0c / D +0x10
+ * 分支时钟（clk_branch2_ops）：写 CBCR bit0 使能，halt 判定看 CBCR bit31(CLK_OFF)。
+ *
+ * v3 实测（真机）：apps=0x4221 ahb=0x20008001 → bit31=0 看着都是"开"，
+ * 但 CMD_RCGR=0x00000000 → **CMD_ROOT_EN=0**，根时钟根本没输出。
+ * 分支"已开"只说明分支门控放行，没有输入时钟照样没有时钟 → 读 SDCC 寄存器 AXI 挂死。
+ * 所以这里必须自己把根时钟配好并打开。 */
 #define R11_GCC_PHYS      0x00100000ULL
 #define R11_GCC_REG_SIZE  0x00020000ULL
 #define GCC_SDCC1_APPS_CBCR 0x16004U
 #define GCC_SDCC1_AHB_CBCR  0x16008U
 #define GCC_SDCC1_ICE_CBCR  0x1600cU
 #define GCC_SDCC1_APPS_RCGR 0x1602cU
+
+#define GCC_RCG_CMD          0x00U
+#define GCC_RCG_CFG          0x04U
+#define GCC_RCG_M            0x08U
+#define GCC_RCG_N            0x0cU
+#define GCC_RCG_D            0x10U
+#define GCC_RCG_CMD_UPDATE   0x00000001U
+#define GCC_RCG_CMD_ROOT_EN  0x00000002U
+#define GCC_RCG_CMD_ROOT_OFF 0x80000000U
+#define GCC_CBCR_ENABLE      0x00000001U
+#define GCC_CBCR_CLK_OFF     0x80000000U
+
+/* 只用 XO（板上 19.2 MHz 晶振，永远在跑）做父时钟，不依赖 GPLL0/GPLL4 有没有起来。
+ * SRC_SEL=0 即 XO，SRC_DIV=0 即不分频 → SDCC 基础时钟 19.2 MHz。
+ * 这样 bring-up 阶段完全自给自足；等通了再换成 GPLL4/HS200。 */
+#define R11_SDCLK_BASE_HZ 19200000U
 
 /* 诊断计数器，panic 里能看到走到哪一步 */
 volatile uint32_t native_sdhci_probe_calls = 0;
@@ -134,8 +162,10 @@ public:
 private:
     bool     mapRegisters (IOService *provider);
     void     logGccState ();
+    bool     enableGccClocks ();
     bool     softReset (uint32_t which, uint32_t loops);
     bool     setBusPowerAndClock ();
+    bool     setSdclkDivider (uint32_t div);
     bool     cardInit ();
 
     bool     sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uint32_t *resp);
@@ -302,8 +332,7 @@ bool NativeSdhci::mapRegisters (IOService *provider)
 }
 
 /* 只读地把 GCC 里 eMMC 相关时钟的开关/分频状态打到屏幕上。
- * 如果 apps_cbcr 显示 CLK_OFF 或 HALT，那么后面第一次读 SDCC 寄存器就可能整机挂死，
- * 这时日志会停在"gcc:"这一行之后 —— 那就能确定下一步必须自己开时钟。 */
+ * 注意寄存器含义（clk-rcg2.h）：cmd_rcgr+0 是 CMD_RCGR（不是 CFG），+4 才是 CFG。 */
 void NativeSdhci::logGccState ()
 {
     OSSharedPtr<IOMemoryMap> gccMap;
@@ -315,14 +344,78 @@ void NativeSdhci::logGccState ()
     uint32_t apps = sdhciRead32 (gcc, GCC_SDCC1_APPS_CBCR);
     uint32_t ahb  = sdhciRead32 (gcc, GCC_SDCC1_AHB_CBCR);
     uint32_t ice  = sdhciRead32 (gcc, GCC_SDCC1_ICE_CBCR);
-    uint32_t cfg  = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR);
-    uint32_t m    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + 0x04);
-    uint32_t n    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + 0x08);
-    uint32_t d    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + 0x0c);
+    uint32_t cmd  = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_CMD);
+    uint32_t cfg  = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_CFG);
+    uint32_t m    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_M);
+    uint32_t n    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_N);
+    uint32_t d    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_D);
     IOLog ("NativeSdhci[" kSdhciTag "]: gcc: apps=%08x ahb=%08x ice=%08x\n", apps, ahb, ice);
-    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: rcg cfg=%08x m/n/d=%08x/%08x/%08x\n", cfg, m, n, d);
+    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: root cmd=%08x cfg=%08x src=%u div=%u m/n/d=%08x/%08x/%08x\n",
+           cmd, cfg, (cfg >> 8) & 0x7, cfg & 0x1f, m, n, d);
     native_sdhci_gcc_apps = apps;
-    native_sdhci_gcc_cfg  = cfg;
+    native_sdhci_gcc_cfg  = cmd;
+}
+
+/* 把 sdcc1_apps_clk_src 的根时钟打开，并确保 apps/ahb 两个分支门控放行。
+ * 顺序照抄 clk-rcg2.c：先 root off → 写 CFG/M/N/D → CMD_UPDATE 生效 → CMD_ROOT_EN 开根
+ * → 轮询 CMD_ROOT_OFF 清零；最后逐个开分支并轮询 CBCR 的 CLK_OFF(bit31) 清零。 */
+bool NativeSdhci::enableGccClocks ()
+{
+    OSSharedPtr<IOMemoryMap> gccMap;
+    uintptr_t gcc = sdhciMapPhys (R11_GCC_PHYS, R11_GCC_REG_SIZE, gccMap);
+    if (!gcc) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed, cannot enable clocks\n");
+        return false;
+    }
+    const uint32_t rcgr = GCC_SDCC1_APPS_RCGR;
+
+    /* 1) 先关根，避免半配置状态输出时钟 */
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CMD, 0);
+    /* 2) 父时钟选 XO、不分频、单边沿模式；M/N/D 全清（纯分频模式，输出 = 19.2 MHz） */
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CFG, 0);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_M, 0);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_N, 0);
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_D, 0);
+    /* 3) CMD_UPDATE 让上面的配置生效 */
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CMD, GCC_RCG_CMD_UPDATE);
+    /* 4) 打开根输出 */
+    sdhciWrite32 (gcc, rcgr + GCC_RCG_CMD, GCC_RCG_CMD_ROOT_EN);
+
+    bool rootOn = false;
+    for (uint32_t i = 0; i < 1000; i++) {
+        uint32_t cmd = sdhciRead32 (gcc, rcgr + GCC_RCG_CMD);
+        if ((cmd & GCC_RCG_CMD_ROOT_OFF) == 0) {
+            rootOn = true;
+            break;
+        }
+        IODelay (10);
+    }
+    uint32_t cmdNow = sdhciRead32 (gcc, rcgr + GCC_RCG_CMD);
+    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: root enabled -> cmd=%08x%s\n", cmdNow,
+           rootOn ? "" : "  (ROOT_OFF still set!)");
+
+    /* 5) 分支门控：先读改写再判定，别把别人的位清掉 */
+    struct { uint32_t off; const char *name; } branches[] = {
+        { GCC_SDCC1_AHB_CBCR,  "ahb"  },
+        { GCC_SDCC1_APPS_CBCR, "apps" },
+    };
+    bool allOn = true;
+    for (unsigned i = 0; i < sizeof (branches) / sizeof (branches[0]); i++) {
+        uint32_t v = sdhciRead32 (gcc, branches[i].off);
+        sdhciWrite32 (gcc, branches[i].off, v | GCC_CBCR_ENABLE);
+        bool on = false;
+        for (uint32_t k = 0; k < 1000; k++) {
+            if ((sdhciRead32 (gcc, branches[i].off) & GCC_CBCR_CLK_OFF) == 0) {
+                on = true;
+                break;
+            }
+            IODelay (10);
+        }
+        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: branch %s=%08x%s\n", branches[i].name,
+               sdhciRead32 (gcc, branches[i].off), on ? "" : "  (CLK_OFF stuck)");
+        allOn = allOn && on;
+    }
+    return rootOn && allOn;
 }
 
 bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
@@ -354,24 +447,43 @@ bool NativeSdhci::setBusPowerAndClock ()
     hostCtrl2 &= (uint16_t) ~SDHCI_CTRL_UHS_MASK;
     sdhciWrite32 (fCore, SDHCI_HOST_CONTROL2, hostCtrl2);
     sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostCtrl);
+    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%04x hostctl2=%04x (8-bit, 1.8V)\n",
+           hostCtrl, hostCtrl2);
 
     /* 超时计数器取最大 */
     sdhciWrite32 (fCore, SDHCI_TIMEOUT_CONTROL, 0x0E);
 
-    /* 400 kHz 启动：SDCLK = base / (2 * div)。假定 base 50 MHz，div = 62 */
-    uint16_t clk = (uint16_t) (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_SDCLK_DIV (62));
-    IOLog ("NativeSdhci[" kSdhciTag "]: clock: hostctl=%04x hostctl2=%04x clk=%04x\n",
-           hostCtrl, hostCtrl2, clk);
+    /* 识别阶段 400 kHz：SDCLK = base / (2 * div)，base 由 enableGccClocks() 定成 19.2 MHz
+     * → div = 19200000 / (2 * 400000) = 24 */
+    return setSdclkDivider (24);
+}
+
+/* SDHCI v3 时钟控制：bit0 INT_CLK_EN，bit2 SD_CLK_EN，bits[15:8] 分频值。
+ * SDCLK = R11_SDCLK_BASE_HZ / (2 * div)。 */
+bool NativeSdhci::setSdclkDivider (uint32_t div)
+{
+    if (div < 1) {
+        div = 1;
+    }
+    if (div > 0xff) {
+        div = 0xff;
+    }
+    /* 先停卡时钟再改分频，避免毛刺 */
+    sdhciWrite32 (fCore, SDHCI_CLOCK_CONTROL, 0);
+    IODelay (100);
+
+    uint32_t clk = SDHCI_CLOCK_INT_EN | (((uint32_t) div) << 8);
     sdhciWrite32 (fCore, SDHCI_CLOCK_CONTROL, clk);
     if (!sdhciWaitSet (fCore, SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_STABLE, kSdhciCmdLoops)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (clk=%08x)\n",
-               sdhciRead32 (fCore, SDHCI_CLOCK_CONTROL));
+        IOLog ("NativeSdhci[" kSdhciTag "]: internal clock never stabilised (div=%u clk=%08x)\n",
+               div, sdhciRead32 (fCore, SDHCI_CLOCK_CONTROL));
         return false;
     }
     clk |= SDHCI_CLOCK_CARD_EN;
     sdhciWrite32 (fCore, SDHCI_CLOCK_CONTROL, clk);
     IODelay (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: clock: stable, clk=%08x\n",
+    IOLog ("NativeSdhci[" kSdhciTag "]: clock: div=%u (%u kHz) ctrl=%08x stable\n", div,
+           (unsigned) (R11_SDCLK_BASE_HZ / (2 * div * 1000)),
            sdhciRead32 (fCore, SDHCI_CLOCK_CONTROL));
     return true;
 }
@@ -794,6 +906,12 @@ bool NativeSdhci::start (IOService *provider)
 
     /* 先看时钟有没有被门控：没时钟就动 SDCC 寄存器在 msm 上会挂总线 */
     logGccState ();
+    if (!enableGccClocks ()) {
+        /* 打不开根时钟就不要读 SDCC —— 那一步会让整机静默挂死，连 panic 都打不出来 */
+        IOLog ("NativeSdhci[" kSdhciTag "]: gcc clocks not ready, giving up before touching SDCC\n");
+        goto fail;
+    }
+    logGccState ();
 
     IOLog ("NativeSdhci[" kSdhciTag "]: start: reading version/caps\n");
     native_sdhci_version = sdhciRead32 (fCore, SDHCI_HOST_VERSION) & 0xFF;
@@ -825,6 +943,12 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: start: card init done\n");
+
+    /* 识别完升频：19.2 MHz / 2 = 9.6 MHz，EXT_CSD 和 GPT 的读取会快一个数量级 */
+    if (!setSdclkDivider (1)) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: could not raise the transfer clock, staying at 400 kHz\n");
+        setSdclkDivider (24);
+    }
 
     native_sdhci_step = 9;
     /* bring-up 第一步：把卡信息 / LBA0 / GPT 分区表打在屏幕上 */
