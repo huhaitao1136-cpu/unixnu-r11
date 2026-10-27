@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v23"
+#define kSdhciTag         "v24"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1159,6 +1159,15 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
            ok ? 1 : 0, state, nis, eis, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), ea0, ea1);
     /* 前四个字 + EXT_CSD[212] 所在的第 53 个字（SEC_COUNT），一眼看出数据是不是真的 */
     fDmaArmed = false;
+    if (!ok) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: dma: ctx blksz=%04x cnt=%04x mode=%04x hostctl=%08x vs0=%08x vs3=%08x mstat=%08x\n",
+               sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
+               sdhciRead16 (fCore, SDHCI_TRANSFER_MODE),
+               sdhciRead32 (fCore, SDHCI_HOST_CONTROL),
+               sdhciRead32 (fCore, CORE_VENDOR_SPEC),
+               sdhciRead32 (fCore, CORE_VENDOR_SPEC3),
+               sdhciRead32 (fCore, CORE_MCI_STATUS_REG));
+    }
     IOLog ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x\n",
            data[0], data[1], data[2], data[3], data[52], data[53], data[126], data[127]);
 
@@ -1199,6 +1208,16 @@ bool NativeSdhci::readExtCsd ()
              * 注意 EIS(0x32) **只能 16 位读** —— 0x32 % 4 == 2，用 32 位读是错位访问，
              * Snapdragon 的 AHB 从口不会拆错位事务，会直接把总线挂死（v16 就是这样
              * "打完 cmd8 complete 就静默"：死在这一行的参数求值里）。 */
+            /* 数据引擎到底动没动？连采 8 次，间隔 5 ms。 */
+            for (uint32_t s = 0; s < 8; s++) {
+                uint32_t st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
+                uint32_t ns = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+                IOLog ("NativeSdhci[" kSdhciTag "]: trace %u state=%08x nis=%08x\n", s, st, ns);
+                if ((st & (SDHCI_DATA_INHIBIT | SDHCI_DOING_READ)) == 0) {
+                    break;
+                }
+                sdhciDelayUs (5000);
+            }
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 ok state=%08x nis=%08x eis=%08x adma=%08x\n",
                    sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                    sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
@@ -1560,6 +1579,21 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
     IOLog ("NativeSdhci[" kSdhciTag "]: start: clock done\n");
+
+    /* 我们从没写过中断使能寄存器。Linux 的 sdhci_enable() 第一步就是写这两个：
+     * 状态位使能全部打开、信号全部关掉（我们纯轮询，不要中断线）。
+     * 部分控制器（含 MSM）的数据引擎推进与状态使能相关，先补上再看。 */
+    sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+    sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+    sdhciWrite16 (fCore, SDHCI_NORMAL_INT_ENABLE, 0xFFFF);
+    sdhciWrite16 (fCore, SDHCI_ERROR_INT_ENABLE, 0xFFFF);
+    sdhciWrite16 (fCore, SDHCI_NORMAL_INT_SIGNAL, 0x0000);
+    sdhciWrite16 (fCore, SDHCI_ERROR_INT_SIGNAL, 0x0000);
+    IOLog ("NativeSdhci[" kSdhciTag "]: int: enable=%04x/%04x signal=%04x/%04x\n",
+           sdhciRead16 (fCore, SDHCI_NORMAL_INT_ENABLE),
+           sdhciRead16 (fCore, SDHCI_ERROR_INT_ENABLE),
+           sdhciRead16 (fCore, SDHCI_NORMAL_INT_SIGNAL),
+           sdhciRead16 (fCore, SDHCI_ERROR_INT_SIGNAL));
     if (!setupDmaMemory ()) {
         IOLog ("NativeSdhci[" kSdhciTag "]: dma memory not available, giving up\n");
         goto fail;

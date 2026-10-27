@@ -4285,3 +4285,79 @@ vendor 侧配置（`CORE_VENDOR_SPEC` 里的 DMA 位 + 描述符表的物理约�
 顺便记一条经验：**先读 CAPABILITIES 判断硬件到底支持什么，再写驱动**。
 前几轮一直在"按 sdhci 通用流程实现 ADMA2"，却没验证这块控制器广告了 ADMA2 没有，
 白烧了三轮（v20/v21/v22）。
+
+## 3.71 SDMA 也不出数据 → 打开中断使能 + 状态演化探针（v24）
+
+v23 日志（SDMA 路径）：
+
+```
+dma: sdma armed layout=sdma caps=742dc8b2 bytes=512 addr=aff40000 hostctl=00
+cmd8 pre state=01f000f0 adma=aff40000
+cmd8 posted state=01f000f1
+cmd8 complete state=01f002f6          <- 这次没有 eis=0x200，ADMA 错误消失
+CMD8 ok state=01f002f6 nis=00000000 eis=00000000 adma=ffffffff
+data timeout nis=0000 eis=0000 state=01f002f6
+dma: done ok=0 … adma=ffffffff err=00000000/00000000
+dma: data 00000000 …
+```
+
+三条新信息：
+
+1. **切到 SDMA 后 ADMA Error 消失了**（命令阶段干净），说明 DMA 模式选择是对的；
+2. `0x58` 在 SDMA 模式下读回 `ffffffff`（该寄存器在 SDMA 模式下没有回读意义，正常）；
+3. 数据引擎完全不动：`NIS` 里既没有 `BUFFER_READ_READY(bit5)` 也没有 `DATA_END(bit1)`，
+   `DAT_INHIBIT(bit1)=1`、`DAT_LINE_ACTIVE(bit2)=1` 从头到尾不变。
+
+把 PIO(v19)、ADMA2(v20~22)、SDMA(v23) 三条路径对齐看，失败模式是一致的：
+**控制器认为"传输已经开始"，但 DAT 线上没有任何东西进来**。
+
+### 3.71.1 发现一个一直被忽略的寄存器
+
+翻遍驱动，我们**从来没有写过 SDHCI 的中断使能寄存器**：
+
+* `SDHCI_NORMAL_INT_ENABLE (0x34)`
+* `SDHCI_ERROR_INT_ENABLE (0x36)`
+* `SDHCI_NORMAL_INT_SIGNAL (0x38)` / `SDHCI_ERROR_INT_SIGNAL (0x3A)`
+
+Linux 的 `sdhci_enable()` 第一步就是 `sdhci_writew(SDHCI_INT_ENABLE, …)` +
+`sdhci_writew(SDHCI_SIGNAL_ENABLE, …)`。部分控制器（含 MSM 系列）的数据引擎
+推进与"状态位使能"相关——状态位不使能时，内部状态机可能不前进。这条线索之前
+完全没有验证过。
+
+### 3.71.2 v24 改动
+
+1. `start()` 在 `clock done` 之后：
+
+   ```c
+   sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+   sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS,  0xFFFF);
+   sdhciWrite16 (fCore, SDHCI_NORMAL_INT_ENABLE, 0xFFFF);
+   sdhciWrite16 (fCore, SDHCI_ERROR_INT_ENABLE,  0xFFFF);
+   sdhciWrite16 (fCore, SDHCI_NORMAL_INT_SIGNAL, 0x0000);
+   sdhciWrite16 (fCore, SDHCI_ERROR_INT_SIGNAL,  0x0000);
+   ```
+
+   状态位全使能、信号全关（我们纯轮询，不需要中断线），并回读打印
+   `int: enable=%04x/%04x signal=%04x/%04x`。
+
+2. `readExtCsd()` 在命令完成后连采 8 次状态（间隔 5 ms）：
+
+   ```
+   trace <n> state=%08x nis=%08x
+   ```
+
+   看 `DAT_LINE_ACTIVE` / `DOING_READ` / `DATA_AVAILABLE` 有没有变化。
+
+3. `endDmaRead()` 失败时补一行上下文：
+
+   ```
+   dma: ctx blksz=… cnt=… mode=… hostctl=… vs0=… vs3=… mstat=…
+   ```
+
+### 3.71.3 判据
+
+| 日志 | 结论 |
+|---|---|
+| `trace` 里 `state` 从 `01f002f6` 变成 `01f000f6`/`…`，`nis` 出现 `0001`(DATA_END) | 中断使能就是那个开关，直接通 |
+| `trace` 全程一模一样 | 数据引擎确实没推进，下一步查 DAT 线/时钟/卡侧模式 |
+| 出现 `EXT_CSD rev=… SEC_COUNT=…` | 64 GB 容量读出来了 |
