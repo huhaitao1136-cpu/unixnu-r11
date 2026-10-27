@@ -1,17 +1,39 @@
 #!/usr/bin/env python3
-"""最小内核补丁：只打"让内核能在 ARMv8.0 + 视频控制台跑起来"的必需项。
+"""让内核能在 ARMv8.0 + 视频控制台上跑起来的最小补丁集。
 
-与 patch-kernel-full.py 的区别：
-  * 保留：PAN 指令（两种编码都处理）、输出开关、serial_init、cons_ops_index
-  * 跳过：AppleARMCPU::_validateConfiguration 返回值伪造
-  * 跳过：mrs xN,<sysreg> → mov wN,#1（伪造 CPU 特性读取）
-  * 跳过：0xE7FFDEFF 特殊标记 → NOP
+历史教训（2026-10-27）
+----------------------
+这个脚本以前把 6 个地址写死：
 
-这些被跳过的补丁可能让内核相信某些不存在的 CPU 能力，进而影响
-文件系统/缓存路径。用最小补丁可以对照验证。
+    SYM_DISABLE       = [0xFFFFFFF0071F9B50, ...51, ...52]
+    SYM_SERIAL_INIT   = 0xFFFFFFF00793E724
+    SYM_CONS_OPS_INDEX= 0xFFFFFFF007167920
+
+内核一重新链接就全漂了。用符号表一对，这版内核里它们其实在：
+
+    符号                     正确地址          硬编码值落在哪
+    _disable_serial_output   0x71FDB50         __ZTV17IOPowerConnection（C++ vtable！）
+    _disable_kprintf_output  0x71FDB51         同上
+    _disable_iolog_...       0x71FDB52         同上
+    _serial_init             0x79424DC         __GLOBAL__sub_I_IOPMrootDomain.cpp
+    _cons_ops_index          0x716B920         _zone_security_array
+
+也就是说旧脚本把 3 个 vtable 字节清零、把某个静态构造函数的头两条指令改成
+`mov w0,#0; ret`、还往 zone 安全数组里写了 1 —— 结果内核跑到
+`iBoot Stage 2 version:` 之后就死了。
+
+所以现在必须传 `--symbols`（llvm-nm 输出），全部按符号定位：
+
+  1) PAN：全域按指令编码扫描（`msr PAN` 两种编码）
+  2) CPU 校验：按内容断言（`and w0, w19, #1` -> `mov w0, #1`）
+  3) mrs xN, PAN / 0xE7FFDEFF：全域按编码扫描
+  4) 三个输出开关：按符号
+  5) serial_init：按符号，写 `mov w0,#0; ret`
+  6) cons_ops_index：按符号，写 1（视频控制台）
 
 用法:
-  python3 patch-kernel-minimal.py <输入 kernel.macho> <输出 kernel.macho> [--with-cpu-fakes]
+  python3 patch-kernel-minimal.py <in> <out> --symbols <nm.txt> \
+      [--with-validate] [--with-trapfix] [--with-mrs1|--with-mrs0] [--with-cpu-fakes]
 """
 import struct
 import sys
@@ -21,14 +43,20 @@ NOP = struct.pack('<I', 0xD503201F)
 MOV_W0_0 = 0x52800000
 RET = 0xD65F03C0
 
-VALIDATE_RET = 0xFFFFFFF0049871A0
-SYM_DISABLE = [0xFFFFFFF0071F9B50, 0xFFFFFFF0071F9B51, 0xFFFFFFF0071F9B52]
-SYM_SERIAL_INIT = 0xFFFFFFF00793E724
-SYM_CONS_OPS_INDEX = 0xFFFFFFF007167920
+VALIDATE_VA = 0xFFFFFFF0049871A0
+VALIDATE_OLD = 0x12000260          # and w0, w19, #1
+
+SYM_SERIAL_INIT = '_serial_init'
+SYM_CONS_OPS_INDEX = '_cons_ops_index'
+SYM_DISABLE = ['_disable_serial_output', '_disable_kprintf_output',
+               '_disable_iolog_serial_output']
+
+# 找不到符号时绝不退回硬编码地址：那只会去改坏别人的 vtable。
+ALLOW_FALLBACK = '--allow-fallback-addresses' in sys.argv
 
 
 def segments(d: bytes):
-    _, _, _, _, ncmds, _, _ = struct.unpack_from('<IiiIIII', d, 0)
+    ncmds = struct.unpack_from('<I', d, 16)[0]
     off = 32
     segs = []
     for _ in range(ncmds):
@@ -48,44 +76,73 @@ def va_to_off(segs, va):
     return None, None
 
 
+def parse_symbols(path):
+    table = {}
+    for line in Path(path).read_text(errors='replace').splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            addr = int(parts[0], 16)
+        except ValueError:
+            continue
+        name = parts[2]
+        table.setdefault(name, addr)
+        if name.startswith('_'):
+            table.setdefault(name[1:], addr)
+        else:
+            table.setdefault('_' + name, addr)
+    return table
+
+
 def patch_pan(d: bytearray) -> int:
-    """两种 PAN 编码都换成等价的 ARMv8.0 指令。"""
     n = 0
     for i in range(0, len(d) - 4, 4):
         w = struct.unpack_from('<I', d, i)[0]
-        if w == 0xD500409F:
-            # msr PAN, #0（关闭保护）→ 无 PAN 的 CPU 上本来就是关闭的，等价于 nop
-            d[i:i + 4] = NOP
-            n += 1
-        elif w == 0xD500419F:
-            # msr PAN, #1（开启保护）→ 无 PAN 的 CPU 无法支持，忽略
+        if w in (0xD500409F, 0xD500419F):
             d[i:i + 4] = NOP
             n += 1
     return n
 
 
 def main() -> int:
-    if len(sys.argv) < 3:
+    argv = sys.argv[1:]
+    symbols = None
+    if '--symbols' in argv:
+        k = argv.index('--symbols')
+        symbols = argv[k + 1]
+        del argv[k:k + 2]
+    if len(argv) < 2:
         print(__doc__)
         return 2
-    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
-    with_validate = '--with-validate' in sys.argv or '--with-cpu-fakes' in sys.argv
-    with_fakes = '--with-cpu-fakes' in sys.argv or '--with-feature-fakes' in sys.argv
-    with_mrs = '--with-mrs1' in sys.argv or '--with-mrs0' in sys.argv or with_fakes
-    mrs_value = 1 if '--with-mrs1' in sys.argv else 0
-    with_trap = '--with-trapfix' in sys.argv or with_fakes
+    src, dst = Path(argv[0]), Path(argv[1])
+    with_validate = '--with-validate' in argv or '--with-cpu-fakes' in argv
+    with_fakes = '--with-cpu-fakes' in argv or '--with-feature-fakes' in argv
+    with_mrs = '--with-mrs1' in argv or '--with-mrs0' in argv or with_fakes
+    mrs_value = 1 if '--with-mrs1' in argv else 0
+    with_trap = '--with-trapfix' in argv or with_fakes
+
     d = bytearray(src.read_bytes())
     segs = segments(d)
+    syms = parse_symbols(symbols) if symbols else {}
+    if not symbols:
+        print('!! 没传 --symbols：脚本无法安全定位 serial_init / cons_ops_index / '
+              '输出开关（硬编码地址已经漂过），先停。')
 
-    n = patch_pan(d)
-    print(f'1) PAN 指令: {n} 条 → nop')
+    print(f'1) PAN 指令: {patch_pan(d)} 条 → nop')
 
     if with_validate:
-        off, seg = va_to_off(segs, VALIDATE_RET)
-        if off is not None:
+        off, seg = va_to_off(segs, VALIDATE_VA)
+        if off is None:
+            print('2) 找不到 CPU 校验点，跳过')
+        else:
             old = struct.unpack_from('<I', d, off)[0]
-            struct.pack_into('<I', d, off, 0x52800020)
-            print(f'2) CPU 校验返回值: 0x{old:08x} -> mov w0,#1')
+            if old == VALIDATE_OLD:
+                struct.pack_into('<I', d, off, 0x52800020)
+                print(f'2) CPU 校验返回值 @0x{VALIDATE_VA:x}: 0x{old:08x} -> mov w0,#1')
+            else:
+                print(f'2) 0x{VALIDATE_VA:x} 内容是 0x{old:08x}，不是预期的 '
+                      f'0x{VALIDATE_OLD:08x}，跳过（地址可能也漂了）')
     else:
         print('2) 跳过 CPU 校验伪造')
 
@@ -93,8 +150,6 @@ def main() -> int:
     for i in range(0, len(d) - 4, 4):
         w = struct.unpack_from('<I', d, i)[0]
         if (w & 0xFFFFFFE0) == 0xD5384260 and with_mrs:
-            # mrs xN, PAN → mov wN, #<mrs_value>
-            # A72 没有 PAN：读出来应当表示"保护未启用"（0）
             d[i:i + 4] = struct.pack('<I', 0x52800000 | (mrs_value << 5) | (w & 0x1F))
             m_ok += 1
         elif w == 0xE7FFDEFF and with_trap:
@@ -104,24 +159,44 @@ def main() -> int:
     print(f'3b) 0xE7FFDEFF trap → nop: {m_bad} 处' + ('' if with_trap else '（跳过）'))
 
     cnt = 0
-    for sym in SYM_DISABLE:
-        off, _ = va_to_off(segs, sym)
-        if off is not None:
-            d[off] = 0
-            cnt += 1
-    print(f'4) 输出开关: {cnt}/3 置 0')
+    for name in SYM_DISABLE:
+        va = syms.get(name) or syms.get(name.lstrip('_'))
+        if va is None:
+            print(f'   !! 符号缺失: {name}')
+            continue
+        off, seg = va_to_off(segs, va)
+        if off is None:
+            print(f'   !! {name}=0x{va:x} 不在任何段里')
+            continue
+        d[off] = 0
+        cnt += 1
+        print(f'   {name} @0x{va:x} -> 0')
+    print(f'4) 输出开关: {cnt}/{len(SYM_DISABLE)} 置 0')
 
-    off, seg = va_to_off(segs, SYM_SERIAL_INIT)
-    if off is not None:
-        struct.pack_into('<I', d, off, MOV_W0_0)
-        struct.pack_into('<I', d, off + 4, RET)
-        print(f'5) serial_init -> mov w0,#0; ret')
+    va = syms.get(SYM_SERIAL_INIT) or syms.get(SYM_SERIAL_INIT.lstrip('_'))
+    if va is None:
+        print(f'5) !! 符号缺失: {SYM_SERIAL_INIT}，跳过')
+    else:
+        off, seg = va_to_off(segs, va)
+        if off is None:
+            print(f'5) !! {SYM_SERIAL_INIT}=0x{va:x} 不在任何段里')
+        else:
+            old = struct.unpack_from('<I', d, off)[0]
+            struct.pack_into('<I', d, off, MOV_W0_0)
+            struct.pack_into('<I', d, off + 4, RET)
+            print(f'5) {SYM_SERIAL_INIT} @0x{va:x}: 0x{old:08x} -> mov w0,#0; ret')
 
-    off, seg = va_to_off(segs, SYM_CONS_OPS_INDEX)
-    if off is not None:
-        old = struct.unpack_from('<I', d, off)[0]
-        struct.pack_into('<I', d, off, 1)
-        print(f'6) cons_ops_index: {old} -> 1（视频控制台）')
+    va = syms.get(SYM_CONS_OPS_INDEX) or syms.get(SYM_CONS_OPS_INDEX.lstrip('_'))
+    if va is None:
+        print(f'6) !! 符号缺失: {SYM_CONS_OPS_INDEX}，跳过')
+    else:
+        off, seg = va_to_off(segs, va)
+        if off is None:
+            print(f'6) !! {SYM_CONS_OPS_INDEX}=0x{va:x} 不在任何段里')
+        else:
+            old = struct.unpack_from('<I', d, off)[0]
+            struct.pack_into('<I', d, off, 1)
+            print(f'6) {SYM_CONS_OPS_INDEX} @0x{va:x}: {old} -> 1（视频控制台）')
 
     dst.write_bytes(d)
     print(f'输出: {dst} ({dst.stat().st_size} B)')

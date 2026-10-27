@@ -121,14 +121,7 @@ def main() -> int:
         return 1
     print(f'已取出 {got} ({kernel.stat().st_size} B)')
 
-    print('== 打内核补丁')
-    # 必须用 patch-kernel-minimal.py 并带齐三组开关：patch-kernel-full.py 漏掉
-    # msr PAN,#0（0xD500409F，_copyout 里那条），那正是真机第一个 undefined instruction。
-    if run(['python3', SCRIPTS / 'patch-kernel-minimal.py', kernel, kernel,
-            '--with-validate', '--with-trapfix', '--with-mrs1']).returncode != 0:
-        return 1
-
-    print('== 打内核日志上屏补丁')
+    print('== 找符号表')
     sym = find_symbols(symbols, payload)
     if sym is None:
         print('   没找到 kernel-symbols.txt，改用 llvm-nm 从内核自己导出')
@@ -138,6 +131,18 @@ def main() -> int:
         print('   或显式传 --symbols <path>（CI 的 导出内核符号 步骤会生成它）')
         return 1
     print(f'   符号表: {sym}')
+
+    print('== 打内核补丁')
+    # 必须用 patch-kernel-minimal.py 并带齐三组开关：patch-kernel-full.py 漏掉
+    # msr PAN,#0（0xD500409F，_copyout 里那条），那正是真机第一个 undefined instruction。
+    # 而且它必须拿到符号表：serial_init / cons_ops_index / 三个输出开关在旧版里是
+    # 硬编码地址，内核一重新链接就去改坏别人的 vtable 和静态构造函数。
+    if run(['python3', SCRIPTS / 'patch-kernel-minimal.py', kernel, kernel,
+            '--symbols', sym,
+            '--with-validate', '--with-trapfix', '--with-mrs1']).returncode != 0:
+        return 1
+
+    print('== 打内核日志上屏补丁')
     if run(['python3', SCRIPTS / 'patch-init-screen-gc.py', kernel, kernel,
             '--symbols', sym]).returncode != 0:
         return 1

@@ -167,7 +167,28 @@ def main() -> int:
         if struct.unpack_from('<I', d, o + 4 * i)[0] == RET:
             rets.append(init + 4 * i)
     if not rets:
-        print('!! 函数体里找不到 ret')
+        # 可能已经打过补丁了：尾声被换成了 `b 跳板`。认一下跳板的样子。
+        for i in range((end - init) // 4):
+            va = init + 4 * i
+            w = struct.unpack_from('<I', d, o + 4 * i)[0]
+            if (w & 0xFC000000) != 0x14000000:
+                continue
+            imm = w & 0x3FFFFFF
+            if imm & 0x2000000:
+                imm -= 0x4000000
+            tgt = va + imm * 4
+            toff = va_to_off(segs, tgt)
+            if toff is None:
+                continue
+            w2 = struct.unpack_from('<5I', d, toff)
+            if w2[0] == 0xA9BF7BFD and w2[1] == 0x52800020 and w2[3] == 0xA8C17BFD:
+                bimm = w2[2] & 0x3FFFFFF
+                if bimm & 0x2000000:
+                    bimm -= 0x4000000
+                print(f'已经打过补丁：0x{va:x} b 0x{tgt:x}，'
+                      f'跳板里的 bl 目标是 0x{tgt + 8 + bimm * 4:x}，跳过')
+                return 0
+        print('!! 函数体里找不到 ret，也没有认出跳板')
         return 1
     print(f'  函数体里 {len(rets)} 个 ret，用最后一个 0x{rets[-1]:x}')
     ret_va = rets[-1]

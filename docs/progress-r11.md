@@ -4049,3 +4049,67 @@ PAN / CPU 校验 / 输出开关 / serial_init / cons_ops_index 那些按指令�
 
 又一个教训：`xcrun` 是 macOS 的东西，WSL 里没有（`/usr/bin/xcrun` 是个会报
 `exec: -f: invalid option` 的壳），本地一律用 `llvm-nm`。
+
+## 3.67 真正的元凶：`patch-kernel-minimal.py` 里 6 个硬编码地址也漂了（2026-10-27）
+
+上一刷（v20 内核 + 全套补丁）屏幕停在 `iBoot Stage 2 version:` 就死了。查下来
+不是 v20 的 ADMA2 代码有问题，而是**补丁打错了地方**。
+
+用 `llvm-nm` 的符号表（70148 行）一对，脚本里写死的地址在 2026-10-27 这版内核里
+全部落在别的东西上：
+
+| 常量 | 硬编码值 | 实际落在 | 正确地址（符号） |
+|---|---|---|---|
+| `SYM_DISABLE[0..2]` | `0x71F9B50/51/52` | `__ZTV17IOPowerConnection+0x1c8`（**C++ vtable**） | `_disable_serial_output 0x71FDB50`、`_disable_kprintf_output 0x71FDB51`、`_disable_iolog_serial_output 0x71FDB52` |
+| `SYM_SERIAL_INIT` | `0x793E724` | `__GLOBAL__sub_I_IOPMrootDomain.cpp+0x64` | `_serial_init 0x79424DC` |
+| `SYM_CONS_OPS_INDEX` | `0x7167920` | `_zone_security_array+0x998` | `_cons_ops_index 0x716B920` |
+
+后果：把 3 个 vtable 字节清零、把某个静态构造函数的头两条指令改成
+`mov w0,#0; ret`、往 zone 安全数组里写了 1。内核随即在
+`iBoot Stage 2 version:` 之后（正好开始跑 C++ 静态构造 / IOPMrootDomain）死掉，
+连 panic 都打不出来。
+
+这也解释了以前为什么一直没事：**那些内核的布局恰好与常量吻合**。`-v serial=3`
+那几轮能看到 `cons_ops_index: 1 -> 1`，就是因为值碰巧一样；一旦内核重新链接，
+`2 -> 1` 其实是"往别处写了 1"。
+
+### 3.67.1 改法
+
+`patch-kernel-minimal.py` 现在必须带 `--symbols`：
+
+* `_serial_init` / `_cons_ops_index` / 三个 `_disable_*` 全部按符号定位；
+* 找不到符号就**跳过并告警**，绝不退回硬编码地址（那只会改坏别人的 vtable）；
+* CPU 校验点保留 `0x49871A0`（在 `__PLK_TEXT_EXEC` 里，prelink 段地址稳定），
+  但加了内容断言：读出来不是 `0x12000260`（`and w0, w19, #1`）就跳过；
+* PAN / `mrs xN, PAN` / `0xE7FFDEFF` 本来就是全域按编码扫描，不受影响。
+
+`patch-payload-full.py` 改成**先**拿符号表、再依次喂给两个补丁脚本。
+
+### 3.67.2 验证（v20 内核，WSL）
+
+```
+1) PAN 指令: 24 条 → nop
+2) CPU 校验返回值 @0xfffffff0049871a0: 0x12000260 -> mov w0,#1
+3a) mrs xN,PAN → mov wN,#1: 14 处
+3b) 0xE7FFDEFF trap → nop: 1 处
+   _disable_serial_output @0xfffffff0071fdb50 -> 0
+   _disable_kprintf_output @0xfffffff0071fdb51 -> 0
+   _disable_iolog_serial_output @0xfffffff0071fdb52 -> 0
+4) 输出开关: 3/3 置 0
+5) _serial_init @0xfffffff0079424dc: 0xd10183ff -> mov w0,#0; ret
+6) _cons_ops_index @0xfffffff00716b920: 1 -> 1（视频控制台）
+```
+
+回读校验：`_serial_init` 开头变成 `00008052 c0035fd6`（`mov w0,#0; ret`）、三个
+`_disable_*` 各 1 字节为 0，而 `0x71F9B50`（vtable）保持原值 —— 说明这次没有误伤。
+
+### 3.67.3 教训（第二次栽同一类坑）
+
+"screencode 里写死的函数尾声地址"和"写死的全局变量地址"是同一个病。凡是
+`0xFFFFFFF00xxxxxxx` 这种常量，只要内核重编就会漂。规则：
+
+* 能按**符号**定位的（nm 里有名字）→ 一律符号；
+* 不能按符号定位的（编译器生成的尾声、prelink 里的无名点）→ 按**指令编码 +
+  上下文断言**定位，断言不过就跳过，绝不盲改；
+* 补丁脚本必须打印"改之前是什么、改完是什么、这个地址属于哪个符号"，出问题
+  第一眼就能看出来。
