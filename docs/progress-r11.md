@@ -3091,3 +3091,17 @@ delay probe: done (advanced=1920 ticks)      /* 100 us @ 19.2 MHz */
 | `reset: cleared after N polls` | 软复位通过 | 看 `bus:` 与 `clock:` |
 | `reset: never cleared` | 32 位写 0x2C 也不生效 | SDCC 复位被 SoC 侧保持，要看 CRG/复位控制器 |
 | `cardInit: OCR=...` | CMD 线通了 | 等 `CMD2/CMD3/CMD9` → `EXT_CSD ... SEC_COUNT` |
+
+### 3.52.5 v7 首轮 CI 编译错误（已修）
+
+`build-arm-driver.py` 用内核自己的编译配方，带 `-Werror -Wdeprecated-volatile` 和严格 C++ 语义，
+v7 第一版撞了两处：
+
+1. `-Wdeprecated-volatile`：`for (volatile uint32_t i = 0; ...; i++)` —— C++20 起对 volatile
+   自增已弃用。改成**非 volatile** 循环变量 + 循环体内 `__asm__ volatile ("yield")`
+   （asm volatile 保证循环不被优化掉）。
+2. `cannot jump from this goto statement to its label`：`start()` 里探针的
+   `uint64_t probeFreq / probeTicks` 声明在若干 `goto fail` 之后，C++ 禁止 goto 跳过带初始化
+   的局部变量。把探针整体套进一个 `{ ... }` 作用域即可（标签在作用域之外，不构成"跳进作用域"）。
+
+教训：这个驱动文件里 `goto fail` 很多，**新增局部变量一律放在函数开头或独立作用域里**。
