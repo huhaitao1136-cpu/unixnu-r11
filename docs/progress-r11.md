@@ -3256,3 +3256,88 @@ if (mode)        rate = rate * m / n;          /* mode = CFG[13:12] == 2 即 dua
 | `CMD1 transfer failed (i=0)` + `err=0001` | 还是超时：查 CMD 引脚/上拉、或 GCC 频率没生效 |
 | `cmd error … err=0004`（CRC） | 参数/CRC 设置问题（R3 不该带 CRC） |
 | `cardInit: CMD2 (cid)` 之后继续 | 识别链走通，只差 CMD3/CMD9/CMD16 |
+
+## 3.55 NativeSdhci v10：400 kHz 真的做到了，CMD1 仍超时 → 转向 vendor 侧模式/IO 电平（2026-10-27）
+
+### 3.55.1 v9 真机日志
+
+```
+NativeSdhci[v9]: state=01f800f0
+NativeSdhci[v9]: ver=02 caps=742dc8b2 caps1=0000008f
+NativeSdhci[v9]: delay probe: begin (cntfrq=19200000 …)  → done
+NativeSdhci[v9]: reset: assert=06 word 000f0007 -> 000f0007
+NativeSdhci[v9]: reset: cleared after 0 polls, word=000f0007
+NativeSdhci[v9]: bus: hostctl2=0000 word28=0000ff18 (1-bit, 3.3V)
+NativeSdhci[v9]: gcc: m/n/hid=1/48/0 -> 400000 Hz (cfg=00002000 m=00000001 n=000000d0 d=000000cf)
+NativeSdhci[v9]: clock: 400000 Hz (gcc m/n=1/48) int=000e0003 now=000e0005
+NativeSdhci[v9]: start: clock done
+NativeSdhci[v9]: cardInit: CMD0
+NativeSdhci[v9]: cardInit: CMD1 (op cond)
+NativeSdhci[v9]: cmd error int=0000 err=0001
+NativeSdhci[v9]: CMD1 transfer failed (i=0)
+NativeSdhci[v9]: card init failed at step 2 (state=01f800f0 err=0000)
+```
+
+- **GCC 那条路是对的**：回读 `cfg=00002000`（dual-edge、src=XO、hid=0）、`m=1`、
+  `n=0xd0`（反码 → 48）、`d=0xcf`（反码 → 48），自检算出 `400000 Hz`。
+  所以 §3.54 的"SDHCI 分频器无效、频率必须由 GCC 给"这个结论成立，并且已经跑通。
+- 但 CMD1 **还是 Command Timeout**（`err=0001`）。也就是说：频率对了、控制器活着、
+  复位干净，卡就是不吭声。
+
+### 3.55.2 下一个怀疑对象：vendor 侧的模式与 IO 电平
+
+`sdhci-msm.c` 的 `msm_hc_select_default()`（非 HS400 模式必须做的三件事）：
+
+```c
+config = readl(core_vendor_spec);
+config &= ~CORE_HC_MCLK_SEL_MASK;        /* bits 8..9 */
+config |= CORE_HC_MCLK_SEL_DFLT;         /* 2 << 8 = free running MCLK */
+writel(config, core_vendor_spec);
+
+config = readl(core_vendor_spec);
+config &= ~CORE_HC_SELECT_IN_EN;         /* bit 18 */
+config &= ~CORE_HC_SELECT_IN_MASK;       /* bits 19..21 */
+writel(config, core_vendor_spec);
+```
+
+同一份代码里 `msm_hc_select_hs400()` 会把 `CORE_HC_MCLK_SEL` 设成 **3**（free running MCLK/2）
+并打开 `HC_SELECT_IN`。ABL（LK）在启动 Android 时就是按 HS400/HS200 配的，
+**所以我们接手时控制器很可能还停在 HS400 的时钟路径上** ——
+在 400 kHz 下走那条路（MCLK/2 + DLL + HC_SELECT_IN）是没有可用时钟输出的，
+卡自然一声不响。这解释了为什么"频率读起来是 400 kHz，但 CMD 没有响应"。
+
+IO 电平同理：R11 的 VCCQ 是 1.8V。`sdhci_msm_handle_pwr_irq()` 的逻辑是
+
+```c
+if ((io_level & REQ_IO_HIGH) && (caps_0 & CORE_3_0V_SUPPORT))
+        new_config &= ~CORE_IO_PAD_PWR_SWITCH;     /* 3.0V */
+else if ((io_level & REQ_IO_LOW) || (caps_0 & CORE_1_8V_SUPPORT))
+        new_config |= CORE_IO_PAD_PWR_SWITCH;      /* 1.8V */
+```
+
+`CORE_IO_PAD_PWR_SWITCH`（VENDOR_SPEC bit16）如果留在 3.0V，控制器的输入门限按 3.0V 判，
+卡在 1.8V 上拉回来的高电平会被读成低电平 —— 同样表现为"没有响应"。
+
+### 3.55.3 v10 改动
+
+1. 新增 `configureVendorSpec()`（在 `ver=` 探活之后、`softReset` 之前调用）：
+   - 打印 `CORE_MCI_VERSION`(0x318，core major/minor)、`CORE_VENDOR_SPEC`(0x20c)、
+     `CORE_VENDOR_SPEC_CAP0`(0x21c)、`CORE_VENDOR_SPEC3`(0x250)、`CORE_MCI_STATUS`(0x324)；
+   - `MCLK_SEL = DFLT(2)`，清 `HC_SELECT_IN_EN` 与 `HC_SELECT_IN`；
+   - `caps0 & CORE_1_8V_SUPPORT` 时置 `CORE_IO_PAD_PWR_SWITCH`（1.8V）；
+   - 清 `CORE_VENDOR_SPEC3` 的 `CORE_PWRSAVE_DLL`(bit3)；
+   - 回读并打印 `io18 / mclk_sel / select_in`，屏幕上一眼可查。
+2. CMD1 失败不再立刻返回：最多重试 3 次，每次打印
+   `CMD1 failed (n) state=%08x norm=%04x err=%04x mstat=%08x`，
+   把 `CORE_MCI_STATUS` 也带出来（下次就能看出是"卡没响应"还是"控制器内部状态"）。
+
+### 3.55.4 判读表（v10）
+
+| 屏幕出现 | 结论 |
+|---|---|
+| `vendor: mci=… (core 1.xx) vs0=… caps0=…` | 能读到 vendor 寄存器，说明映射/memCount=0 的常量没错 |
+| `vendor: io18=1 mclk_sel=2 select_in=0` | 模式与 IO 电平已按默认模式配置 |
+| `io18=0` | caps0 没报 1.8V 支持，需要手工置 bit16 再试 |
+| `cardInit: OCR=…` | **CMD1 通了** |
+| `CMD1 failed (n) … err=0001` 三次 | 卡确实没在 CMD 线上应答 → 下一步查供电/引脚/时钟是否真的到卡 |
+| `CMD1 failed … err=0004` | CRC/索引错 → 响应有了，参数或标志要修 |

@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v9"
+#define kSdhciTag         "v10"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -77,6 +77,24 @@
 #define GCC_SDCC1_AHB_CBCR  0x16008U
 #define GCC_SDCC1_ICE_CBCR  0x1600cU
 #define GCC_SDCC1_APPS_RCGR 0x1602cU
+
+/* ---- Qualcomm SDCC 的 vendor 寄存器（相对 core 基址 0xC0C4000，见 sdhci-msm.c
+ *      的 sdhci_msm_v5_offset）---- */
+#define CORE_VENDOR_SPEC           0x20cU
+#define CORE_VENDOR_SPEC3          0x250U
+#define CORE_VENDOR_SPEC_CAP0      0x21cU
+#define CORE_MCI_VERSION_REG       0x318U
+#define CORE_MCI_STATUS_REG        0x324U
+#define CORE_HC_MCLK_SEL_MASK      (3U << 8)
+#define CORE_HC_MCLK_SEL_DFLT      (2U << 8)   /* 默认：free running MCLK */
+#define CORE_HC_MCLK_SEL_HS400     (3U << 8)   /* HS400：free running MCLK/2 */
+#define CORE_HC_SELECT_IN_EN       (1U << 18)
+#define CORE_HC_SELECT_IN_MASK     (7U << 19)
+#define CORE_IO_PAD_PWR_SWITCH_EN  (1U << 15)
+#define CORE_IO_PAD_PWR_SWITCH     (1U << 16)  /* 置 1 = IO 走 1.8V */
+#define CORE_3_0V_SUPPORT          (1U << 25)
+#define CORE_1_8V_SUPPORT          (1U << 26)
+#define CORE_PWRSAVE_DLL           (1U << 3)   /* 在 VENDOR_SPEC3 里 */
 
 #define GCC_RCG_CMD          0x00U
 #define GCC_RCG_CFG          0x04U
@@ -260,6 +278,7 @@ private:
     bool     enableGccClocks ();
     bool     softReset (uint32_t which, uint32_t loops);
     bool     setBusPowerAndClock ();
+    bool     configureVendorSpec ();
     bool     setGccSdccRate (uint32_t m, uint32_t n, uint32_t hidDiv);
     bool     setBusClock (uint32_t hz);
     bool     cardInit ();
@@ -582,6 +601,51 @@ bool NativeSdhci::setBusPowerAndClock ()
 
     /* 识别阶段 400 kHz：靠 GCC 的 M/N(=1/48) 得到，SDHCI 分频器在本平台上无效 */
     return setBusClock (400000);
+}
+
+/* Qualcomm SDCC 的"默认模式"配置，照抄 sdhci-msm.c 的 msm_hc_select_default()：
+ *  - CORE_HC_MCLK_SEL 必须是 DFLT(2)，HS400 的 (3) 是 free running MCLK/2；
+ *    ABL 交接时控制器可能还停在 HS400 路径上，400 kHz 走那条路是没有输出的。
+ *  - CORE_HC_SELECT_IN_EN / MASK 要清零，让 Host Control2 的 UHS 位说了算。
+ *  - IO 电平：R11 的 VCCQ 是 1.8V，CORE_1_8V_SUPPORT 置位时 IO_PAD_PWR_SWITCH 要置 1，
+ *    否则控制器的输入门限按 3.0V 判，卡在 1.8V 上拉回来的高电平会被读成低电平。
+ *  - CORE_PWRSAVE_DLL（VENDOR_SPEC3 bit3）清掉，避免 MCLK 门控时序问题。 */
+bool NativeSdhci::configureVendorSpec ()
+{
+    uint32_t vs0   = sdhciRead32 (fCore, CORE_VENDOR_SPEC);
+    uint32_t caps0 = sdhciRead32 (fCore, CORE_VENDOR_SPEC_CAP0);
+    uint32_t vs3   = sdhciRead32 (fCore, CORE_VENDOR_SPEC3);
+    uint32_t mci   = sdhciRead32 (fCore, CORE_MCI_VERSION_REG);
+    uint32_t mstat = sdhciRead32 (fCore, CORE_MCI_STATUS_REG);
+    IOLog ("NativeSdhci[" kSdhciTag "]: vendor: mci=%08x (core %u.%02x) vs0=%08x caps0=%08x vs3=%08x mstat=%08x\n",
+           mci, (mci >> 28) & 0xF, mci & 0xFF, vs0, caps0, vs3, mstat);
+
+    uint32_t next = vs0;
+    next &= ~CORE_HC_MCLK_SEL_MASK;
+    next |= CORE_HC_MCLK_SEL_DFLT;
+    next &= ~CORE_HC_SELECT_IN_EN;
+    next &= ~CORE_HC_SELECT_IN_MASK;
+
+    bool io18 = (caps0 & CORE_1_8V_SUPPORT) != 0;
+    if (io18) {
+        next |= CORE_IO_PAD_PWR_SWITCH;
+    } else {
+        next &= ~CORE_IO_PAD_PWR_SWITCH;
+    }
+    if (next != vs0) {
+        sdhciWrite32 (fCore, CORE_VENDOR_SPEC, next);
+    }
+
+    uint32_t next3 = vs3 & ~CORE_PWRSAVE_DLL;
+    if (next3 != vs3) {
+        sdhciWrite32 (fCore, CORE_VENDOR_SPEC3, next3);
+    }
+
+    uint32_t vs0Now = sdhciRead32 (fCore, CORE_VENDOR_SPEC);
+    uint32_t vs3Now = sdhciRead32 (fCore, CORE_VENDOR_SPEC3);
+    IOLog ("NativeSdhci[" kSdhciTag "]: vendor: io18=%u mclk_sel=%u select_in=%u vs0=%08x vs3=%08x\n",
+           io18 ? 1 : 0, (vs0Now >> 8) & 3, (vs0Now >> 19) & 7, vs0Now, vs3Now);
+    return true;
 }
 
 /* GCC 里 sdcc1_apps_clk_src 的输出频率按 clk-rcg2.c 的 calc_rate 反推：
@@ -997,13 +1061,23 @@ bool NativeSdhci::cardInit ()
     native_sdhci_step = 2;
     IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 (op cond)\n");
     bool ready = false;
+    uint32_t fails = 0;
     for (uint32_t i = 0; i < 1000; i++) {
         /* CMD1 的响应是 R3：**没有 CRC**。带 SDHCI_CMD_CRC 会被当成 CRC 错；
          * 参数 0x40FF8000 = HCS(bit30, 支持高容量) + OCR 电压窗 3.2–3.4V。 */
         if (!sendCommand (MMC_SEND_OP_COND, 0x40FF8000U,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_INDEX, resp)) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD1 transfer failed (i=%u)\n", i);
-            return false;
+            fails++;
+            IOLog ("NativeSdhci[" kSdhciTag "]: CMD1 failed (%u) state=%08x norm=%04x err=%04x mstat=%08x\n",
+                   fails, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+                   sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS),
+                   sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
+                   sdhciRead32 (fCore, CORE_MCI_STATUS_REG));
+            if (fails >= 3) {
+                return false;
+            }
+            sdhciDelayUs (10000);
+            continue;
         }
         if (resp[0] & 0x80000000U) {
             ready = true;
@@ -1158,6 +1232,9 @@ bool NativeSdhci::start (IOService *provider)
         IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%08x%08x)\n",
                (uint32_t) (delta >> 32), (uint32_t) delta);
     }
+
+    /* 先把 vendor 侧的模式/IO 电平拨回"默认模式"（ABL 可能留着 HS400 配置） */
+    configureVendorSpec ();
 
     /* 只复位 CMD/DATA 状态机：全复位会关掉卡时钟并且在本平台卡住（v7 实测） */
     IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (CMD|DATA, 0x2C word)\n");
