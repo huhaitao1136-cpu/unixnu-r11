@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v10"
+#define kSdhciTag         "v11"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -765,15 +765,27 @@ bool NativeSdhci::setBusClock (uint32_t hz)
 bool NativeSdhci::waitCommandComplete ()
 {
     for (uint32_t i = 0; i < kSdhciCmdLoops; i++) {
-        uint16_t status = sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) {
-            uint16_t err = sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS);
-            sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, err);
-            IOLog ("NativeSdhci[" kSdhciTag "]: cmd error int=%04x err=%04x\n", status, err);
-            return false;
+        /* 0x30(Normal) 与 0x32(Error) 是相邻的两个 16 位寄存器，用一次对齐 32 位读
+         * 就能同时拿到：低 16 位 = NIS，高 16 位 = EIS。
+         * 单独做 16 位读在这颗 MSM 控制器上不可靠 —— v10 实测出现过
+         * "NIS 的 error 汇总位亮了、EIS 却读出 0" 的自相矛盾结果。 */
+        uint32_t word = sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS);
+        uint16_t nis = (uint16_t) (word & 0xFFFFu);
+        uint16_t eis = (uint16_t) (word >> 16);
+        if (nis & SDHCI_INT_ERROR) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: cmd error word=%08x nis=%04x eis=%04x\n",
+                   word, nis, eis);
+            if (eis) {
+                sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, eis);
+                sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR);
+                return false;
+            }
+            /* 汇总位亮了但 EIS 全 0：没有真正的错误源，按"命令已完成"继续往下走，
+             * 真有问题的命令会在下面的 RESPONSE/数据阶段暴露出来。 */
         }
-        if (status & SDHCI_INT_RESPONSE) {
-            sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_RESPONSE);
+        if (nis & SDHCI_INT_RESPONSE) {
+            sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS,
+                          SDHCI_INT_RESPONSE | SDHCI_INT_ERROR);
             return true;
         }
         sdhciDelayUs (1);
@@ -1078,6 +1090,10 @@ bool NativeSdhci::cardInit ()
             }
             sdhciDelayUs (10000);
             continue;
+        }
+        if (i < 3 || (i % 100) == 0) {
+            IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 resp[%u]=%08x state=%08x\n",
+                   i, resp[0], sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
         }
         if (resp[0] & 0x80000000U) {
             ready = true;

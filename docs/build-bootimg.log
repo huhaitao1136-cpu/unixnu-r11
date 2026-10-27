@@ -1,3 +1,3 @@
 unixnu: developed and tested on macOS only; the kernel step needs Xcode and --skip-setup needs hdiutil
 == bootimg
-== bootimg: /root/src/UniXNU/out/r11/boot/boot.img (14508032 bytes)
+== bootimg: /root/src/UniXNU/out/r11/boot/boot.img (14475264 bytes)
