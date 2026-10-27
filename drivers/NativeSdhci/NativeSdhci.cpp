@@ -53,7 +53,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v16"
+#define kSdhciTag         "v17"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -602,13 +602,13 @@ bool NativeSdhci::setBusPowerAndClock ()
     uint32_t hostCtrl = hostWord & 0xFFu;
     hostCtrl &= ~(uint32_t) (SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);
 
-    /* ABL 交接时把 HOST_CONTROL 的 DMA Select 配成了 ADMA2(64-bit)（v6~v14 实测 0x18）。
-     * 我们全程用 PIO（TRANSFER_MODE 的 DMA Enable = 0），但 DMA Select 非 0 时
-     * MSM 的数据引擎仍会去 SDHCI_ADMA_ADDRESS(0x58) 取描述符，而那里是 ABL 留下的
-     * 野指针 —— 数据阶段会挂住、永远不产生 DATA_END（v13/v14 的
-     * `data timeout nis=0020 state=01f00af6`）。这里把 DMA Select(bits 3-4) 与
-     * 扩展 DMA 位(bit5) 一起清零，强制 SDMA/PIO 语义。 */
-    hostCtrl &= ~(uint32_t) (0x18u | 0x20u);
+    /* ABL 交接时 HOST_CONTROL 的 DMA Select 是 ADMA2(64-bit)（实测 0x18）。
+     * v15 试过清零（期望强制 PIO），真机结果反而更糟：CMD8 一发出整机静默，
+     * 连命令阶段的日志都出不来 —— 说明 MSM 在 DMA Select=SDMA(00) 时会真的启动
+     * SDMA 引擎去 0x58 里的野指针搬运，把 AHB 挂死。所以这里**保持**原值，
+     * 改成每次数据命令前把 0x58 清零（见 sendCommand）。 */
+    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%02x (DMA select=%u, keep as-is)\n",
+           hostCtrl & 0xFFu, (hostCtrl >> 3) & 0x3u);
 
     uint16_t hostCtrl2 = sdhciRead16 (fCore, SDHCI_HOST_CONTROL2);
     hostCtrl2 &= (uint16_t) ~(SDHCI_CTRL_VDD_180 | SDHCI_CTRL_UHS_MASK);
@@ -853,6 +853,8 @@ bool NativeSdhci::waitTransferComplete ()
 
 bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uint32_t *resp)
 {
+    const bool isData = (flags & SDHCI_CMD_DATA) != 0;
+
     /* 等 CMD/DATA 线空闲（上一次传输还没收尾时不能发新命令） */
     for (uint32_t i = 0; i < kSdhciCmdLoops; i++) {
         if (!(sdhciRead32 (fCore, SDHCI_PRESENT_STATE) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT))) {
@@ -861,16 +863,35 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
         sdhciDelayUs (1);
     }
 
+    if (isData) {
+        /* MSM 的 SDMA/ADMA 地址寄存器（0x58）在 ABL 之后是野值。DMA Enable 虽然是 0，
+         * 但保险起见每次数据命令之前清零，避免控制器拿野指针去搬运。 */
+        sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, 0);
+        IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u pre state=%08x adma=%08x\n",
+               index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
+               sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
+    }
+
     sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
     sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, 0xFFFF);
     sdhciWrite32 (fCore, SDHCI_ARGUMENT, arg);
     sdhciWrite16 (fCore, SDHCI_COMMAND, SDHCI_MAKE_CMD (index, flags));
+
+    if (isData) {
+        /* 打出这一行就说明"写 COMMAND 寄存器"本身没有把总线挂死 */
+        IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u posted state=%08x\n",
+               index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
+    }
 
     if ((flags & SDHCI_CMD_RESP_MASK) == SDHCI_CMD_RESP_NONE) {
         return true;
     }
     if (!waitCommandComplete ()) {
         return false;
+    }
+    if (isData) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u complete state=%08x\n",
+               index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     }
     if (resp) {
         resp[0] = sdhciRead32 (fCore, SDHCI_RESPONSE + 0);

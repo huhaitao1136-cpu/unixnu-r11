@@ -3721,3 +3721,48 @@ CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff00 attempt=0
 | `pio word 0 state=…` 后 `pio read starved at word 1` | 只有 1 个字出来：DAT0 上有数据但没持续 |
 | `pio read 128 words state=…` 且 bit11 为 0 | 数据搬完了，接下来只差 DATA_END |
 | `EXT_CSD rev=8 SEC_COUNT=…` | 数据阶段通了 |
+
+## 3.62 NativeSdhci v16 真机结果：清 DMA Select 反而更糟 —— 命令阶段就挂死（2026-10-27）
+
+### 3.62.1 屏幕日志（v16，等了 7 分钟仍是这一屏）
+
+```
+start: probing media at 400 kHz
+CMD8 setup blksz=0200 cnt=0001 mode=0012 word28=0000ff00 attempt=0
+                                                        <- 没有 "CMD8 ok"，也没有 "CMD8 failed"
+```
+
+### 3.62.2 结论：v15 的"清 DMA Select"是负优化
+
+| 版本 | word28 | 现象 |
+|---|---|---|
+| v13 / v14 | `0000ff18`（DMA Select = ADMA2-64） | 命令阶段通过，数据阶段 `data timeout nis=0020` |
+| v15 / v16 | `0000ff00`（DMA Select = SDMA） | **CMD8 一发出就整机静默** |
+
+也就是说，MSM 的 SDCC 在 `DMA Select = 00`（SDMA）时会**真的启动 SDMA 引擎**，
+拿 `SDHCI_ADMA_ADDRESS(0x58)` 里的野值（ABL 留下的地址）去做总线搬运，直接把 AHB 挂死。
+而 `DMA Select = 11`（ADMA2）时代码虽然没配描述符，控制器反而没动手。
+这与"我们没有配置任何 DMA 缓冲区"的处境一致：**既不能开 DMA，也不能把选择位拨到 SDMA**。
+
+### 3.62.3 v17 改动
+
+1. **恢复** `HOST_CONTROL` 的 DMA Select（不再清零），改为打印
+   `bus: hostctl=18 (DMA select=3, keep as-is)`。
+2. 每次**数据命令**之前把 `SDHCI_ADMA_ADDRESS(0x58)` 清零，并打
+   `cmd%u pre state=%08x adma=%08x` —— 排除"野指针"这条通路。
+3. `sendCommand()` 给数据命令加三段探针：
+   * `cmd%u pre state=…`（等 inhibit 之后、写寄存器之前）
+   * `cmd%u posted state=…`（刚写完 COMMAND 寄存器）
+   * `cmd%u complete state=…`（命令完成中断之后）
+   这三行能精确区分"写 COMMAND 挂死"、"命令永不完成"、"命令完成但数据不开始"。
+4. `kSdhciTag` = `v17`。
+
+### 3.62.4 下一刷的判读表
+
+| 屏幕最后一行 | 结论 |
+|---|---|
+| `cmd8 pre state=…` 之后停住 | 写 NIS/EIS/ARGUMENT/COMMAND 其中之一挂死（AHB 层面） |
+| `cmd8 posted` 之后停住 | 控制器接受命令后立刻挂死：数据引擎被启动（DMA/电源/时钟门控） |
+| `cmd8 complete` 之后停住 | 命令完成，卡在数据 FIFO（回到 v14 的问题） |
+| `CMD8 ok … adma=00000000` | 命令与野指针都排除了，问题纯粹在数据通路 |
+| `EXT_CSD rev=8 SEC_COUNT=…` | 通了 |
