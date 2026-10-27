@@ -23,6 +23,7 @@
  */
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 /* 内核头文件里没有 IOMemoryMap.h（只有 IOUSer 的）；IOMemoryMap 由
@@ -1055,13 +1056,9 @@ bool NativeSdhci::setupDmaMemory ()
 
     IOByteCount descLen = 0;
     IOByteCount dataLen = 0;
-/* getPhysicalSegment 在部分 SDK 里带 deprecated 标记；这里确实要用物理地址，
- * 而且它是最直接的接口，所以就地关掉这条告警（CI 用 -Werror）。 */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    fDmaDescPhys = fDmaDesc->getPhysicalSegment (0, &descLen, kIODirectionOut);
-    fDmaDataPhys = fDmaData->getPhysicalSegment (0, &dataLen, kIODirectionOut);
-#pragma clang diagnostic pop
+    /* 第三个参数是 IOOptionBits（不是 IODirection），0 = 走默认映射 */
+    fDmaDescPhys = (IOPhysicalAddress) fDmaDesc->getPhysicalSegment (0, &descLen, 0);
+    fDmaDataPhys = (IOPhysicalAddress) fDmaData->getPhysicalSegment (0, &dataLen, 0);
     IOLog ("NativeSdhci[" kSdhciTag "]: dma: desc va=%p phys=%08llx len=%llu / data va=%p phys=%08llx len=%llu\n",
            fDmaDesc->getBytesNoCopy (), (unsigned long long) fDmaDescPhys,
            (unsigned long long) descLen, fDmaData->getBytesNoCopy (),
