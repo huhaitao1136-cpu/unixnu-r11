@@ -4636,3 +4636,72 @@ after 318: 1000006b 00000000 00f04003 0007f800
 | 仍然全 0，且 `diff` 显示 `20c` 没变 | 写 `IO_PAD_PWR_SWITCH` 被硬件忽略 → 转 TLMM（`0x03000000`）查 DAT 引脚配置 |
 | 仍然全 0，`diff` 里 `2c` 掉到 `000e0003` | `CARD_CLK_EN` 被清 → 时钟在命令后掉了，需在命令前重开 |
 
+## 3.76 NativeSdhci v29：电源与 IO pad 都补上了，数据仍不来 → 按 SDR 模式重配数据通路
+
+### 3.76.1 v28 真机结果（关键读数）
+
+```
+after key host28=0000ff18 clk2c=000e0007 state24=01f80af6
+after key dll200=0705642c dllst208=0000001c vs20c=00018a0e
+after key pwr240=00000000 pwr24c=00000001 ddr25c=00004073 mstat324=0007f800
+bus[cmd8] host28=0000ff18 -> 0000ff18 vs0=00018a0e -> 00018a0e
+diff after (only changed regs)
+after 000: 00020000 -> 00010000
+after 00c: 0d020003 -> 0d1a0012
+after 010: 00000000 -> 00000900
+after 024: 01f800f0 -> 01f80af6
+after 028: 00006030 -> 0000ff10
+after 02c: 000f0007 -> 000e0007
+after 034: 07ff003f -> fffff7ff
+after 03c: 00030000 -> 00000000
+after 20c: 00240a0e -> 00018a0e
+after 304: 00000000 -> 0000000c
+after 308: 00000000 -> 00000200
+after 324: 00007800 -> 0007f800
+after changed=12/43
+```
+
+| 结论 | 依据 |
+|---|---|
+| IO pad EN 补上了 | `vs20c` 从 `0x00010a0e` 变成 `0x00018a0e`（bit15 \| bit16 都在） |
+| 总线电源补上了 | `host28` 的次字节不再是 0（`0000ff18`） |
+| 时钟一直是好的 | `clk2c=000e0007`：`INT_CLK_STABLE=1`、`CARD_CLK_EN=1` |
+| 命令通道一直是好的 | `CMD8 r1=00000900 current_state=4 (tran)` |
+| **数据仍然 0 字节** | `pio got 512 words … first=00000000`、`data timeout nis=0000 eis=0000` |
+| DDR 配置还是 ABL 的 HS400 值 | `ddr25c=0x00004073` |
+
+### 3.76.2 转向"数据接收路径"
+
+命令通道通、数据通道死，说明问题在 MSM 内部**采数路径**（不是引脚、不是时钟、不是供电）。
+Linux `sdhci-msm.c` 对默认速（非 tuning）模式做三件我们没做的事：
+
+1. `sdhci_msm_set_cdr(host, false)`（:1165-1184）：
+   `config &= ~CORE_CDR_EN (bit17)`，`config |= CORE_CDR_EXT_EN (bit19)`。
+2. `CORE_DDR_CONFIG(0x25C)`：Linux 注释（:1016-1027）明确"该寄存器 POR 默认值就是
+   SDR 要的配置，bootloader 改过就要写回去"。我们现在拿 ABL 的 HS400 值（`0x4073`）跑 SDR。
+3. `CORE_CLK_PWRSAVE(bit1, VENDOR_SPEC)`：`vs0=0x00018a0e` 里 bit1=1，空闲时允许门控 MCLK；
+   数据阶段需要 MCLK 连续。
+
+### 3.76.3 v29 改动
+
+全塞进 `ensureBusState()`（每次 CMD8/CMD17 前都会跑），三处写都带 before→after：
+
+* `0x200 DLL_CONFIG`：清 bit17、置 bit19；
+* `0x25C DDR_CONFIG`：写 0；
+* `0x20C VENDOR_SPEC`：清 bit1（`CORE_CLK_PWRSAVE`）。
+
+新增日志：
+```
+path[cmd8] dll=0705642c -> … ddr=00004073 -> … vs0=… -> …
+```
+
+### 3.76.4 下一刷判读表
+
+| 现象 | 结论 |
+|---|---|
+| `path[cmd8] dll` 的 bit19 置上了、`ddr` 变 00000000 | 三处写都被硬件接受 |
+| `dll` 写不进去（读回原值） | 需要先置 `CORE_DLL_PDN/RST` 再改 → 补 DLL 复位序列 |
+| `ddr` 写不进去 | `0x25C` 在这个 core 版本是只读的，改走 `core_ddr_config_old`(0x1b8) |
+| `pio got` 里出现非 0 字 | **数据通了**，接着看 `w52/w53`（`SEC_COUNT`） |
+| 仍然全 0 | 采数路径还是错，下一步把 `CORE_HC_SELECT_IN` 显式设成 1(2^0) / 2 / 4 逐个试，并读 DLL_STATUS 的 lock 位 |
+

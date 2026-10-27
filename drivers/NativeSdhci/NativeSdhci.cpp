@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v28"
+#define kSdhciTag         "v29"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1091,9 +1091,33 @@ void NativeSdhci::ensureBusState (const char *why)
         sdhciWrite32 (fCore, 0x20Cu, want);
     }
 
+    /* 3) 数据接收路径：SDR/默认速模式要"关 CDR、开 CDR_EXT"（Linux sdhci_msm_set_cdr(false)） */
+    uint32_t dll    = sdhciRead32 (fCore, 0x200u);            /* CORE_DLL_CONFIG   */
+    uint32_t dllNew = (dll & ~(1u << 17)) | (1u << 19);       /* ~CDR_EN | CDR_EXT_EN */
+    if (dllNew != dll) {
+        sdhciWrite32 (fCore, 0x200u, dllNew);
+    }
+
+    /* 4) CORE_DDR_CONFIG 被 ABL 按 HS400 配过（0x4073），SDR 读要用复位默认值 */
+    uint32_t ddr    = sdhciRead32 (fCore, 0x25Cu);
+    if (ddr != 0) {
+        sdhciWrite32 (fCore, 0x25Cu, 0);
+    }
+
+    /* 5) 关掉 VENDOR_SPEC 的 CORE_CLK_PWRSAVE(bit1)，数据阶段需要 MCLK 连续 */
+    uint32_t vs0b    = sdhciRead32 (fCore, 0x20Cu);
+    uint32_t vs0bNew = vs0b & ~(1u << 1);
+    if (vs0bNew != vs0b) {
+        sdhciWrite32 (fCore, 0x20Cu, vs0bNew);
+    }
+
     IOLog ("NativeSdhci[" kSdhciTag "]: bus[%s] host28=%08x -> %08x vs0=%08x -> %08x\n",
            why, word, sdhciRead32 (fCore, SDHCI_HOST_CONTROL),
            vs0, sdhciRead32 (fCore, 0x20Cu));
+    IOLog ("NativeSdhci[" kSdhciTag "]: path[%s] dll=%08x -> %08x ddr=%08x -> %08x vs0=%08x -> %08x\n",
+           why, dll, sdhciRead32 (fCore, 0x200u),
+           ddr, sdhciRead32 (fCore, 0x25Cu),
+           vs0b, sdhciRead32 (fCore, 0x20Cu));
 }
 
 bool NativeSdhci::readCsd ()
