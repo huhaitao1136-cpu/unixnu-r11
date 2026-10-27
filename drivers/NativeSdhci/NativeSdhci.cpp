@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v26"
+#define kSdhciTag         "v27"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -300,6 +300,7 @@ private:
     bool     endDmaRead (void *dst, UInt32 bytes);
     bool     readCsd ();
     bool     logCardStatus (const char *who);   /* v26: CMD13，问卡在什么状态 */
+    void     dumpRegs (const char *tag);        /* v27: 全表 dump，找数据路径缺的那块 */
     bool     readExtCsd ();
     bool     probeMedia ();
 
@@ -1013,6 +1014,24 @@ bool NativeSdhci::logCardStatus (const char *who)
     return true;
 }
 
+void NativeSdhci::dumpRegs (const char *tag)
+{
+    /* 全部 4 字节对齐的偏移 —— 错位 32 位读会把 AHB 挂死（见 docs §3.50） */
+    IOLog ("NativeSdhci[" kSdhciTag "]: ===== dump %s: core 0x000..0x0FC =====\n", tag);
+    for (uint32_t base = 0x000; base <= 0x0F0; base += 0x10) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x %08x %08x %08x\n", tag,
+               base, sdhciRead32 (fCore, base + 0x0), sdhciRead32 (fCore, base + 0x4),
+               sdhciRead32 (fCore, base + 0x8), sdhciRead32 (fCore, base + 0xC));
+    }
+
+    IOLog ("NativeSdhci[" kSdhciTag "]: ===== dump %s: vendor 0x200..0x330 =====\n", tag);
+    for (uint32_t base = 0x200; base <= 0x330; base += 0x10) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x %08x %08x %08x\n", tag,
+               base, sdhciRead32 (fCore, base + 0x0), sdhciRead32 (fCore, base + 0x4),
+               sdhciRead32 (fCore, base + 0x8), sdhciRead32 (fCore, base + 0xC));
+    }
+}
+
 bool NativeSdhci::readCsd ()
 {
     uint32_t resp[4] = {0, 0, 0, 0};
@@ -1278,6 +1297,7 @@ bool NativeSdhci::readExtCsd ()
 
         if (!ok) {
             (void) logCardStatus ("after CMD8 data failure");
+            dumpRegs ("after");
             recoverCommandState ("after CMD8 data failure");
             continue;
         }
@@ -1598,6 +1618,11 @@ bool NativeSdhci::start (IOService *provider)
         goto fail;
     }
     logGccState ();
+
+    /* v27：时钟已经打开、但还没有写过任何 SDCC 寄存器 —— 此刻的寄存器状态就是
+     * ABL 交接时的状态（ABL 自己能在 HS400 上读 eMMC，所以这份是"能工作"的配置）。
+     * 存证之后，数据阶段失败时再 dump 一次，两份对比就知道差在哪。 */
+    dumpRegs ("abl");
 
     /* 第一次触 SDCC：先用 32 位、4 字节对齐的 PRESENT_STATE(0x24) 探活，
      * 再用 16 位读 HOST_VERSION(0xFE)。v3/v4 在这里用 32 位读 0xFE 是错位访问，

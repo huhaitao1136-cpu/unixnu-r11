@@ -4492,3 +4492,78 @@ eMMC 在 R1 里报告 `CARD_IS_LOCKED`、`ILLEGAL_COMMAND`、`ADDRESS_OUT_OF_RAN
 | `CMD8 r1` 的 bit5(`ILLEGAL_COMMAND`) 置位 | 卡不认 CMD8，或 RCA 不对 | 重做 CMD3（发新 RCA）/检查 `fRca` |
 | `CMD8 r1` 的 bit25(`CARD_IS_LOCKED`) 置位 | 卡被锁 | 需要先解密码，这条基本走死 |
 | `status(...) CMD13 failed` | 连 CMD13 都发不出去 | 回到命令线/时钟问题 |
+
+## 3.74 NativeSdhci v27：卡说"我在 tran、准备好"，数据却不在总线上 → 存证 ABL 的寄存器状态（2026-10-27）
+
+### 3.74.1 v26 真机结果：R1 干净，数据线全空闲
+
+```
+cmd8 complete state=01f80af6
+CMD8 r1=00000900 current_state=4 (tran)
+trace 0..7 state=01f80af6 nis=00000000
+CMD8 ok state=01f80af6 nis=00000000 eis=00000000 adma=00000000
+pio got 512 words (block=128) first=00000000 00000000 00000000 00000000 last=00000000
+data timeout nis=0000 eis=0000 state=01f80af6
+ext w0=00000000 w1=00000000 w52=00000000 w53=00000000 w126=00000000 w127=00000000 drained=0
+EXT_CSD transfer failed (attempt 0)
+status(after CMD8 data failure) r1=00000900 current_state=4 (tran) ready=1
+CMD17 r1=00000900 current_state=4 (tran)
+```
+
+`R1 = 0x00000900`：
+
+| 位 | 含义 | 值 |
+|---|---|---|
+| bit8 | `READY_FOR_DATA` | 1 |
+| bits12..9 | `CURRENT_STATE` | 4 = tran |
+| bit5 | `ILLEGAL_COMMAND` | 0 |
+| bit25 | `CARD_IS_LOCKED` | 0 |
+
+卡自认为处于传输态、准备好了、没有任何错误。控制器一侧同样"正常"：
+`DATA_INHIBIT`/`DAT_LINE_ACTIVE`/`READ_TRANSFER_ACTIVE`/`BUFFER_READ_ENABLE` 全在，
+而 `DAT[3:0]` 电平（state bits20..23）= `1111`，四条数据线一直空闲高电平。
+
+**结论：命令通道完全正常（CMD 线上能收到 R1），数据通道上一个字节都没出现。**
+这已经不是"我们读 FIFO 的方式不对"或"收尾位判断不对"，而是数据根本没上总线。
+
+### 3.74.2 为什么去 dump 寄存器
+
+我们从来没看过 ABL 交接那一瞬间 SDCC 的完整寄存器状态。而 ABL(LK) 是能正常
+读这块 eMMC 的 —— 它自己在 HS400 上跑、把 Android 从这块盘上加载起来。
+也就是说：**ABL 留下的那份寄存器配置是"能工作"的**，而我们在
+`configureVendorSpec()` / `setBusPowerAndClock()` 里改过 MCLK_SEL、
+HC_SELECT_IN、IO pad、软件复位、时钟、中断使能等等。
+
+最省事的判据：把两份 dump 放在一起对比，差的那几位就是数据路径缺的东西。
+
+### 3.74.3 v27 改动
+
+1. 新增 `void NativeSdhci::dumpRegs (const char *tag)`：
+   - `core 0x000 .. 0x0FC`，每行 4 个 32 位字；
+   - `vendor 0x200 .. 0x330`，每行 4 个 32 位字；
+   - 全部偏移都是 4 的倍数 —— **绝不再踩错位 32 位读**（`docs §3.50` 那次整机静默就是这个坑）。
+2. 调用两次：
+   - `start()` 里 **GCC 时钟打开之后、第一次写 SDCC 之前** → `dump abl`（= ABL 交接状态）；
+   - `readExtCsd()` 数据阶段失败之后 → `dump after`（= 我们初始化之后的状态）。
+3. `kSdhciTag = "v27"`。
+
+注意 dump 位置特意放在 `enableGccClocks()` 之后：时钟没开时读 SDCC 在 MSM 上会把
+AHB 挂死，连 log 都打不出来。
+
+### 3.74.4 下一刷要盯的寄存器
+
+| 偏移 | 名字 | 关注点 |
+|---|---|---|
+| `0x200` | `CORE_DLL_CONFIG` | ABL 在 HS400 会打开 DLL（`CORE_DLL_EN`/`CDR_EN`/`CK_OUT_EN`）；若 `after` 里这些位还在而我们跑 400 kHz，可能反而坏事 |
+| `0x208` | `CORE_DLL_STATUS` | `CORE_DLL_LOCK`(bit7) |
+| `0x20c` | `CORE_VENDOR_SPEC` | `MCLK_SEL`(bits9:8)、`HC_SELECT_IN`(bits21:18)、`IO_PAD_PWR_SWITCH_EN`(15)/`SWITCH`(16) |
+| `0x250` | `CORE_VENDOR_SPEC3` | `CORE_PWRSAVE_DLL`(bit3) |
+| `0x25c` | `CORE_DDR_CONFIG` | DDR / 采样相关 |
+| `0x28` | `HOST_CONTROL`（core 段） | DMA Select / 位宽 |
+| `0x2C` | `CLOCK_CONTROL` | `INT_CLK_STABLE`(bit1) 是否真的置起来了 |
+| `0x324` | `CORE_MCI_STATUS` | MSM 内部状态位 |
+
+判读思路：如果 `abl` 里某个"数据路径开关"在 `after` 里被我们关掉/改掉了，
+下一版就把它恢复；如果两份几乎一样，说明问题不在寄存器配置，而在
+TLMM 引脚复用（DAT 线可能没接到 SDC）或外部电平转换器 —— 那时再 map
+TLMM（`pinctrl@03000000`）逐个 pin 打印。
