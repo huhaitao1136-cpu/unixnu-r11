@@ -4799,3 +4799,67 @@ data timeout nis=0000 eis=0000 state=01f80af6
 | 60 步全是 `got=0 (no data)` | 卡真的一个字节都没发；转 TLMM `0x9b000` QDSD 控制字（`sdc2_data` pull/drive 位 9/0、`sdc2_cmd` 11/3、`sdc2_clk` 14/6）与卡侧状态 |
 | 出现 `probe DATA_END` 且 `got` 到 128 | 通了，直接看 `ext w53`（`SEC_COUNT` 低 32 位） |
 
+
+## 3.79 NativeSdhci v32：数据侧改走 DMA —— SDMA 一直在工作，是我们去读了空 FIFO（2026-10-28）
+
+### 3.79.1 v31（时间线探针）的真机结果
+
+```
+CMD8 r1=00000900 current_state=4 (tran)
+probe it=0  got=0
+probe it=8  got=97   w=00000000 state=01f00af6 nis=00000000
+probe done  got=128/128 state=01f00af6 nis=00000000 eis=00000000 drained=1
+ext w0=00000000 w1=00000000 w52=00000000 w53=00000000 w126=00000000 w127=00000000 drained=1
+CMD8: rev=0 SEC_COUNT=0 (0 GiB) BUS_WIDTH=0 HS_TIMING=0
+```
+
+读到了 128 个字，但**每个字都是 0**，`DATA_END` 一次没来，`eis=0`。
+也就是说 `DATA_AVAILABLE(bit11)` 从头到尾是 1，可 FIFO 里没有真数据 —— 这个位在撒谎。
+
+顺带记一个自己的 bug：v31 把 `drained(=got>=128)` 当成功，于是 `SEC_COUNT=0` 也被当成
+“读到了”，后面的 `LBA0` 才失败。v32 起 `EXT_CSD` 必须 `w52/w53（SEC_COUNT）非 0` 才算成功。
+
+### 3.79.2 关键证据：`0x58` 被控制器消费掉了
+
+回看 v23 的日志：
+
+```
+dma: sdma armed layout=sdma caps=742dc8b2 bytes=512 addr=aff40000 hostctl=00
+cmd8 pre  state=01f000f0 adma=aff40000      ← 写进去的地址还在
+cmd8 complete state=01f002f6
+CMD8 ok state=01f002f6 nis=00000000 eis=00000000 adma=ffffffff   ← 被消费/写回了
+```
+
+`SDHCI_ADMA_ADDRESS(0x58)` 从 `aff40000` 变成 `ffffffff`，说明 **SDMA 引擎确实动过**
+（SDMA 会把地址推进或写回）。当时我们紧接着用 `pioTransfer()` 去读 FIFO，而数据已经被
+搬进内存了，FIFO 自然是空的。v25–v31 反复出现的“全 0 + `DATA_AVAILABLE` 不退”就是这么来的。
+
+也就是说 v23 之后一直走错的方向是**读的地方**，不是“数据没来”。
+
+### 3.79.3 v32 改动（`E:\DeepSeekWorkspace\out\patch-v32.py`）
+
+1. `readExtCsd()`：v31 的探针整段删掉，改成
+   `beginDmaRead(512)` → `sendCommand(CMD8, RESP_SHORT|CRC|INDEX|DATA)` → `endDmaRead(ext, 512)`；
+   成功后打印 `ext w0/w1/w52/w53/w126/w127 drained`，**只有 `w52|w53 != 0` 才 `ok = true`**，
+   并打印 `CMD8: SEC_COUNT lo=… hi=… => %llu blocks`。
+2. `readBlocks()`：`pioTransfer(true, buffer, 512)` → `endDmaRead(buffer, 512)`，命令前插
+   `beginDmaRead(512)`，失败分支补 `fDmaArmed = false`，成功条件改成
+   `drained || w0 || w1 || w126 || w127`。
+3. 两处 `SDHCI_TRANSFER_MODE` 都带上 `SDHCI_TRNS_DMA`（`DMA | READ | BLK_CNT_EN`）。
+4. `kSdhciTag = "v32"`。
+
+### 3.79.4 判读表（下一刷）
+
+| 看到什么 | 结论 |
+|---|---|
+| `dma: sdma armed … addr=…` 且 `dma: done ok=1` + `dma: data` 前几字非 0 | 数据真的进来了 → 看 `SEC_COUNT`、`LBA0 ok`、`GPT ok` |
+| `dma: done ok=1` 但 `dma: data` 仍全 0 | 引擎跑完但没搬数据 → 查 `0x58` 是否指向 `fDmaDataPhys`、SDMA 是否需要 `HOST_CONTROL` 的其他位 |
+| `dma: done ok=0` + `eis=0200` | 又回到 ADMA Error → 确认 `Host Control` 的 DMA Select 真的是 0 |
+| `dma: done ok=0` + `state=01f80af6` | 引擎冻结 → 转 TLMM `0x9b000` QDSD（`sdc2_data` 位 9/0）查 pad 归属 |
+| `CMD8 dma arm failed` | `setupDmaMemory()` 失败（`phys=0`）→ 换 `IOMallocContiguous` |
+
+### 3.79.5 教训
+
+- 写寄存器要看**读回值的变化**：`0x58` 被改写本身就是“引擎动过”的证据，比任何猜测都硬。
+- 同一个现象（全 0）可以由完全不同的原因造成；v25–v31 七轮都在“怎么读 FIFO”上打转，
+  真正该问的是“**数据被搬到哪去了**”。
