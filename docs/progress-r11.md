@@ -4983,3 +4983,96 @@ sendCommand()
 | `untouched=0/128` 但全 `00000000` | 写了 0 → 转卡侧（TLMM QDSD、采样时钟、HS400 残留） |
 | 仍然 `untouched=128/128` | 顺序也不是主因 → 下一步给 `0x58` 换成 ADMA2 猜测（用 64 位描述符 + 把 `Host Control` 的 DMA Select 强行置 3），验证 CAP bit27 是否真的不可用 |
 | `dma: sdma armed … addr=` 与 `cmd8 pre … adma=` 不一致 | 别的路径又把 0x58 改了，要查 `sendCommand()` 里的清零逻辑 |
+
+## 3.82 NativeSdhci v35：CAPABILITIES 解码一直错着 —— 它支持 ADMA2，没有 SDMA 引擎（2026-10-27）
+
+### 3.82.1 证据链
+
+v33 的毒化实验给出决定性读数：
+
+```
+NativeSdhci[v33]: dma: data a5a5a5a5 a5a5a5a5 a5a5a5a5 a5a5a5a5 | w52=a5a5a5a5 w53=a5a5a5a5
+                  w126=a5a5a5a5 w127=a5a5a5a5 untouched=128/128
+```
+
+`untouched=128/128` 说明 DMA 引擎**一个字节都没往我们的缓冲区写**，所以这不是“读了 0”，
+而是“根本没搬”。v34 把 `0x58` 挪到 `TRANSFER_MODE` 之前（规范要求）之后仍然 `128/128`，
+于是回头核对 CAPABILITIES 的位定义。
+
+Linux v6.6 `drivers/mmc/host/sdhci.h`：
+
+```
+#define SDHCI_CAN_DO_ADMA2    0x00080000   /* bit19 */
+#define SDHCI_CAN_DO_ADMA1    0x00100000   /* bit20 */
+#define SDHCI_CAN_DO_SDMA     0x00400000   /* bit22 */
+#define SDHCI_CAN_VDD_180     0x04000000   /* bit26 */
+#define SDHCI_CAN_64BIT       0x10000000   /* bit28 */
+```
+
+真机 `caps=0x742dc8b2` 按 nibble 拆开：
+
+| nibble | 二进制 | 含义 |
+|---|---|---|
+| n4 = 0xd | 1101 | **bit19 = 1 → 支持 ADMA2** |
+| n5 = 0x2 | 0010 | **bit22 = 0 → 不支持 SDMA** |
+| n6 = 0x4 | 0100 | bit26 = 1 → 1.8V 支持 |
+| n7 = 0x7 | 0111 | bit28 = 1 → 64 位系统总线 |
+
+而 v23~v34 的代码写的是：
+
+```cpp
+const bool hasAdma2 = (caps & (1u << 27)) != 0;   /* 错 */
+const bool hasSdma  = (caps & (1u << 26)) != 0;   /* 错 */
+```
+
+也就是把“支持 ADMA2、没有 SDMA 引擎”的控制器判定成“必须走 SDMA”，把 `Host Control`
+的 DMA Select 拨到 0、把数据缓冲区地址写进 `0x58`——**而这块控制器根本没有 SDMA 引擎，
+`0x58` 里的地址无人使用**。`untouched=128/128` 就是这么来的。
+
+### 3.82.2 v20/v22 的 ADMA Error 也解释清楚了
+
+v20/v22 走 ADMA2 时报 `eis=0x200`（ADMA Error）。描述符我们写成了 16 字节的
+
+```
+[attr|len][0][addr_lo][addr_hi]
+```
+
+而规范的 96-bit 描述符（Host Version 4 Enable 未置位时）是 **12 字节**：
+
+```
+[attr|len][addr_lo][addr_hi]      /* Linux struct sdhci_adma2_64_desc */
+```
+
+中间多塞的那个 0 让控制器把 `[0][addr_lo]` 当成 64 位地址，取 `0x00000000_aff45000`
+这个不存在的描述符 → ADMA Error。
+
+### 3.82.3 v35 的三处改动
+
+1. CAP 按正确位解码：`hasAdma2 = caps & 0x00080000`、`hasSdma = caps & 0x00400000`、
+   `has64 = caps & 0x10000000`；`!hasAdma2` 时直接返回失败，不再退回 SDMA。
+2. **显式写 `Host Control` 的 DMA Select = 2（32 位 ADMA2）**：
+   `hostWord = (hostWord & ~0x18u) | 0x10u`。ABL 留下的 3、以及 v23 自己改成的 0，
+   都不是我们要的；这一位从来没被正确设置过。
+3. 描述符按 8 字节写，单条即可（缓冲区物理连续、512 字节远小于单条 64 KiB 上限）：
+
+```cpp
+desc[0] = (bytes << 16) | 0x23u;                 /* Valid|End|TRAN */
+desc[1] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
+sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS,    (uint32_t) fDmaDescPhys);
+sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS_HI, 0);
+```
+
+`SdhciRegs.h` 补了 `SDHCI_ADMA_ADDRESS_HI 0x5C`（SDHCI 4.0+ 的 64 位地址高半部）。
+
+### 3.82.4 判读表（下一刷）
+
+| 日志 | 结论 |
+|---|---|
+| `dma: caps=742dc8b2 adma2=1 sdma=0 64bit=1` | CAP 解码已修正 |
+| `dma: armed layout=32 select=2 … desc0=02000023 …` | 描述符与 DMA Select 都已按规范写好 |
+| `dma: data` 出现非 `a5a5a5a5` 且 `untouched=0/128` | ADMA2 通了 → 看 `SEC_COUNT` / `LBA0 ok` / `GPT ok` |
+| 仍 `untouched=128/128`，但 `adma=` 读回不是我们的 `fDmaDescPhys` | 控制器拒绝接受描述符地址（查 `0x5C`、CORE_VENDOR_SPEC 的 DMA 位） |
+| `dma: done ok=0` 且 `eis=0x200` | 描述符内容仍不合规（attr/长度/End 位） |
+
+教训（写进下一次的检查清单）：**先把 CAPABILITIES 的每个 bit 按厂商头文件拆开再写代码**。
+v23~v34 共 12 个版本、一整天，全部建立在一个错的位定义上。

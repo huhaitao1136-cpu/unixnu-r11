@@ -46,6 +46,7 @@
 #define SDHCI_MAX_CURRENT          0x48
 #define SDHCI_ADMA_ERROR           0x54
 #define SDHCI_ADMA_ADDRESS         0x58
+#define SDHCI_ADMA_ADDRESS_HI      0x5C  /* SDHCI 4.0+ / 64 位 ADMA2 的高 32 位 */
 #define SDHCI_PRESET_FOR_INIT      0x60
 #define SDHCI_PRESET_FOR_DS        0x64
 #define SDHCI_PRESET_FOR_HS        0x68

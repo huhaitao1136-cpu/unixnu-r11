@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v34"
+#define kSdhciTag         "v35"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1244,48 +1244,56 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
      * v20~v22 一直在 ADMA2 上撞，也一直是 eis=0x200(ADMA Error)。既然它没广告
      * ADMA2，就走它广告了的 SDMA：把 DMA Select 拨回 0，0x58 里直接放数据缓冲区
      * 的物理地址（SDMA 没有描述符表）。 */
-    const uint32_t caps    = sdhciRead32 (fCore, SDHCI_CAPABILITIES);
-    const bool     hasAdma2 = (caps & (1u << 27)) != 0;
-    const bool     hasSdma  = (caps & (1u << 26)) != 0;
+    /* CAP 的位定义见 Linux `drivers/mmc/host/sdhci.h`：
+     *   ADMA2 = 0x00080000(bit19)、ADMA1 = 0x00100000(bit20)、
+     *   SDMA  = 0x00400000(bit22)、64BIT = 0x10000000(bit28)、VDD_180 = bit26。
+     * v23~v34 把 bit27/bit26 当成 ADMA2/SDMA，于是把一个“支持 ADMA2、没有 SDMA 引擎”
+     * 的控制器当成必须走 SDMA —— 0x58 里写的地址从来没被硬件用过。 */
+    const uint32_t caps     = sdhciRead32 (fCore, SDHCI_CAPABILITIES);
+    const bool     hasAdma2 = (caps & 0x00080000u) != 0;
+    const bool     hasSdma  = (caps & 0x00400000u) != 0;
+    const bool     has64    = (caps & 0x10000000u) != 0;
 
-    if (!hasAdma2 && hasSdma) {
-        uint32_t hostWord = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
-        hostWord &= ~0x18u;                                 /* DMA Select = 0 (SDMA) */
-        sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: caps=%08x adma2=%u sdma=%u 64bit=%u descphys=%08llx dataphys=%08llx\n",
+           caps, hasAdma2 ? 1u : 0u, hasSdma ? 1u : 0u, has64 ? 1u : 0u,
+           (unsigned long long) fDmaDescPhys, (unsigned long long) fDmaDataPhys);
 
-        fDmaDesc->prepare (kIODirectionOut);
-        fDmaData->prepare (kIODirectionIn);
-
-        sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu));
-        fDmaArmed = true;
-        IOLog ("NativeSdhci[" kSdhciTag "]: dma: sdma armed layout=sdma caps=%08x bytes=%u addr=%08x hostctl=%02x\n",
-               caps, bytes, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), hostWord & 0xFFu);
-        return true;
+    if (!hasAdma2) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: dma: controller does not advertise ADMA2, cannot arm DMA\n");
+        return false;
     }
 
-    const uint32_t hostWord  = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
+    /* 关键：DMA Select 必须由我们显式写成 2（32 位 ADMA2），
+     * ABL 留下的 3 / v23 自己改成 0 都不是我们要的。 */
+    uint32_t hostWord = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
+    hostWord = (hostWord & ~0x18u) | 0x10u;                 /* bits3..4 = 10b = ADMA2 32-bit */
+    sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
     const uint32_t dmaSelect = (hostWord >> 3) & 0x3u;
-    const char    *layout    = "32";
 
-    desc[0] = (bytes << 16) | 0x27u;                        /* Valid|End|Int|TRAN + 长度 */
-    if (dmaSelect == 3) {
-        desc[1] = 0;                                        /* 64 位 ADMA 的保留字 */
-        desc[2] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
-        desc[3] = (uint32_t) ((uint64_t) fDmaDataPhys >> 32);
-        layout  = "64";
-    } else {
-        desc[1] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);
-        layout  = "32";
+    /* 32 位 ADMA2 描述符：8 字节 = [attr|len][addr]。物理地址都必须在 32 位内。 */
+    if ((uint64_t) fDmaDescPhys > 0xFFFFFFFFull || (uint64_t) fDmaDataPhys > 0xFFFFFFFFull) {
+        IOLog ("NativeSdhci[" kSdhciTag "]: dma: phys above 4 GiB (desc=%08llx data=%08llx), 32-bit ADMA2 cannot reach it\n",
+               (unsigned long long) fDmaDescPhys, (unsigned long long) fDmaDataPhys);
+        return false;
     }
+
+    /* 只要一条描述符：缓冲区物理连续、512 字节远小于单条上限（64 KiB）。
+     * attr = Valid(bit0)|End(bit1)|TRAN(bits4..5=10b) = 0x23。 */
+    desc[0] = (bytes << 16) | 0x23u;
+    desc[1] = (uint32_t) (fDmaDataPhys & 0xFFFFFFFFu);      /* 数据缓冲区的物理地址 */
+    desc[2] = 0;
+    desc[3] = 0;
 
     fDmaDesc->prepare (kIODirectionOut);
     fDmaData->prepare (kIODirectionIn);
 
     sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDescPhys & 0xFFFFFFFFu));
+    sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS_HI, 0);
     fDmaArmed = true;
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed layout=%s select=%u caps=%08x bytes=%u desc0=%08x %08x %08x %08x adma=%08x\n",
-           layout, dmaSelect, caps, bytes, desc[0], desc[1], desc[2], desc[3],
-           sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed layout=32 select=%u caps=%08x bytes=%u desc0=%08x %08x %08x %08x adma=%08x/%08x hostctl=%02x\n",
+           dmaSelect, caps, bytes, desc[0], desc[1], desc[2], desc[3],
+           sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS_HI), sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS),
+           hostWord & 0xFFu);
     return true;
 }
 
