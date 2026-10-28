@@ -4926,3 +4926,60 @@ v32 的日志两种都解释得通，所以必须先做个能区分的实验。
   属性 → SDCC 的 DMA 不经过 apps-SMMU，`ffffffff` 不是 SMMU 拦下来的。
 - 官方文档《UFS 移植》里“DMA”一栏要求记录的是“缓冲区分配、物理地址/IOVA 关系、对齐、
   一致性和缓存维护”，与这里的实验一致；平台组件表里的 `ArmSmmu4K` 对本控制器不适用。
+
+## 3.81 NativeSdhci v34：`0x58` 必须在 Transfer Mode 之前写（2026-10-28）
+
+### 3.81.1 v33 的真机结果把成因分开了
+
+```
+dma: sdma armed layout=sdma caps=742dc8b2 bytes=512 addr=aff41000 hostctl=00
+cmd8 pre  state=01f000f0 adma=aff41000
+cmd8 complete state=01f002f6
+dma: done ok=0 state=01f002f6 nis=00000000 eis=0000 adma=ffffffff err=00000000/00000000
+dma: data a5a5a5a5 a5a5a5a5 a5a5a5a5 a5a5a5a5 | w52=a5a5a5a5 w53=a5a5a5a5 w126=a5a5a5a5 w127=a5a5a5a5 untouched=128/128
+```
+
+`untouched=128/128`：毒值一个字都没被动过 —— **DMA 根本没往我们这块内存写**（上一节的
+情形 (a)），不是“写了 0”。
+
+### 3.81.2 根因：寄存器写入顺序
+
+`readExtCsd()` / `readBlocks()` 原来的顺序是：
+
+```
+BLOCK_SIZE
+BLOCK_COUNT
+TRANSFER_MODE  (bit0 = DMA Enable)     ← 先置了 DMA
+beginDmaRead()  → 写 SDHCI_ADMA_ADDRESS(0x58)
+sendCommand()
+```
+
+SD Host Controller 规范要求 **System Address(0x58) 必须先于 Transfer Mode 写入**：写
+Transfer Mode 的那一刻，DMA 相关的配置（地址、方向、块数）就被锁存并用于启动搬运。
+我们先置了 DMA Enable，控制器便拿着它内部那个还没被赋值的地址开始工作（事后读回正是
+`ffffffff`），随后写的 `aff41000` 完全没被采用 —— 于是毒值一字未动，而 `BLOCK_COUNT`
+却被消费掉（控制器以为跑完了）。
+
+### 3.81.3 v34 改动（`E:\DeepSeekWorkspace\out\patch-v34.py`）
+
+两处（`readExtCsd()`、`readBlocks()`）都改成：
+
+```
+ensureBusState()
+armed = beginDmaRead()          ← 先写 0x58
+BLOCK_SIZE / BLOCK_COUNT
+TRANSFER_MODE (DMA|READ|BLK_CNT_EN)
+sendCommand()
+```
+
+`armed` 失败时才 `fDmaArmed = false` 并跳过命令。毒化实验保留，`untouched=` 继续作为
+最硬判据。
+
+### 3.81.4 判读表
+
+| 现象 | 结论 |
+|---|---|
+| `untouched=0/128` 且 `data` 出现非 `a5` 值 | 顺序问题解决，DMA 真的搬了数据 → 看 `SEC_COUNT` / `LBA0` / `GPT` |
+| `untouched=0/128` 但全 `00000000` | 写了 0 → 转卡侧（TLMM QDSD、采样时钟、HS400 残留） |
+| 仍然 `untouched=128/128` | 顺序也不是主因 → 下一步给 `0x58` 换成 ADMA2 猜测（用 64 位描述符 + 把 `Host Control` 的 DMA Select 强行置 3），验证 CAP bit27 是否真的不可用 |
+| `dma: sdma armed … addr=` 与 `cmd8 pre … adma=` 不一致 | 别的路径又把 0x58 改了，要查 `sendCommand()` 里的清零逻辑 |

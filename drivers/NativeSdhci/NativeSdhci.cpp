@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v33"
+#define kSdhciTag         "v34"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1355,16 +1355,20 @@ bool NativeSdhci::readExtCsd ()
         memset (ext, 0, sizeof (ext));
         poisonDmaBuffer ();
 
+        ensureBusState ("cmd8");
+
+        /* v34：顺序是硬要求 —— System Address(0x58) 必须在 Transfer Mode 之前写，
+         * 写 Transfer Mode 的瞬间 DMA 配置就被锁存。v32/v33 是先写 mode 再写 0x58，
+         * 控制器于是拿着旧的（ffffffff）地址空转，毒值才一字未动。 */
+        bool armed = beginDmaRead ((UInt32) kSdhciBlockSize);
+
         sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
         /* BLK_CNT_EN 让控制器按 BLOCK_COUNT 字节数收尾（单块也要置位，
          * 否则某些 MSM 版本会按"开到 CMD12 为止"处理，DATA_END 永远不来）。 */
-        /* v25：不用 DMA。v19 的 PIO 至少拿到过 BUFFER_READ_READY，而 ADMA2/SDMA
-         * 都是数据引擎直接冻结；先确认"数据到底有没有进 FIFO"。 */
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
                       (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
-        ensureBusState ("cmd8");
         IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
@@ -1372,9 +1376,7 @@ bool NativeSdhci::readExtCsd ()
         bool ok = false;
         uint32_t r1[4] = { 0, 0, 0, 0 };
 
-        /* v32：数据侧一律走 DMA。SDMA 引擎确实在工作（0x58 会被它消费成 ffffffff），
-         * 之前读 FIFO 只能拿到空缓冲区。 */
-        if (!beginDmaRead ((UInt32) kSdhciBlockSize)) {
+        if (!armed) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 dma arm failed\n");
             fDmaArmed = false;
         } else if (!sendCommand (MMC_SEND_EXT_CSD, 0,
@@ -1646,16 +1648,18 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
 
     for (uint32_t attempt = 0; attempt < 2; attempt++) {
         ensureBusState ("cmd17");
+
+        /* v34：先武装 DMA（写 0x58），再写 BLOCK_SIZE/COUNT 与 Transfer Mode。 */
+        bool armed = beginDmaRead ((UInt32) kSdhciBlockSize);
+
         sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
-        /* v25：不用 DMA。v19 的 PIO 至少拿到过 BUFFER_READ_READY，而 ADMA2/SDMA
-         * 都是数据引擎直接冻结；先确认"数据到底有没有进 FIFO"。 */
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
                       (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
         uint32_t r1[4] = { 0, 0, 0, 0 };
 
-        if (!beginDmaRead ((UInt32) kSdhciBlockSize)) {
+        if (!armed) {
             IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 dma arm failed\n");
             fDmaArmed = false;
         } else if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
