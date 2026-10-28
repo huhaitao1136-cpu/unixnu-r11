@@ -4863,3 +4863,66 @@ CMD8 ok state=01f002f6 nis=00000000 eis=00000000 adma=ffffffff   ← 被消费/�
 - 写寄存器要看**读回值的变化**：`0x58` 被改写本身就是“引擎动过”的证据，比任何猜测都硬。
 - 同一个现象（全 0）可以由完全不同的原因造成；v25–v31 七轮都在“怎么读 FIFO”上打转，
   真正该问的是“**数据被搬到哪去了**”。
+
+## 3.80 NativeSdhci v33：给 DMA 缓冲区投毒，区分“没写”与“写了 0”（2026-10-28）
+
+### 3.80.1 v32 真机结果（走 DMA 读 EXT_CSD）
+
+```
+dma: sdma armed layout=sdma caps=742dc8b2 bytes=512 addr=aff3b000 hostctl=00
+cmd8 pre  state=01f000f0 adma=aff3b000
+cmd8 posted state=01f000f1
+cmd8 complete state=01f002f6
+CMD8 r1=00000900 current_state=4 (tran)
+data timeout nis=0000 eis=0000 state=01f002f6
+dma: done ok=0 state=01f002f6 nis=00000000 eis=0000 adma=ffffffff err=00000000/00000000
+dma: ctx blksz=0200 cnt=0000 mode=0013 hostctl=0000ff00 vs0=00010a0c vs3=02626440 mstat=0007f880
+dma: data 00000000 00000000 00000000 00000000 | w52=00000000 w53=00000000 w126=00000000 w127=00000000
+ext w0=00000000 … drained=0
+EXT_CSD empty (attempt 0)
+```
+
+diff 里最关键的一行：
+
+```
+after 058: 00000000 -> ffffffff
+```
+
+三条新事实：
+
+1. `mode=0013` = `DMA_ENABLE|BLOCK_COUNT_ENABLE|READ`，说明控制器确实看到了 DMA 位；
+2. `cnt=0000` 说明 `BLOCK_COUNT` 被消费掉了 —— 从控制器角度看，这一块“传完了”；
+3. 但 `0x58` 被写回成 `ffffffff`，我们那块缓冲区 `data[0..3]`、`w52`、`w53` 全 0。
+
+### 3.80.2 为什么必须再分一次岔
+
+缓冲区“全 0”有两种成因，处理方式完全相反：
+
+- **(a) DMA 根本没写这里**：0x58 没被采用、引擎空转、或写到了别的地址 → 查地址/引擎；
+- **(b) DMA 写了，但写进去的就是 0**：卡没驱动 DAT，或采样到全 0 → 查卡侧/引脚/时钟。
+
+v32 的日志两种都解释得通，所以必须先做个能区分的实验。
+
+### 3.80.3 v33 改动（`E:\DeepSeekWorkspace\out\patch-v33.py`）
+
+1. 新增 `void NativeSdhci::poisonDmaBuffer ()`：把 `fDmaData` 的 128 个字全部写成
+   `0xA5A5A5A5`。`readExtCsd()` 每次尝试开头调用（就在 `memset (ext, …)` 之后）。
+   顺序很重要：`beginDmaRead()` 里的 `fDmaData->prepare(kIODirectionIn)` 会把这段
+   cache 刷回内存，所以 DMA 看到的就是毒值。
+2. `endDmaRead()` 在 `dma: data` 日志里加 `untouched=%u/128`：统计还剩多少个毒字。
+
+### 3.80.4 判读表
+
+| `untouched` | `dma: data` | 结论 | 下一步 |
+|---|---|---|---|
+| 128/128 | 全是 `a5a5a5a5` | **(a) DMA 没写** | 查 `0x58` 是否真被采用（换 ADMA2 64 位描述符、或试 `0x58` 对齐到 4 KiB）、查 `CORE_ADDR_LIMIT`/vendor 里的 DM 位 |
+| 0/128 或中间值 | 出现真数据 | 数据通了 | 看 `SEC_COUNT` / `LBA0` / `GPT` |
+| 0/128 | 全 0（毒值被 0 覆盖） | **(b) 写了 0** | 卡侧：TLMM QDSD（`0x9b000`）DAT 位、采样时钟、卡侧 HS400 残留 |
+| 部分 | 前几字真、后面毒 | 短读 | 查 `BLOCK_SIZE`/`BLOCK_COUNT` 与控制器收尾 |
+
+### 3.80.5 同时核对过的两件事
+
+- `E:\DeepSeekWorkspace\R11-backup\dt\dtb-12.dts:3401-3439` 里 `sdhci@c0c4000` **没有 `iommus`**
+  属性 → SDCC 的 DMA 不经过 apps-SMMU，`ffffffff` 不是 SMMU 拦下来的。
+- 官方文档《UFS 移植》里“DMA”一栏要求记录的是“缓冲区分配、物理地址/IOVA 关系、对齐、
+  一致性和缓存维护”，与这里的实验一致；平台组件表里的 `ArmSmmu4K` 对本控制器不适用。

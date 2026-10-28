@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v32"
+#define kSdhciTag         "v33"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -298,6 +298,7 @@ private:
     bool     setupDmaMemory ();
     bool     beginDmaRead (UInt32 bytes);
     bool     endDmaRead (void *dst, UInt32 bytes);
+    void     poisonDmaBuffer ();
     bool     readCsd ();
     bool     logCardStatus (const char *who);   /* v26: CMD13，问卡在什么状态 */
     void     dumpRegs (const char *tag);        /* v27/v28: 快照 + diff */
@@ -1305,6 +1306,14 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
            ok ? 1 : 0, state, nis, eis, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), ea0, ea1);
     /* 前四个字 + EXT_CSD[212] 所在的第 53 个字（SEC_COUNT），一眼看出数据是不是真的 */
     fDmaArmed = false;
+
+    uint32_t untouched = 0;
+    for (UInt32 i = 0; i < 128; i++) {
+        if (data[i] == 0xA5A5A5A5u) {
+            untouched++;
+        }
+    }
+
     if (!ok) {
         IOLog ("NativeSdhci[" kSdhciTag "]: dma: ctx blksz=%04x cnt=%04x mode=%04x hostctl=%08x vs0=%08x vs3=%08x mstat=%08x\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
@@ -1314,8 +1323,8 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
                sdhciRead32 (fCore, CORE_VENDOR_SPEC3),
                sdhciRead32 (fCore, CORE_MCI_STATUS_REG));
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x\n",
-           data[0], data[1], data[2], data[3], data[52], data[53], data[126], data[127]);
+    IOLog ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x untouched=%u/128\n",
+           data[0], data[1], data[2], data[3], data[52], data[53], data[126], data[127], untouched);
 
     if (!ok || dst == nullptr) {
         return false;
@@ -1324,12 +1333,27 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
     return true;
 }
 
+/* v33：把 DMA 目标缓冲区填成 0xA5A5A5A5。传输之后：
+ *   全还是 0xA5 → DMA 没写（地址/引擎问题）
+ *   变成别的（含 0）→ DMA 确实写了，数据本身就是 0（卡/线路问题） */
+void NativeSdhci::poisonDmaBuffer ()
+{
+    if (fDmaData == nullptr) {
+        return;
+    }
+    uint32_t *d = static_cast<uint32_t *> (fDmaData->getBytesNoCopy ());
+    for (UInt32 i = 0; i < 128; i++) {
+        d[i] = 0xA5A5A5A5u;
+    }
+}
+
 bool NativeSdhci::readExtCsd ()
 {
     uint8_t ext[kSdhciBlockSize] __attribute__ ((aligned (64)));
 
     for (uint32_t attempt = 0; attempt < 2; attempt++) {
         memset (ext, 0, sizeof (ext));
+        poisonDmaBuffer ();
 
         sdhciWrite16 (fCore, SDHCI_BLOCK_SIZE, (uint16_t) kSdhciBlockSize);
         sdhciWrite16 (fCore, SDHCI_BLOCK_COUNT, 1);
