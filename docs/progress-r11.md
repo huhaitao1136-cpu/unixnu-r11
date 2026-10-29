@@ -5968,3 +5968,82 @@ import hashlib: True
 | `PASS: 190 ordinary iOS storage slots; …` | 审计通过 |
 | `archive 6/12` 通过 | AES 夹具的连带伤害已消除 |
 | 之后 12/12 + prelink + package 全绿 | 可以刷机（用户手里那一版 kernel 已经验证过能挂 APFS 根卷） |
+
+## 3.95 root hash 过了，进到 exec：`errno 86` 是种子里的 init 太旧（2026-10-29）
+
+### 3.95.1 这一刷的日志（关键段）
+
+```
+import_boot_forwarded_roothash:3491: importing root hash (basessystem ? 0)...
+apfs_extract_root_hash_arm:13275: could not retrieve system-volume-auth-blob from device tree
+import_boot_forwarded_roothash:3496: apfs_extract_root_hash_and_manifest failed with error: No such file or directory (2)
+Waiting on <dict … IOMedia … UUID 7E14B42C-1A2B-4E9C-9ACB-4CAF4EE0EC2D …>
+Got boot device = IOService:/IOResources/NativeRamBlock/IOBlockStorageDriver/Native Owned RAM block storage Media/AppleAPFSContainer/OwnerData
+BSD root: disk1s1, major 1, minor 2
+apfs_vfsop_mountroot:2965: apfs: mountroot called!
+nx_mount:1617: disk1 checkpoint search: largest xid 4, best xid 4 @ 7
+apfs_log_op_with_proc:3091: disk1s1 mount-complete volume OwnerData
+dove_kernel_mount: kernel_mount failed: 2
+…
+No POST boot-arg set.
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+load_init_program: failed loading /usr/appleinternal/sbin/launchd.development: errno 86
+load_init_program: attempting to load /sbin/launchd
+load_init_program: failed loading /sbin/launchd: errno 86
+```
+
+* `is_root_hash_authentication_required` 那两行**没了** —— `patch-apfs-roothash.py` 生效，
+  挂根一路走到 `mount-complete`；
+* 之后是**第一次真正走到 `load_init_program`**：内核开始按 `kern_exec.c` 的顺序
+  `launchd.debug → launchd.development → /sbin/launchd` 找 PID 1；
+* 三个候选都失败，`errno 86` = **EBADEXEC**。
+
+### 3.95.2 根因：种子里的 `init.macho` 还是 arm64e
+
+`unixnu-r11/seed/init.macho`（CI 的 `make-data-seed.sh` 就是把它装到那三个路径上）的头部是：
+
+```
+magic feedfacf  cputype 0100000c  cpusubtype 2  filetype 2  ncmds 2  sizeofcmds 440
+```
+
+两个问题：
+
+1. `cpusubtype = 2` 是 **CPU_SUBTYPE_ARM64E**，而我们的内核是普通 arm64
+   → `mach_loader` 先把 arch 判成不匹配，返回 `LOAD_BADARCH`，`kern_exec` 映射成
+   **EBADEXEC(86)**（这和当年 mockfs 那轮的 `errno 86` 是同一个坑，见 §3.39）；
+2. `ncmds = 2`（没有 `__PAGEZERO`）—— 就算 subtype 对了，也会因为缺 4 GiB hard page zero
+   变成 `LOAD_BADMACHO`（`ENOEXEC(8)`）。
+
+也就是说：`scripts/make-minimal-init.py` 早就修好了（`CPU_SUBTYPE_ARM64_ALL = 0`、
+`PAGEZERO_SIZE = 0x100000000`、`ncmds = 3`），但仓库里那份 `seed/init.macho`
+还是修好之前生成的二进制。
+
+### 3.95.3 修法
+
+重新生成并提交种子里的 init：
+
+```bash
+python3 scripts/make-minimal-init.py seed/init.macho --pad=65536
+```
+
+```
+已生成 seed/init.macho (65536 B)
+  入口 VA     : 0x0000000100000220（文件偏移 0x220）
+  指令长度    : 72 B（18 条）
+  标记串      : b'R11_EL0_INIT_OK\n'
+size 65536
+magic feedfacf cputype 0100000c cpusubtype 0 filetype 2 ncmds 3 sizeofcmds 512
+```
+
+`make-data-seed.sh` 里 `INIT_BIN="$(cd "$(dirname "$0")/.." && pwd)/seed/init.macho"`，
+所以 CI 下次生成的 APFS 种子会自动带上这一版。
+
+### 3.95.4 下一刷要看的
+
+| 现象 | 含义 |
+| --- | --- |
+| `load_init_program: attempting to load /sbin/launchd` 之后不再打 `failed loading` | exec 成功 |
+| 屏幕上出现 `R11_EL0_INIT_OK` | **EL0 用户态第一次跑起来**（init 往 `/dev/console` 写标记） |
+| 仍是 `errno 86` | 种子里还是旧 init（payload 没重新生成），或 APFS 读文件返回的不是文件内容 |
+| 变成 `errno 8` | subtype 对了但 PAGEZERO 没进去，检查 `ncmds == 3` |
+| `dove_kernel_mount: kernel_mount failed: 2` 后停住 | 根卷挂上了但 data 卷那一步失败，属于下一层（`/var`）问题 |
