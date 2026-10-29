@@ -5604,3 +5604,68 @@ undefined: ['__ZTV20IOBlockStorageDevice', '__ZN20IOBlockStorageDevice4initEP12O
 * 仍然失败，但日志里已经列清 `缺:` 的每个符号和它的槽位/`kernel_names`，我们可以据此决定
   是扩展 `possible`（对 `kernel_names` 非空的槽改绑到 prelink 后的 kernel 地址），
   还是回驱动里少覆盖几个可选槽。
+
+## 3.90 第三个误报：Itanium 的 `S_` 替换让同一签名文本不同（2026-10-29）
+
+### 3.90.1 第 7 轮 CI
+
+`r11-logs (7).zip` 的 `tmp/ramblock.log`（审计、`NativeRamBlock` 编译、符号覆盖全绿）：
+
+```
+[ramblock] 未解析符号: 11 个，审计覆盖 11 个，缺 0 个
+[ramblock] 审计里带 kernel_names 的槽: 176 个（这些不走 candidate_target 绑定）
+[ramblock] 绑定脚本比较已修补（_r11_same_method + 打印出错名字）
+Concrete subclass dispatch mismatch at slot 86
+  actual=__ZN14NativeRamBlock5startEP9IOService (_ZN14NativeRamBlock5startEP9IOService)
+  expected=__ZN9IOService5startEPS_ (_ZN9IOService5startEPS_)
+  tails=5startEP9IOService/5startEPS_
+```
+
+这是同一个方法：`IOService::start(IOService*)`。Itanium C++ ABI 会把它已出现过的
+`IOService` 替换成 `S_`（基类里的 `start` 用 `PS_`），所以**文本不同但签名相同**。
+上游那句「比反解尾巴」的检查因此也有漏洞 —— 只在反解器正常工作、且两边都没吃替换时才成立。
+
+### 3.90.2 修法：比「方法标识符」而不是整段 mangled 尾巴
+
+`scripts/make-ramblock-bindings.py` 的 helper 升到 `_r11_same_method()`：
+
+```python
+def _r11_same_method(actual, expected, readable):
+    left, right = readable[actual], readable[expected]
+    if '::' in left and '::' in right:                 # 反解成功：保持上游语义（比整段尾巴）
+        return left.split('::', 1)[1] == right.split('::', 1)[1]
+    return _r11_mangled_ident(actual) == _r11_mangled_ident(expected)   # 否则只比标识符
+```
+
+`_r11_mangled_ident()` 在 `_r11_mangled_tail()` 基础上再吃掉 `<len><方法名>`：
+
+* `__ZN14NativeRamBlock5startEP9IOService` → `start`
+* `__ZN9IOService5startEPS_` → `start` → 判为同一方法 ✓
+* `__ZN14NativeRamBlock16doAsyncReadWriteEP…` vs `__ZN20IOBlockStorageDevice12doUnmapEP…`
+  → `doAsyncReadWrite` vs `doUnmap` → 仍然拦下 ✗
+
+标记换成 `_r11_same_method`；早先两版（`_r11_tail`、只有 `_r11_mangled_tail` 的版本）会先被清掉，
+同一文件里不会留多套 helper。失败信息改成打 `idents=…/…`。
+
+本地验证（`E:\DeepSeekWorkspace\out\test-bindings-patch3.sh`，拿上游原始脚本建 `/tmp/rbtest`）：
+
+```
+helper defs: 1 / mangled-tail: 1 / ident: 1 / call sites: 2 / old form: 0 / stale: 0
+start            vs start            same=True
+getMetaClass     vs getMetaClass     same=True
+doAsyncReadWrite vs doAsyncReadWrite same=True
+```
+
+### 3.90.3 关于「11 个未解析符号都已被审计覆盖」
+
+这一行说明 `possible` 的构造对我们这套驱动是自洽的：11 个导入全部能在
+`audit['methods']` 里找到 `kernel_names` 为空的同级记录（外加构造函数/析构/元类/vtable 四个显式项），
+所以下一轮应该能真正生成 `libNativeRamBlock.a`。剩下的风险只在生成之后——链接内核时若
+再有未定义符号，就会在 `build-xnu-4k-baseline.sh` 的 `LD` 阶段暴露。
+
+| 下一轮现象 | 结论 |
+| --- | --- |
+| `PASS: …/libNativeRamBlock.a (… B)，IOBlockStorageDevice 相关符号 N 行` | 绑定成功 |
+| `Concrete subclass dispatch mismatch … idents=a/b` | `a != b` 才算真的不一致 |
+| `Unqualified original storage import` | `possible` 缺符号（本轮报告已排除） |
+| 链接期 `Undefined symbols: _OBJC…` / `__ZN20IOBlockStorageDevice…` | 绑定表漏了符号，按链接器报的名字补 |
