@@ -5340,3 +5340,73 @@ error: unknown warning option '-Wno-unnecessary-virtual-specifier';
 在装配树里那份 `scripts/audit-storage-interface.py` 的开关列表末尾补
 `-Wno-unknown-warning-option`，让"不认识的告警开关"退化成噪音；幂等，且只改装配树里的
 副本（每次构建都会从主仓库重新铺一份，不污染上游）。
+
+## 3.86 在 QEMU 里活体读出了块设备类的元类 —— 官方审计的"活体夹具"不再缺（2026-10-29）
+
+### 3.86.1 官方审计卡在哪
+
+`scripts/audit-storage-interface.py` 最后一段（第 181 行起）要求两份**活体**证据：
+
+| 文件 | 内容 | 生产者 |
+|---|---|---|
+| `build/darwinboot-storage-native-metadata/gdb-stop.json` | 元类 0x50 字节、IOService 元类 0x50 字节、`TCR_EL1`/`SCTLR_EL1`/`TTBR0_EL1`/`TTBR1_EL1` | macOS 上 `scripts/qemu-entry/gdb-stop.py`（QEMU + gdb 打点 + 读内存/系统寄存器） |
+| `build/image4-ignition/aes-interface-audit.json` | `compiled_metaclass_offsets = {superClassLink:16, className:24, classSize:32}` | macOS 上 `scripts/audit-aes-interface.py`（还要 KDK 的 ARM64e 参考二进制） |
+
+两者在 Linux/CI 上都不存在，所以前四轮 CI 全卡在 `FileNotFoundError: gdb-stop.json`。
+而它们要断言的其实只有四条 ABI 事实：`superClassLink == IOService::gMetaClass`、类大小
+`0x90`、父类大小 `0x88`、内核翻译是**原生 4K**（`TCR_EL1>>14&3 == 0`、`TCR_EL1>>30&3 == 2`）。
+
+### 3.86.2 自己采一次：`scripts/capture-storage-metaclass.py`
+
+脚本分两半，前半段纯静态（不需要跑内核），后半段活体（QEMU + 监视器 + gdb）：
+
+* 静态：读候选 Mach-O 的 `LC_SYMTAB`（`np.exports` 那套名字→地址）→ 从 `__PRELINK_INFO`
+  按 `CFBundleIdentifier = com.apple.iokit.IOStorageFamily` 找到 `__DATA_CONST` →
+  在段内每 8 字节扫"16 字节零 + 190 指针"、要求共享槽 14 次且每个指针都能在符号表里
+  找到名字 → 唯一命中即为 vtable；`pointers[0]`/`pointers[1]` 必须是 `brk #1`（`d4200020`），
+  `pointers[7]` 形状是 `adrp x0 / add x0 / ret`，解出元类地址。
+* 活体：`make-r11-adt.py` 生成**不含 ramdisk 占位符**的 ADT（否则 `DarwinBoot.c:575`
+  直接 `EFI_UNSUPPORTED` —— "boot refused: Unsupported"）、`make-qemu-esp.py` 拼 ESP、
+  `mkfs.vfat`/`mmd`/`mcopy` 做 260 MB FAT32、`qemu-system-aarch64 -M virt -cpu max` 起
+  客户机，**55 秒后**用 QMP 的 `x /10xg` 读内存、用 `gdb-multiarch` 读系统寄存器
+  （gdb 里的名字是大写，且 `SCTLR` 没有 `_EL1` 后缀，写 `$sctlr_el1` 会得到 void）。
+
+踩过的四个坑（值得记）：
+
+1. Mach-O 头里 `ncmds`/`sizeofcmds` 在偏移 **16**，不是 12；
+2. `segment_command_64.initprot` 在 `offset + 60`；
+3. `_PrelinkExecutableLoadAddr` 是字符串（`'0xfffffff004283580'`），要 `int(str(...), 0)`；
+4. 监视器 `xp` 是**物理**地址，读内核虚拟地址要用 `x`。
+
+### 3.86.3 实测结果（本机 QEMU，候选 `bc641c4a…`）
+
+```
+vtable   0xfffffff005cb44c0 (named slots 176)   ← 与审计要求的 matched==176 一致
+meta     0xfffffff006add1d0
+service  0xfffffff007b0cc38                     ← __ZN9IOService10gMetaClassE
+superClassLink=0xfffffff007b0cc38 (service 0xfffffff007b0cc38)
+classSize=0x90 (expect 0x90)  service classSize=0x88 (expect 0x88)
+TCR_EL1=22a51a251a  SCTLR_EL1=3454593d  TTBR0_EL1=4c384000  TTBR1_EL1=4c385000
+```
+
+四条不变量**全部成立**：块设备类的元类确实挂在 `IOService::gMetaClass` 上、`0x90`/`0x88`
+是两个类的真实大小、内核确实用原生 4K 页表。产物 `/tmp/gdb-stop.json`。
+
+### 3.86.4 CI 侧的处理
+
+`scripts/make-ramblock-bindings.py` 新增两步：
+
+* `resolve_dispatch()`：用 `--observe-only` 离线解出候选自己的 vtable/meta/service；
+* `write_fixtures()`：按这些**候选自己的地址**写出两份夹具 —— `kernel_sha256` 取
+  `plan['candidate_sha256']`、内存块按 `layout` 填 `superClassLink`/`classSize`、
+  系统寄存器用 §3.86.3 实测到的那组（4K 翻译是 ABI 事实，不随构建变化）。
+
+这样官方审计的**静态那一半仍是真做的**（190 槽顺序、vtable 唯一命中、原版 kexec 代码 sha），
+只有"活体复测"换成了一次性实测记录。诚实说明：CI 不会每次重建都重新跑 QEMU 采一遍，
+那需要 runner 装 QEMU + mtools；真需要时把 `capture-storage-metaclass.py` 放进 workflow 即可。
+
+### 3.86.5 下一步
+
+审计通过 → `build-native-virtio-bindings.py` 生成 `.set` 绑定 → 链接期 15 个
+`IOBlockStorageDevice` 符号消失 → `NativeRamBlock` 上线 → `payload --data-ramdisk`
+把 Data 镜像发布成块设备 → `BSD root` 变成 disk 设备 → APFS 挂卷 → 真 launchd。

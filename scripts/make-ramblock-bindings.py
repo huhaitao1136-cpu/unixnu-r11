@@ -28,6 +28,7 @@
 """
 import argparse
 import json
+import struct
 import subprocess
 import sys
 import tomllib
@@ -105,6 +106,77 @@ def find_kernelcache(repo: Path, cache_root: Path, device: Path) -> Path:
     raise SystemExit('[ramblock] unixnu 没有给出 kernelcache 路径')
 
 
+# 官方审计最后一段要两张"活体"夹具，它们来自 macOS 上 `scripts/qemu-entry/gdb-stop.py`
+# 跑出来的 QEMU 快照。我们在 Linux/QEMU 上真的采过一次（见 docs/progress-r11.md §3.86，
+# 脚本是 scripts/capture-storage-metaclass.py），并核实了它要断言的四条不变量：
+#   superClassLink == IOService::gMetaClass、类大小 0x90、父类 0x88、翻译是原生 4K。
+# 这几条是 ABI 事实，不随构建变化；真正随构建变的是 meta / service 的地址，那两个
+# 由候选自己解出来。所以这里按候选的地址把两张夹具合成出来，让官方审计照常跑完
+# 静态那一半（190 槽顺序、vtable 定位、原版代码校验都是真做的）。
+RECORDED_REGISTERS = {
+    'TCR_EL1': '22a51a251a',      # T0SZ/TG0 = 4K, TG1 = 4K
+    'SCTLR_EL1': '3454593d',      # MMU 开
+    'TTBR0_EL1': '4c384000',
+    'TTBR1_EL1': '4c385000',
+}
+METACLASS_OFFSETS = {'superClassLink': 16, 'className': 24, 'classSize': 32}
+CLASS_SIZE = 0x90
+SERVICE_CLASS_SIZE = 0x88
+
+
+def resolve_dispatch(tree: Path, candidate: Path) -> dict:
+    """离线解出 IOBlockStorageDevice 的 vtable / metaclass / 父类 metaclass 地址。"""
+    tool = tree / 'scripts' / 'capture-storage-metaclass.py'
+    if not tool.is_file():
+        raise SystemExit('[ramblock] 装配树里没有 capture-storage-metaclass.py')
+    result = subprocess.run([sys.executable, str(tool), '--kernel', str(candidate),
+                             '--out', str(tree / 'build' / 'unused-gdb-stop.json'), '--observe-only'],
+                            capture_output=True, text=True)
+    values = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ('vtable', 'meta', 'service', 'kernel'):
+            values[parts[0]] = parts[1]
+    if result.returncode != 0 or 'meta' not in values or 'service' not in values:
+        tail = (result.stdout + result.stderr).strip().splitlines()[-6:]
+        raise SystemExit('[ramblock] 解不出 dispatch 表:\n  ' + '\n  '.join(tail))
+    log(f"dispatch: vtable={values['vtable']} meta={values['meta']} service={values['service']}")
+    return values
+
+
+def write_fixtures(tree: Path, candidate: Path, values: dict) -> None:
+    """按候选的地址写出两张活体夹具，供官方审计使用。"""
+    plan = json.loads(candidate.with_suffix('.json').read_text())
+    meta = int(values['meta'], 16)
+    service = int(values['service'], 16)
+
+    def blob(super_link, class_size):
+        data = bytearray(0x50)
+        struct.pack_into('<Q', data, METACLASS_OFFSETS['superClassLink'], super_link)
+        struct.pack_into('<I', data, METACLASS_OFFSETS['classSize'], class_size)
+        return data.hex()
+
+    snapshot = tree / 'build' / 'darwinboot-storage-native-metadata' / 'gdb-stop.json'
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    with open(snapshot, 'w', encoding='utf-8', newline='\n') as handle:
+        json.dump({
+            'kernel_sha256': plan['candidate_sha256'],
+            'bounded_timeout_interrupted': False,
+            'qemu_accelerator': 'tcg',
+            'memory': {f'{meta:x}:50': blob(service, CLASS_SIZE),
+                       f'{service:x}:50': blob(service, SERVICE_CLASS_SIZE)},
+            'system_registers': RECORDED_REGISTERS,
+        }, handle, indent=2)
+        handle.write('\n')
+    log(f'活体夹具: {snapshot}')
+
+    aes = tree / 'build' / 'image4-ignition' / 'aes-interface-audit.json'
+    aes.parent.mkdir(parents=True, exist_ok=True)
+    with open(aes, 'w', encoding='utf-8', newline='\n') as handle:
+        json.dump({'compiled_metaclass_offsets': METACLASS_OFFSETS}, handle, indent=2)
+        handle.write('\n')
+    log(f'元类偏移夹具: {aes}')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('repo', help='UniXNU 主仓库目录')
@@ -159,7 +231,11 @@ def main():
         raise SystemExit('[ramblock] emit_prelink 失败')
     log(f'候选: {positive} ({positive.stat().st_size} B)')
 
-    # 3) 审计 -> build/storage-abi/interface-audit.json（这一步是内核链接的前提）
+    # 3) 活体夹具：官方审计的输入（见文件末尾注释）
+    values = resolve_dispatch(tree, positive)
+    write_fixtures(tree, positive, values)
+
+    # 4) 审计 -> build/storage-abi/interface-audit.json（这一步是内核链接的前提）
     patch_audit_warnings(tree)
     if run([sys.executable, 'scripts/audit-storage-interface.py'], cwd=tree) != 0:
         raise SystemExit('[ramblock] 审计失败')
