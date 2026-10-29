@@ -417,6 +417,15 @@ def main():
     record = json.loads(audit.read_text())
     log(f"审计: slots={record.get('method_slots')} live4k={record.get('live_native_4k')}")
 
+    # 存储审计只借了 AES 夹具里的 `compiled_metaclass_offsets`。用完就撤掉这份「只有一个键」的文件：
+    # `build-native-aes-bindings.py` 只有在它**不存在**时才会回落到
+    # `scripts/data/native-aes-original-bindings.S`（记录的地址）；留着它反而会让 AES 那步
+    # 走进完整审计路径并因为缺 `methods` 而 KeyError。
+    aes_fixture = tree / 'build' / 'image4-ignition' / 'aes-interface-audit.json'
+    if aes_fixture.is_file():
+        aes_fixture.unlink()
+        log('已撤掉 AES 夹具（存储审计用完即弃），AES 绑定回落到 scripts/data/native-aes-original-bindings.S')
+
     # 4) NativeRamBlock.o：能编就顺手编，编不出来就交给内核构建（那里一定会编）
     obj = tree / 'build' / 'native-ram-block' / 'NativeRamBlock.o'
     if obj.is_file():

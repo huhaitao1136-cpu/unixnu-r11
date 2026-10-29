@@ -5669,3 +5669,75 @@ doAsyncReadWrite vs doAsyncReadWrite same=True
 | `Concrete subclass dispatch mismatch … idents=a/b` | `a != b` 才算真的不一致 |
 | `Unqualified original storage import` | `possible` 缺符号（本轮报告已排除） |
 | 链接期 `Undefined symbols: _OBJC…` / `__ZN20IOBlockStorageDevice…` | 绑定表漏了符号，按链接器报的名字补 |
+
+## 3.91 绑定通了（`libNativeRamBlock.a` 299 KB），但把 AES 步骤踩了（2026-10-29）
+
+### 3.91.1 第 8 轮 CI：`IOStorageFamily` 绑定成功
+
+`r11-logs (8).zip`：
+
+```
+[ramblock] 未解析符号: 11 个，审计覆盖 11 个，缺 0 个
+[ramblock] $ python3 scripts/build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block
+PASS: 190 concrete slots, 24 overrides and 11 genuine original storage imports
+Actual device I/O and filesystem integration remain unqualified by this compile/ABI audit.
+[ramblock] PASS: …/build/native-ram-block/libNativeRamBlock.a (299472 B)，IOBlockStorageDevice 相关符号 22 行
+```
+
+也就是说：190 个具体槽、24 个自有覆盖、11 个真正的原始导入，归档 299,472 B 生成完毕。
+§3.44 时代那 15 个未定义符号，到这里第一次有了落地的绑定。
+
+### 3.91.2 新问题：AES 绑定步骤 KeyError
+
+`kernel.log` 走到 archive 6/12 就炸：
+
+```
+== kernel: archive 6/12: build-native-aes-bindings.py
+  File ".../scripts/build-native-aes-bindings.py", line 61, in <module>
+    for row in audit['methods']:
+KeyError: 'methods'
+```
+
+根因很清楚：我们这个流水线里 `build/image4-ignition/aes-interface-audit.json`
+**只有一个键**（`compiled_metaclass_offsets`，因为存储审计只借这一个字段，§3.86）。
+而上游 `build-native-aes-bindings.py` 的回落条件是
+
+```python
+audit_path = ROOT / 'build/image4-ignition/aes-interface-audit.json'
+recorded   = ROOT / 'scripts/data/native-aes-original-bindings.S'
+if not audit_path.is_file() and recorded.is_file():
+    ... 用 scripts/data/native-aes-original-bindings.S 里记录的地址绑定 ...
+```
+
+—— 只要那个文件**不存在**，它就用记录的地址（`native-aes-original-bindings.S` 里是
+`__ZN16IOAESAccelerator10gMetaClassE = 0xfffffff006ae52d0` 这一套，来自 board.toml 钉住的 kernelcache）。
+我们造了半份夹具，等于把它从回落路径推进了完整审计路径。
+
+### 3.91.3 修法：用完即弃
+
+`scripts/make-ramblock-bindings.py` 在存储审计跑完之后立刻删掉这份 AES 夹具：
+
+```python
+aes_fixture = tree / 'build' / 'image4-ignition' / 'aes-interface-audit.json'
+if aes_fixture.is_file():
+    aes_fixture.unlink()
+    log('已撤掉 AES 夹具（存储审计用完即弃），AES 绑定回落到 scripts/data/native-aes-original-bindings.S')
+```
+
+时序上没问题：存储审计（同一步骤内）已经读完了 `compiled_metaclass_offsets`；
+后面的 `build-native-aes-bindings.py` 在**编译内核**这一步里才跑，此时文件已不在，
+于是回落到 `scripts/data/native-aes-original-bindings.S`——这正是加入 RamBlock 支线之前的行为
+（那时 AES 步骤一直走这条回落路径、从没报错）。
+
+### 3.91.4 下一轮判据
+
+| 现象 | 结论 |
+| --- | --- |
+| archive 6/12 打出 `PASS: native AES bound with the recorded original-kernelcache addresses` | AES 恢复正常 |
+| archive 8/12（NativeRamBlock）后再没有 `Undefined symbols` | 内核链接吃下了 11 个绑定 |
+| `LD mach.development.bcm2837.unstripped.noctf` 通过 + prelink/package 全绿 | 可以拿 `r11-boot-artifacts` 刷机 |
+| 链接期仍缺符号 | 按链接器报的名字回查 `possible` |
+
+刷机后要验证的第一批日志：`NativeRamBlock` 是否被 personality 匹配（`KernelConfigTables.cpp` 里
+`XNU_NATIVE_RAM_BLOCK` 段），以及 `/chosen/memory-map` 里是 `RAMDisk`（dense）还是 `PackedRAMDisk`
+—— 若拿到的是 16 字节 `RAMDisk`，`BSD root:` 就不再是 `md0`，而是它发布出来的块设备。
