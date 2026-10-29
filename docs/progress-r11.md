@@ -5801,3 +5801,93 @@ idempotent, tree: 1 repo: 1
 | archive 9/12 打出 `PASS: 190 concrete slots, …` | 补丁活过装配，绑定进内核归档 |
 | 之后 `LD mach.development.bcm2837.unstripped.noctf` 报 `Undefined symbols:` | 11 个导入里有没被 vtable 绑定覆盖的，按名字补 `possible` |
 | 链接通过 + prelink + package 全绿 | 拿 `r11-boot-artifacts` 刷机，看 `NativeRamBlock` 是否上线 |
+
+## 3.93 打通到 APFS 挂载：`BSD root: disk1s1` —— 卡在 root hash 认证（2026-10-29）
+
+### 3.93.1 这一刷发生了什么
+
+`payload` 里第一次真的带了稠密 Data 种子（`scratch-data.img 33,554,432 B`，`payload.json` 的
+`data_ramdisk_sha256 = 22344519…`），ADT 的 `/chosen/memory-map` 里是 **`RAMDisk`** 属性。
+真机日志（按顺序）：
+
+```
+NativeSdhci[v37]: … data timeout … LBA0 read FAILED     ← eMMC 那条线仍在原地（见 §3.84）
+Got boot device = IOService:/IOResources/NativeRamBlock/IOBlockStorageDriver/
+                  Native Owned RAM block storage Media/AppleAPFSContainer/…
+BSD root: disk1s1, major 1, minor 2
+disk1s1: device is not readable.
+mockfs_mountroot failed: 13
+apfs_vfsop_mountroot:2965: apfs: mountroot called!
+dev_init:306: disk1 device_handle block size 4096 block count 8192 features 0 internal
+nx_mount:1617: disk1 checkpoint search: largest xid 4, best xid 4 @ 7
+nx_mount:1644: disk1 stable checkpoint indices: desc 6 data 10
+fs_lookup_root_snapshot_name:373: disk1s1 failed to get root-snapshot-name from DT
+apfs_find_named_root_snapshot_xid:2035: … No such file or directory (2)
+apfs_find_named_root_snapshot_xid:2073: disk1s1 The global payload bytes pointer is NULL
+apfs_vfsop_mount:2714: disk1s1 failed to find named root snapshot: Need authenticator (81)
+apfs_log_op_with_proc:3091: disk1s1 mounting volume OwnerData, requested by: kernel_task (pid 0)
+handle_mount:817: disk1s1 vol-uuid: 7E14B42C-1A2B-4E9C-9ACB-4CAF4EE0EC2D
+                              block size: 4096 block count: 8192 (unencrypted, flags: 0x1 features: 1.0.2)
+handle_mount:830: disk1s1 setting dev block size to 4096 from 512
+apfs_log_op_with_proc:3091: disk1s1 mount-complete volume OwnerData, requested by: kernel_task (pid 0)
+is_root_hash_authentication_required:472: disk1s1 Release kext, booting xid: 0
+is_root_hash_authentication_required:555: disk1s1 Root Volume, root hash authentication is required
+```
+
+也就是说：**存储栈整条通了** —— `NativeRamBlock` 通过 `IOResourceMatch = IOBSD` 上线，
+发布 `IOBlockStorageDriver` + IOMedia，APFS 容器挂载、卷 `OwnerData`（UUID 对上了 ADT 的
+`root-matching`）`mount-complete`，`BSD root` 变成了 `disk1s1`。
+
+### 3.93.2 新的门槛：root hash 认证
+
+`apfs_vfsop_mountroot` 之后内核问 `is_root_hash_authentication_required()`：它把我们的卷
+归类成 `Root Volume`（因为它就是被 root 挂载的那个卷），于是返回 1 → 去认证 root hash。
+而我们既没有 iBoot 注入的 root hash（前面 `import_boot_forwarded_roothash:3451` 已经报
+`No such file or directory`），也没有 AMFI 认证器，于是停在这一行不动。
+
+### 3.93.3 定位这个函数（主内核符号表里没有它）
+
+APFS 是 kext，prelink 之后主内核的 `lc_symtab` 只有 7 万个符号，**没有任何 apfs 符号**。
+改用字符串交叉引用定位：
+
+1. 在 `__PRELINK_TEXT` 里找到字符串 `is_root_hash_authentication_required`
+   （文件 0x1794fe8 / VA `0xfffffff0045cefe8`）；
+2. 扫所有可执行段找 `adrp` + `add` 对，命中 1 处：`__PLK_TEXT_EXEC` 的
+   `0xfffffff0056cda94`（`adrp x8, 0x45ce000` / `add x8, x8, #0xfe8`）；
+3. 反汇编确认这正是那句日志：`movz w9, #0x22b`（=555，与日志里的 `:555:` 一致），
+   紧接着 `adrp x0, 0x45ce000 ; add x0, x0, #0xfbd` 是格式串
+   `%s:%d: %s %s, root hash authentication %s`；
+4. 同一个函数里还能看到两条分支：`w20 = 0` 配 `0x45cf019`（"will be skipped"）、
+   `w20 = 1` 配 `0x45cf00d`（"is required"），函数返回值就是 `w20`；
+5. 函数入口 = 最近一个 `ret` 之后的 `stp x28, x27, [sp, #-64]!`（`0xfffffff0056cd968`）。
+
+### 3.93.4 补丁：`scripts/patch-apfs-roothash.py`
+
+* 找字符串 → 找 `adrp/add` 交叉引用 → 从引用点往回找最近的 `ret` → 入口写
+  `mov w0,#0 ; ret`（`0x52800000` / `0xD65F03C0`），即「不需要 root hash 认证」；
+* 幂等：第二次跑会认出「最近那个 ret 的前一条是 `mov w0,#0`」并跳过；
+* **两个编码坑**（第一版就是被它们坑的）：
+  - `ADRP` 的掩码只能到 `0x9F000000`，把低 5 位的 Rd 也算进掩码会一处都匹配不到；
+  - `ADD (immediate)` 同理，`0xFFC003E0` 会把 Rn 留在结果里，必须用 `0x9F000000`；
+  - 函数入口不能用"向前找 prologue"的写法（打完补丁后序言被换成 mov/ret，第二次跑会
+    漂到函数体内的 `sub sp, sp, #0x430` 上），必须钉在"最近 `ret` + 4"。
+* 已接进 `patch-payload-full.py`（在"上屏补丁"之后、"写回 payload"之前自动跑）。
+
+### 3.93.5 验证（对 `ci-art57` 的 `kernel.macho`）
+
+```
+字符串 @ 文件 0x1794fe8 / VA 0xfffffff0045cefe8
+adrp/add 交叉引用: 1 处
+  __PLK_TEXT_EXEC 引用 0xfffffff0056cda94 → 函数入口 0xfffffff0056cd968（入口指令 0xa9bc6ffc）
+已写回 …（1 处）
+[再跑一次] 0xfffffff0056cd968: 已经打过补丁（mov w0,#0; ret）   ← 幂等
+```
+
+### 3.93.6 下一刷要看的
+
+| 现象 | 结论 |
+| --- | --- |
+| `is_root_hash_authentication_required:555 … will be skipped` | 补丁生效 |
+| 之后出现 `load_init_program: attempting to load /sbin/launchd` | 挂根成功，进入 exec（种子里的 64 KB init 就能验 EL0） |
+| 仍停在 `…root hash authentication is required` | 函数入口找错了（另一种可能是它还有内联副本），需要换个定位法 |
+| 新的 panic（`Process 1 exec … failed`） | 已经是 EL0 那一层的问题，按 §3.39 的 exec 排查走 |

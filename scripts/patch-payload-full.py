@@ -147,6 +147,14 @@ def main() -> int:
             '--symbols', sym]).returncode != 0:
         return 1
 
+    print('== 放过 APFS 的 root hash 校验（种子卷不是密封卷，我们也没有 iBoot 的 root hash）')
+    # apfs 在 `apfs_vfsop_mountroot` 之后会问 `is_root_hash_authentication_required()`，
+    # 返回 1 就去认证 root hash，而我们既没有 root hash 也没有 AMFI 认证器，内核就停在那里。
+    # 该函数在 APFS kext 里（prelink 后主内核符号表不含 kext 内部符号），所以按字符串
+    # "is_root_hash_authentication_required" 的 adrp/add 交叉引用定位函数入口，改成 return 0。
+    if run(['python3', SCRIPTS / 'patch-apfs-roothash.py', kernel]).returncode != 0:
+        return 1
+
     print('== 写回 payload')
     if run(['mcopy', '-o', '-i', str(payload), str(kernel), got]).returncode != 0:
         return 1
