@@ -5076,3 +5076,54 @@ sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS_HI, 0);
 
 教训（写进下一次的检查清单）：**先把 CAPABILITIES 的每个 bit 按厂商头文件拆开再写代码**。
 v23~v34 共 12 个版本、一整天，全部建立在一个错的位定义上。
+
+## 3.83 NativeSdhci v35 真机：ADMA2 终于按规范武装，但数据仍然不来（2026-10-29）
+
+### 3.83.1 v35 真机读数
+
+```
+dma: caps=742dc8b2 adma2=1 sdma=0 64bit=1 descphys=afdb6000 dataphys=aff45000
+dma: armed layout=32 select=2 caps=742dc8b2 bytes=512 desc0=02000023 aff45000 00000000 00000000 adma=… hostctl=10
+CMD8 setup blksz=0200 cnt=0001 mode=0013 word28=0000ff10 attempt=1
+cmd8 pre state=01f000f0 adma=afdb6000          ← 描述符地址确实在 0x58 里
+cmd8 posted state=01f000f1
+cmd done, error flag ignored: word=02000001 nis=0001 eis=0200 eis16=0200   ← ADMA Error
+cmd8 complete state=01f002f6
+CMD8 r1=00000900 current_state=4 (tran)        ← 卡状态正常
+data timeout nis=0000 eis=0000 state=01f002f6
+dma: done ok=0 … adma=afdb6018                 ← 只前进了 0x18
+dma: ctx blksz=0200 cnt=0000 mode=0013 hostctl=0000ff10 vs0=00010a0c
+dma: data a5a5a5a5 a5a5a5a5 a5a5a5a5 a5a5a5a5 | w52=a5a5a5a5 w53=a5a5a5a5 … untouched=128/128
+```
+
+三个要点：
+
+1. CAP 解码、DMA Select、描述符内容都已是规范写法（`adma2=1 sdma=0`、`select=2`、
+   `desc0=02000023`、`hostctl=10`）；
+2. **ADMA Error 依旧**，且 ADMA 指针只前进 `0x18`（24 字节）；
+3. `state=01f002f6` 里 `DAT[3:0] = 1111` —— **四条数据线全程空闲高电平**，
+   和 v25/v30/v31 的 PIO 读数（512 个字全 0、`DATA_AVAILABLE` 不退）完全一致。
+
+### 3.83.2 目前的结论
+
+命令通道（CMD 线）完全正常：CMD0/1/2/3/9/7/16/17 全部完成、卡状态 `tran`、
+`R1=0x900`（`READY_FOR_DATA`）。数据通道（DAT 线）从第一次数据命令起就没有任何活动，
+且控制器自己也不报 data timeout —— 它在等卡发数据。ADMA Error 是“等到超时后，
+控制器发现描述符没被消费完”的副产物，不是根因。
+
+### 3.83.3 v36：一次启动试 1 / 4 / 8 位
+
+仍然最可疑的残余假设是“ABL 把 eMMC 留在 HS400 / 8 位，host 改回 1 位但卡侧没回去”。
+v36 直接把三档都试一遍：
+
+- 新增成员 `uint32_t fBusWidth = 1;`；`ensureBusState()` 按它写 `HOST_CONTROL` 的
+  bit1（4 位）/ bit5（8 位），不再无条件清成 1 位；
+- 新增 `void setHostBusWidth (uint32_t bits)`，改 `fBusWidth`、写寄存器、回读打印
+  `bus width=%u hostctl=%02x`；
+- `probeMedia()` 里 `(void) readExtCsd ();` 换成 1→4→8 循环，失败时打印
+  `width %u: EXT_CSD still empty (state=%08x dat=%u%u%u%u)`（`state` bits20..23 依次是
+  DAT3..DAT0 的电平）。
+
+判读：哪一档出现 `EXT_CSD rev=… SEC_COUNT=…` 就说明卡侧确实停在那个宽度上；
+三档都是 `dat=1111`，则基本可以排除总线宽度，转向 TLMM/QDSD 引脚（SDC2 在
+`pinctrl-sdm660` 里是特殊 QDSD pin group、`mux_bit = -1`，功能不是普通 TLMM 寄存器控制的）。

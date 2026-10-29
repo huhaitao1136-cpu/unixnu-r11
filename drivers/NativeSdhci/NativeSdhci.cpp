@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v35"
+#define kSdhciTag         "v36"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -303,6 +303,7 @@ private:
     bool     logCardStatus (const char *who);   /* v26: CMD13，问卡在什么状态 */
     void     dumpRegs (const char *tag);        /* v27/v28: 快照 + diff */
     void     ensureBusState (const char *why);  /* v28: 数据命令前重新拉起电源/IO pad */
+    void     setHostBusWidth (uint32_t bits);   /* v36: 1 / 4 / 8 位 */
     bool     readExtCsd ();
     bool     probeMedia ();
 
@@ -319,6 +320,8 @@ private:
     /* beginDmaRead() 之后为 true：此时 SDHCI_ADMA_ADDRESS 里是我们自己的
      * 描述符地址，sendCommand() 绝不能再清它（v20 就是在这里黑屏的）。 */
     bool                      fDmaArmed = false;
+    /* v36：host 侧总线宽度（1/4/8）。ensureBusState() 每次数据命令前按它重写 HOST_CONTROL。 */
+    uint32_t                  fBusWidth = 1;
     UInt16    fRca      = 0;
     UInt64    fBlockCount = 0;
 #if XNU_NATIVE_SDHCI_BLOCK_DEVICE
@@ -1073,6 +1076,24 @@ void NativeSdhci::dumpRegs (const char *tag)
            sdhciRead32 (fCore, 0x25C), sdhciRead32 (fCore, 0x324));
 }
 
+/* v36：host 侧总线宽度。eMMC 上电默认 1 位，但 ABL 可能把它留在 8 位（HS400）。 */
+void NativeSdhci::setHostBusWidth (uint32_t bits)
+{
+    fBusWidth = bits;
+
+    uint32_t hostWord = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
+    hostWord &= ~(uint32_t) (SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS);
+    if (bits == 4) {
+        hostWord |= SDHCI_CTRL_4BITBUS;
+    } else if (bits == 8) {
+        hostWord |= SDHCI_CTRL_8BITBUS;
+    }
+    sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
+
+    IOLog ("NativeSdhci[" kSdhciTag "]: bus width=%u hostctl=%02x\n",
+           bits, sdhciRead32 (fCore, SDHCI_HOST_CONTROL) & 0xFFu);
+}
+
 void NativeSdhci::ensureBusState (const char *why)
 {
     /* 1) HOST_CONTROL(0x28) 低字节与 POWER_CONTROL(0x29) 同一个 32 位字，一起写。
@@ -1080,7 +1101,12 @@ void NativeSdhci::ensureBusState (const char *why)
     uint32_t word = sdhciRead32 (fCore, SDHCI_HOST_CONTROL);
     uint32_t hostCtrl = word & 0xFFu;
 
-    hostCtrl &= ~(uint32_t) (SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);   /* 1-bit */
+    hostCtrl &= ~(uint32_t) (SDHCI_CTRL_8BITBUS | SDHCI_CTRL_4BITBUS);
+    if (fBusWidth == 4) {
+        hostCtrl |= SDHCI_CTRL_4BITBUS;
+    } else if (fBusWidth == 8) {
+        hostCtrl |= SDHCI_CTRL_8BITBUS;
+    }
     uint32_t newWord = (word & 0xFFFF0000u)
                      | ((uint32_t) (SDHCI_POWER_ON | SDHCI_POWER_330) << 8)
                      | hostCtrl;
@@ -1438,7 +1464,23 @@ bool NativeSdhci::probeMedia ()
 {
     uint8_t block[kSdhciBlockSize] __attribute__ ((aligned (64)));
 
-    (void) readExtCsd ();
+    /* v36：1 → 4 → 8 位都试一遍，谁能读出 EXT_CSD 就用谁。 */
+    {
+        static const uint32_t kWidths[] = { 1, 4, 8 };
+        bool extOk = false;
+
+        for (unsigned wi = 0; wi < 3 && !extOk; wi++) {
+            setHostBusWidth (kWidths[wi]);
+            extOk = readExtCsd ();
+
+            if (!extOk) {
+                uint32_t st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
+                IOLog ("NativeSdhci[" kSdhciTag "]: width %u: EXT_CSD still empty (state=%08x dat=%u%u%u%u)\n",
+                       kWidths[wi], st,
+                       (st >> 23) & 1u, (st >> 22) & 1u, (st >> 21) & 1u, (st >> 20) & 1u);
+            }
+        }
+    }
 
     memset (block, 0, sizeof (block));
     if (readBlocks (0, 1, block) != kIOReturnSuccess) {
