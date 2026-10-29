@@ -5257,3 +5257,27 @@ BSD root: md0 / disk0s…
 `PackedRAMDisk` 与 `RAMDisk` 同时存在会直接返回 false；`RAMDisk` 属性长度必须是 16
 （前 8 字节物理地址、后 8 字节长度），物理地址要 4 KiB 对齐、落在 DRAM 里，
 否则 `start()` 同样返回 false。
+
+### 3.85.6 第一轮 CI 的实测结果（2026-10-29 16:00）
+
+| 观察点 | 结果 |
+|---|---|
+| `ramblock.log` | `refer/IOStorageFamily -> out/feeds/IOStorageFamily-ad2e13e0` ✓，随后 `找不到 out/ipsw/*/kernelcache.decompressed` ✗ |
+| `kernel.log` | archive 1–8 全绿（**archive 8 = `build-arm-driver.py NativeRamBlock` 编译通过**），archive 9（bindings）抛 `FileNotFoundError: …/build/storage-abi/interface-audit.json` |
+| `archive-09-build-native-virtio-bindings.log` | 同上回溯栈 |
+
+根因：kernelcache 是 `unixnu build kernel` 走到 **prelink** 那一步时才从 IPSW 里按
+HTTP range 取出来的（`scripts/unixnu/ipsw.py:198-229`，落在 `out/ipsw/<build>/kernelcache.decompressed`），
+而我们的审计步骤排在编译内核**之前**，那时它还不存在，`out/ipsw` 甚至还没有目录。
+
+修法（`scripts/make-ramblock-bindings.py`）：
+
+* `find_kernelcache()`：先找现成的 `out/ipsw/*/kernelcache.decompressed`，没有就自己
+  调 `./unixnu ipsw -D <device> fetch KernelCache`（只取 IPSW 里的那一个成员），
+  从输出里拿路径；
+* `NativeRamBlock.o` 那一档从"必需"降级为"顺手"：编不出来就警告并返回 0 ——
+  `.o` 由内核构建的 archive 8 一定会编，审计（`interface-audit.json`）才是真正的门槛；
+* 失败时打印具体原因（取 kernelcache 失败会带回最后 6 行 stderr）。
+
+下一轮要看的仍然是 §3.85.5 那三处，先看 `ramblock.log` 有没有 `审计: slots=190 …` 与
+`PASS: …libNativeRamBlock.a`。
