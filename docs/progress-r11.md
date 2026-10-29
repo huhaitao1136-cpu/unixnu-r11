@@ -5181,3 +5181,79 @@ PIO 收尾位（v25~v31）→ 寄存器顺序（v34）→ **CAP 位定义**（v3
 
 而“卡为什么不发”的答案，最终应该从**卡的当前总线模式**（ABL 留下的 HS400）里找，
 而不是继续调 host 寄存器。
+
+## 3.85 RamBlock 支线接入：审计 + `.set` 绑定 + payload 带 Data 镜像（2026-10-29）
+
+eMMC 数据线那条路（§3.76–§3.84）把所有能想到的寄存器都试过了，`DAT[3:0]` 恒为 `1111`、
+`DAT_INHIBIT` 不掉，卡疑似仍在 ABL 留下的 HS400 状态里。这一节按用户的决定切到
+**RamBlock 支线**：不碰 eMMC，用内存里的 Data 镜像当块设备，先把
+`APFS → IOMedia → BSD root → 真 launchd` 这条长链打通。
+
+### 3.85.1 为什么必须要"绑定"
+
+之前几轮一直把 `NativeRamBlock` 的归档注释掉，理由是"链进来就缺 15 个符号"（§3.44）。
+这次先把事实钉死：prelink 后的 `kernel.macho` 符号表里**一个 IOStorageFamily 符号都没有**
+
+```
+grep -c 'IOBlockStorageDevice' out/r11/kernel/kernel-symbols.txt   # 0
+grep -c 'IOStorage'            out/r11/kernel/kernel-symbols.txt   # 0
+```
+
+也就是说 kext 的**代码**被 prelink 拷进来了，但它的**符号**没有任何地方导出过。
+官方解法是 `scripts/build-native-virtio-bindings.py`：生成一份汇编，把每个缺失符号
+`.set` 成原版 kext 被 slide 之后的绝对地址，再与 `NativeRamBlock.o` 一起打成归档。
+地址由 `scripts/audit-storage-interface.py` 算出来，它需要三样东西：
+
+1. `refer/IOStorageFamily`（公开源码，pinned `e45fbe30a7879e0b16e26dddb78538f1b00e0bff`）
+   —— 编出 190 槽的 vtable 顺序；
+2. `build/native-prelink/native-apfs-load-positive.macho` + `.json` —— 一份 prelink 候选，
+   用来在原版 kext 的 `__DATA_CONST` 里唯一定位那张 vtable（要求 `matched == 176`）；
+3. `kernelcache.decompressed`（`out/ipsw/*/`，哈希 `f18b4df8…` 与 board.toml 一致）。
+
+### 3.85.2 新增 `scripts/make-ramblock-bindings.py`
+
+工作目录为仓库根，参数 `<repo> <board.toml>`，按顺序：
+
+| 步骤 | 动作 |
+|---|---|
+| 1 | `tree/refer/IOStorageFamily` 符号链接到 `out/feeds/IOStorageFamily-*`（装配树里原本只有 `edk2`） |
+| 2 | 按 `[kernel.prelink]` 组命令跑 `emit_prelink.py`，产出 prelink 候选（需要 noctf） |
+| 3 | 跑 `scripts/audit-storage-interface.py` → `build/storage-abi/interface-audit.json` |
+| 4 | 缺 `build/native-ram-block/NativeRamBlock.o` 时先 `build-arm-driver.py NativeRamBlock` |
+| 5 | 跑 `build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block` |
+| 6 | `nm libNativeRamBlock.a` 统计 `IOBlockStorageDevice` 符号行数，打印 PASS |
+
+### 3.85.3 配置改动
+
+* `board.toml` 的 `[kernel] archives`：放开 `"build-arm-driver.py NativeRamBlock"`，
+  紧跟着加 `"build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block"`。
+* `configs/r11_defconfig`：`CONFIG_XNU_NATIVE_RAM_BLOCK=n` → `y`。
+* 工作流在「把 NativeSdhci 接入构建脚本」之后、编译内核之前插入
+  「生成 RamBlock 的 IOStorageFamily 绑定（审计 + .set）」，`continue-on-error: true`，
+  日志写 `/tmp/ramblock.log` 并随 `r11-logs` 上传。
+* payload 步骤改为带 `--data-ramdisk $RUNNER_TEMP/seed.dbr.raw`（稠密 raw），
+  ADT 侧 `packed_data_ramdisk = false` 已经就位，所以会走 `--data-ramdisk` →
+  `/chosen/memory-map/RAMDisk` → `NativeRamBlock::start()` 里的 `range` 分支。
+
+### 3.85.4 已知的两处脆弱点
+
+1. **冷缓存要跑两次**。绑定地址来自"上一次成功编译出来的 noctf"，所以第一次跑
+   （或缓存被清）那一步会失败并跳过，随后内核链接会因为缺 15 个符号失败；
+   再跑一次就恢复正常。CI 的缓存键含 `out/r11/tree/build`，正常不会走到这里。
+2. **种子步骤仍是 `continue-on-error`**。种子失败时 payload 不带 Data 镜像，
+   内核里 `NativeRamBlock::start()` 会因为找不到 `RAMDisk` 属性直接返回 false，
+   表现还是 §3.39 那个 `Waiting on <dict … IOMedia …>`。所以下一刷要同时确认
+   `payload.log` 里出现了 `seed.dbr.raw` 与 `--data-ramdisk`。
+
+### 3.85.5 下一刷要看什么
+
+```
+NativeRamBlock: …            # 驱动是否被 personality 匹配到
+IOMedia … / 卷 UUID 出现      # 块设备上线
+BSD root: md0 / disk0s…
+```
+
+驱动侧判断依据（上游 `drivers/NativeRamBlock/NativeRamBlock.cpp:191-210`）：
+`PackedRAMDisk` 与 `RAMDisk` 同时存在会直接返回 false；`RAMDisk` 属性长度必须是 16
+（前 8 字节物理地址、后 8 字节长度），物理地址要 4 KiB 对齐、落在 DRAM 里，
+否则 `start()` 同样返回 false。
