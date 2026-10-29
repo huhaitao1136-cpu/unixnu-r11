@@ -177,6 +177,42 @@ def write_fixtures(tree: Path, candidate: Path, values: dict) -> None:
         handle.write('\n')
     log(f'元类偏移夹具: {aes}')
 
+def patch_bindings_comparison(tree: Path) -> None:
+    """`build-native-virtio-bindings.py` 用 `demangled.split('::', 1)[1]` 比方法名，
+    但有些名字（`operator delete(void*)` 之类）反解后没有 `::`，于是直接 IndexError。
+    这里把它换成一个不会炸的 `_tail()`，并把出错时的名字打出来。幂等；只改树内副本。"""
+    script = tree / 'scripts' / 'build-native-virtio-bindings.py'
+    if not script.is_file():
+        log('警告: 装配树里没有 build-native-virtio-bindings.py，跳过比较修补')
+        return
+    text = script.read_text(encoding='utf-8')
+    if '_r11_tail' in text:
+        log('绑定脚本比较已修补过')
+        return
+    anchor = "readable = dict(zip(all_names, demangled))\n"
+    if anchor not in text:
+        log('警告: 绑定脚本结构变了，没能插入 _r11_tail')
+        return
+    helper = (anchor +
+              "def _r11_tail(text):\n"
+              "    return text.split('::', 1)[1] if '::' in text else text\n")
+    text = text.replace(anchor, helper, 1)
+    old = ("        if not own or (row['slot'] not in (0, 1) and readable[actual].split('::', 1)[1] "
+           "!= readable[expected].split('::', 1)[1]):\n"
+           "            raise SystemExit('Concrete subclass dispatch mismatch at slot ' + str(row['slot']))")
+    new = ("        if not own or (row['slot'] not in (0, 1) and _r11_tail(readable[actual]) "
+           "!= _r11_tail(readable[expected])):\n"
+           "            raise SystemExit('Concrete subclass dispatch mismatch at slot ' + str(row['slot']) +\n"
+           "                             ' actual=' + str(actual) + ' (' + readable[actual] + ')' +\n"
+           "                             ' expected=' + str(expected) + ' (' + readable[expected] + ')')")
+    if old not in text:
+        log('警告: 绑定脚本的比较语句变了，只补了 _r11_tail 没改调用点')
+    else:
+        text = text.replace(old, new, 1)
+    with open(script, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(text)
+    log('绑定脚本比较已修补（_r11_tail + 打印出错名字）')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('repo', help='UniXNU 主仓库目录')
@@ -254,6 +290,7 @@ def main():
         return 0
 
     # 5) 生成绑定归档 build/native-ram-block/libNativeRamBlock.a
+    patch_bindings_comparison(tree)
     if run([sys.executable, 'scripts/build-native-virtio-bindings.py',
             '--component', 'NativeRamBlock', '--directory', 'build/native-ram-block'], cwd=tree) != 0:
         raise SystemExit('[ramblock] 生成绑定失败')
