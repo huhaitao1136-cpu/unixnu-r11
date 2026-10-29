@@ -54,7 +54,7 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v36"
+#define kSdhciTag         "v37"
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -1576,9 +1576,11 @@ bool NativeSdhci::cardInit ()
     uint32_t resp[4] = {0, 0, 0, 0};
 
     native_sdhci_step = 1;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD0\n");
-    /* CMD0：回到 idle（此时 CMD 线上不需要 CRC） */
-    if (!sendCommand (MMC_GO_IDLE_STATE, 0, SDHCI_CMD_RESP_NONE, nullptr)) {
+    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD0 (f0f0f0f0 reset)\n");
+    /* CMD0 参数用 0xF0F0F0F0：JEDEC 规定这是带 HS400 状态机在内的软件复位；
+     * 参数为 0 的 CMD0 只回 idle，**不会**退出 HS400。ABL 是按 HS200/HS400 配好
+     * eMMC 才跳进内核的，所以必须用这个参数才能把卡拉回 SDR/1 位。 */
+    if (!sendCommand (MMC_GO_IDLE_STATE, 0xF0F0F0F0u, SDHCI_CMD_RESP_NONE, nullptr)) {
         IOLog ("NativeSdhci[" kSdhciTag "]: CMD0 failed\n");
         return false;
     }

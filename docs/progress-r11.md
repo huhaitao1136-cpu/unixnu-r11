@@ -5127,3 +5127,57 @@ v36 直接把三档都试一遍：
 判读：哪一档出现 `EXT_CSD rev=… SEC_COUNT=…` 就说明卡侧确实停在那个宽度上；
 三档都是 `dat=1111`，则基本可以排除总线宽度，转向 TLMM/QDSD 引脚（SDC2 在
 `pinctrl-sdm660` 里是特殊 QDSD pin group、`mux_bit = -1`，功能不是普通 TLMM 寄存器控制的）。
+
+## 3.84 v36 真机：三档总线宽度全失败 → 卡被 ABL 留在 HS400（2026-10-29）
+
+### 3.84.1 v36 读数
+
+```
+bus width=1 hostctl=10 … (三个宽度的 EXT_CSD 尝试)
+bus[...] …
+width 8: EXT_CSD still empty (state=01f800f0 dat=1111)
+cmd17 pre state=01f800f0 adma=afdb8000
+cmd done, error flag ignored: word=02000001 nis=0001 eis=0200
+dma: data a5a5a5a5 … untouched=128/128
+```
+
+三档（1/4/8 位）都在数据阶段失败，`DAT[3:0]` 恒为 `1111`。**host 侧宽度不是变量。**
+
+### 3.84.2 根因（JEDEC 条款）
+
+eMMC 5.1 关于 HS400 的退出条件写得很明确：
+
+> HS400 mode is entered only from HS200. After entering HS400, the device cannot
+> change to other mode **without a power cycle**. CMD0 with argument `0xF0F0F0F0`
+> resets the device including the HS400 state machine.
+
+ABL 是按 HS200/HS400 把 eMMC 配好才跳进内核的（我们的寄存器 dump 也印证：
+`CORE_VENDOR_SPEC` 的 MCLK_SEL、`DDR_CONFIG(0x25C)` 曾是 `0x00004073`、
+`MCI_STATUS` 里有 HS400 相关位）。而我们一直发的 CMD0 参数是 **0** ——
+按规范那只是“回到 idle”，**不会把 HS400 状态机复位**。
+
+结果就是：卡仍然期待 DDR + data strobe 的数据时序，而我们在 SDR 1 位下发数据命令，
+卡自然一个字节都不发 —— `DAT[3:0]` 恒为 `1111`、`DATA_AVAILABLE` 永不给、
+控制器也不报 data timeout（它在等）。命令通道不受影响，所以 CMD0~CMD17 全都“成功”。
+
+### 3.84.3 v37
+
+`cardInit()` 的 CMD0 参数改成 `0xF0F0F0F0`，日志改
+`cardInit: CMD0 (f0f0f0f0 reset)`。
+
+- 成功：`EXT_CSD rev=… SEC_COUNT=…` 出现 → HS400 就是根因，接着读 LBA0/GPT；
+- 失败：说明这片子连 JEDEC 的 HS400 软复位都不认（部分样品确实只认掉电），
+  那就得走“给 eMMC VCC 断电再上电”（PMIC regulator），或改走 RamBlock 支线。
+
+### 3.84.4 这一天的教训汇总
+
+在 eMMC 这条线上，失败的假设依次是：位宽（v5）→ 8 位寄存器访问（v6）→ `IODelay`
+（v7）→ `RESET_ALL`（v8）→ 内部分频器（v9）→ vendor 模式位（v10）→ 中断使能（v24）→
+PIO 收尾位（v25~v31）→ 寄存器顺序（v34）→ **CAP 位定义**（v35）→ 总线宽度（v36）。
+
+真正站得住的结论只有两条：
+1. CPU 侧的一切（映射、GCC 时钟、命令序列、状态位读数）都是对的；
+2. 卡从第一条数据命令起就没在 DAT 线上发过东西。
+
+而“卡为什么不发”的答案，最终应该从**卡的当前总线模式**（ABL 留下的 HS400）里找，
+而不是继续调 host 寄存器。
