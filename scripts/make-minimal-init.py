@@ -65,30 +65,37 @@ def b_cond(cond, imm):
     return 0x54000000 | (((imm >> 2) & 0x7FFFF) << 5) | cond
 
 
+def brk(imm16=0):
+    return 0xD4200000 | ((imm16 & 0xFFFF) << 5)
+
+
 def build_code():
     # 指令表：(助记符, 参数) —— ADR/分支的目标先占位，稍后按最终长度回填
-    LATEST = 17          # b . 的索引
-    L_CONSOLE_WRITE = 12  # console 写入失败后跳到「写 fd 1」的位置
+    L_TRAP = 19          # open 失败 → brk #0x11（SIGTRAP → 内核 panic，屏幕可见）
+    L_UDF = 20           # write 失败 → udf #0（SIGILL）
 
-    instrs = [None] * 18
+    instrs = [None] * 21
     instrs[0] = ('adr', 0, 'devpath')
     instrs[1] = ('raw', movz_w(1, 1))         # x1 = O_WRONLY
     instrs[2] = ('raw', movz_x(2, 0))         # x2 = 0
     instrs[3] = ('raw', movz_x(16, 5))        # x16 = SYS_open
     instrs[4] = ('raw', svc())
-    instrs[5] = ('bcond', 2, L_CONSOLE_WRITE)  # b.cs → 跳过 console 写入
+    instrs[5] = ('bcond', 2, L_TRAP)          # b.cs → open 失败，直接暴露
     instrs[6] = ('raw', mov_xd_xs(3, 0))      # x3 = x0（console fd）
     instrs[7] = ('adr', 1, 'marker')
     instrs[8] = ('raw', movz_x(2, len(MARKER)))
     instrs[9] = ('raw', mov_xd_xs(0, 3))      # x0 = x3
     instrs[10] = ('raw', movz_x(16, 4))       # x16 = SYS_write
     instrs[11] = ('raw', svc())
-    instrs[12] = ('adr', 1, 'marker')
-    instrs[13] = ('raw', movz_x(2, len(MARKER)))
-    instrs[14] = ('raw', movz_x(0, 1))        # fd 1
-    instrs[15] = ('raw', movz_x(16, 4))       # x16 = SYS_write
-    instrs[16] = ('raw', svc())
-    instrs[17] = ('raw', 0x14000000)          # b .
+    instrs[12] = ('bcond', 2, L_UDF)          # b.cs → 写 console 失败
+    instrs[13] = ('adr', 1, 'marker')
+    instrs[14] = ('raw', movz_x(2, len(MARKER)))
+    instrs[15] = ('raw', movz_x(0, 1))        # fd 1
+    instrs[16] = ('raw', movz_x(16, 4))       # x16 = SYS_write
+    instrs[17] = ('raw', svc())
+    instrs[18] = ('raw', 0x14000000)          # b .  ← 保持 PID 1 存活
+    instrs[19] = ('raw', brk(0x11))           # SIGTRAP：open("/dev/console") 失败
+    instrs[20] = ('raw', 0x00000000)          # UDF #0：write 到 console 失败
 
     code_len = len(instrs) * 4
     msg_off = code_len

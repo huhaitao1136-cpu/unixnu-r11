@@ -38,6 +38,12 @@ mkdir -p "$MNT/private/var/mobile/Media"
 mkdir -p "$MNT/private/var/db"
 chmod 755 "$MNT/private" "$MNT/private/var" "$MNT/private/var/mobile" 2>/dev/null || true
 
+# /dev 必须存在，否则 bsd_init 里的 `devfs_kernel_mount("/dev")` 返回 ENOENT
+# （真机日志：`devfs_kernel_mount: kernel_mount failed: 2`），随后 PID 1 打开
+# /dev/console 会失败 → 用户态任何输出都看不见。空的挂载点就够了。
+mkdir -p "$MNT/dev"
+chmod 755 "$MNT/dev"
+
 python3 - "$MNT/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist" <<'PY'
 import plistlib, sys
 from pathlib import Path

@@ -6201,3 +6201,85 @@ syntax        : ok
 官方绑定脚本的 `possible` 过滤条件是**给"链接器能按导出名解析"的场合**准备的；
 我们的内核是 prelink 合并产物，kext 符号不在 `LC_SYMTAB` 里，所以这条假设不成立。
 凡是"上游根据自己的产物形态做的假设"，接到我们这套 prelink 产物上都要重新验一遍。
+
+## 3.98 exec 已经成功，静默的原因是 /dev 不存在（2026-10-29，夜里）
+
+这一刷的屏幕结尾只有一行，**没有** `failed loading …` 也**没有** `Process 1 exec of … failed`：
+
+```
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+```
+
+`kern_exec.c` 的 `load_init_program()` 只有失败时才打印
+（`load_init_program: failed loading %s: errno %d` 或
+`Process 1 exec of %s failed, errno %d @%s:%d`），一条都没出现就意味着
+**exec 成功了** —— PID 1 已经是我们那个 64 KB 的 init，`cpusubtype 0` + 4 GiB
+`__PAGEZERO` 的修法（§3.95）生效。
+
+那为什么看不到 `R11_EL0_INIT_OK`？
+
+### 3.98.1 现场那一行被我读错了：是 devfs，不是 dove
+
+同一屏上更早有一行，我之前按低清照片读成了 `dove_kernel_mount: kernel_mount failed: 2`。
+内核里真正的字符串是：
+
+```
+devfs_kernel_mount: kernel_mount failed: %d
+```
+
+也就是 **`devfs` 挂到 `/dev` 失败，errno 2 = ENOENT**。原因很直接：
+`kernel_mount` 要求挂载点 vnode 存在，而我们的 APFS 种子卷里**没有 `/dev` 目录**
+（`make-data-seed.sh` 只建了 `private/var/...`、`sbin`、`usr/appleinternal/sbin`）。
+
+于是 PID 1 里 `open("/dev/console", O_WRONLY)` 返回 ENOENT，init 的两条
+`write()`（console 与 fd 1）都写不出去，然后 `b .` 静默死循环 —— 屏幕就停在那行。
+
+### 3.98.2 修法一：种子卷里补 `/dev`
+
+`make-data-seed.sh` 里加：
+
+```bash
+mkdir -p "$MNT/dev"
+chmod 755 "$MNT/dev"
+```
+
+空的挂载点就够，devfs 挂上去之后 `console`/`tty`/`zero`/`klog` 这些节点由
+`devfs_sinit` 自己建（内核里 `console|tty|zero|klog` 那组字符串就是它）。
+
+### 3.98.3 修法二：让 init 自己"证明"失败（不再有静默模式）
+
+`make-minimal-init.py` 生成 21 条指令（84 B）：
+
+```
+open("/dev/console", O_WRONLY)   → b.cs 到 brk #0x11   （open 失败：SIGTRAP）
+write(fd, "R11_EL0_INIT_OK\n")  → b.cs 到 udf #0       （write 失败：SIGILL）
+write(1, "R11_EL0_INIT_OK\n")   → 忽略结果
+b .                              → 保持 PID 1 存活
+```
+
+PID 1 收到 SIGTRAP/SIGILL 时内核会打 `panic`（`unexpected SIGKILL of …` 那套逻辑，
+之前 exec 失败时我们见过它真的能打印），这样"用户态跑没跑"就永远有答案：
+
+* 看到 `R11_EL0_INIT_OK` = 一切正常；
+* 看到 panic 提到 SIGTRAP = `/dev/console` 仍打不开（devfs 还没挂上）；
+* 看到 panic 提到 SIGILL = 打得到 console 但写不进去（`cons_ops` / tty 层问题）；
+* 什么都没有 = 用户态根本没跑（exec 的"成功"另有玄机）。
+
+重新生成后的 `seed/init.macho`：`65536 B`、`magic feedfacf cputype 0100000c
+cpusubtype 0 filetype 2 ncmds 3 sizeofcmds 512`、入口 `0x0000000100000220`、
+代码 84 B。
+
+### 3.98.4 为什么这次必须靠 CI
+
+种子是 `hdiutil` + `diskutil` 在 macOS 上造的（Linux/Windows 上没有可写的 APFS），
+所以我们只能改脚本、让 CI 重新生成种子和 payload。
+
+### 3.98.5 下一刷判据
+
+| 现象 | 结论 |
+| --- | --- |
+| `devfs_kernel_mount: kernel_mount failed` 消失 | `/dev` 挂上了 |
+| `R11_EL0_INIT_OK` 出现 | **EL0 用户态跑通**（这一阶段的终点） |
+| panic 提到 SIGTRAP | devfs 还是没挂上，下一步查 `devfs_kernel_mount` |
+| panic 提到 SIGILL | console 能开但写失败，查 tty / `cons_ops` |
+| 仍是只有 `attempting …` 且无 panic | 用户态没跑起来，回到 exec 路径查 |
