@@ -5481,3 +5481,84 @@ readable[actual].split('::', 1)[1] != readable[expected].split('::', 1)[1]
 `NativeRamBlock` 真正被链进内核；payload 带 `--data-ramdisk` 时它会读
 `/chosen/memory-map` 的 `RAMDisk`（16 字节：物理地址 + 长度）并发布成块设备 —— 那一步才是
 `BSD root:` 从 `md0` 变成磁盘、APFS 挂上自己卷的起点。
+
+## 3.88 绑定脚本的第二个坑：`c++filt` 会把符号原样吐回（2026-10-29）
+
+### 3.88.1 第 6 轮 CI 的报错
+
+`r11-logs (6).zip` 的 `tmp/ramblock.log`（审计依旧全绿）：
+
+```
+[ramblock] 绑定脚本比较已修补（_r11_tail + 打印出错名字）
+[ramblock] $ python3 scripts/build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block
+Concrete subclass dispatch mismatch at slot 7
+  actual=__ZNK14NativeRamBlock12getMetaClassEv (_ZNK14NativeRamBlock12getMetaClassEv)
+  expected=__ZNK20IOBlockStorageDevice12getMetaClassEv (_ZNK20IOBlockStorageDevice12getMetaClassEv)
+```
+
+括号里是 `readable[...]` 的值 —— **和 mangled 名一模一样**，说明 `xcrun c++filt`
+根本没有反解这两个符号（它把输入原样输出了）。于是两边「尾巴」都等于整串 mangled 名，
+必然不等 → 误报槽位不匹配。
+
+slot 7 正是**元类 getter**（`getMetaClass()`），每个 C++ 类都会覆盖它，本来就是合法的覆盖；
+这也解释了为什么只有它报错：其余槽位我们的声明与基类签名逐字相同（`actual == expected`），
+压根没走到「比尾巴」这条分支 —— slot 7 是第一次真正用到 `readable`。
+
+### 3.88.2 修法：不再依赖反解器
+
+`scripts/make-ramblock-bindings.py` 的 `patch_bindings_comparison()` 改成注入
+`_r11_mangled_tail()`，直接从 **mangled 名**里切出方法段（Itanium ABI：
+
+`__ZNK <14 NativeRamBlock> <12 getMetaClass> E v`），完全不依赖 `c++filt`：
+
+```python
+def _r11_mangled_tail(text):
+    if '::' in text:
+        return text.split('::', 1)[1]      # 反解成功就走原路
+    body = text
+    for prefix, cut in (('__ZNK', 4), ('__ZNV', 4), ('__ZNR', 4), ('__ZN', 4),
+                        ('_ZNK', 3), ('_ZNV', 3), ('_ZNR', 3), ('_ZN', 3)):
+        if body.startswith(prefix):
+            body = body[cut:]
+            break
+    while body[:1] in ('K', 'V', 'r'):
+        body = body[1:]
+    digits = ''
+    while body[:1].isdigit():
+        digits += body[0]; body = body[1:]
+    if digits:
+        body = body[int(digits):]
+    return body
+```
+
+`__ZNK14NativeRamBlock12getMetaClassEv` → `12getMetaClassEv`，
+`__ZNK20IOBlockStorageDevice12getMetaClassEv` → `12getMetaClassEv`，两边相等 → 通过；
+签名真的不同时（例如 `doAsyncReadWrite` 的参数表不一样）尾巴仍然不等，检查没有失效。
+
+第一版写成 `body[len(prefix) - 1:]`（想「保留 N」），对 `__ZN` 会多切一位变成 `N14Native…`，
+已在本地测出来后改成显式 `cut` 表。标记位从 `_r11_tail` 换成 `_r11_mangled_tail`，
+旧补丁会先被替换掉，避免同一文件里两套 helper。
+
+### 3.88.3 本地验证
+
+`E:\DeepSeekWorkspace\out\test-bindings-patch2.sh`：拿上游原始
+`build-native-virtio-bindings.py` 建 `/tmp/rbtest/scripts/`，连调两次修补函数，然后
+
+```
+helper defs: 1 / call sites: 2 / old form: 0 / stale tail: 0
+__ZNK14NativeRamBlock12getMetaClassEv         -> 12getMetaClassEv   vs 12getMetaClassEv   same=True
+__ZN14NativeRamBlock16doAsyncReadWriteEP19IOBufferMemoryDescriptoryyjP24IOStorageCompletion
+                                              -> 16doAsyncReadWriteEP19IOBufferMemoryDescriptoryyjP24IOStorageCompletion
+_ZdlPv                                        -> _ZdlPv
+```
+
+并对打补丁后的整份脚本做了 `compile()`，语法通过。
+
+### 3.88.4 下一轮判据（不变）
+
+| 现象 | 结论 |
+| --- | --- |
+| `PASS: …/libNativeRamBlock.a (… B)` | 绑定成功，内核链接期 15 个 `IOBlockStorageDevice` 符号消失 |
+| `Concrete subclass dispatch mismatch at slot N … tails=a/b` | 真的签名不一致，按 `tails=` 对比 |
+| `Unqualified original storage import` | `possible` 里缺符号（`getProperty`/`setProperties`/`requestIdle` 之类） |
+| `Concrete block class has missing/additional/pure virtual methods` | 子类没覆盖满 190 槽 |

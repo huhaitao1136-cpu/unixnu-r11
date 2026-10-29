@@ -177,41 +177,84 @@ def write_fixtures(tree: Path, candidate: Path, values: dict) -> None:
         handle.write('\n')
     log(f'元类偏移夹具: {aes}')
 
+HELPER_MARKER = '_r11_mangled_tail'
+
+# 这个方法按 mangled name 自己解析出「方法名」部分，不依赖 c++filt：
+# `__ZNK14NativeRamBlock12getMetaClassEv` → `12getMetaClassEv`
+# 这样即使 xcrun c++filt 把某个符号原样吐回来（= 没反解），比较也仍然是确定的。
+BINDINGS_HELPER = '''
+def _r11_mangled_tail(text):
+    if '::' in text:
+        return text.split('::', 1)[1]
+    body = text
+    for prefix, cut in (('__ZNK', 4), ('__ZNV', 4), ('__ZNR', 4), ('__ZN', 4),
+                        ('_ZNK', 3), ('_ZNV', 3), ('_ZNR', 3), ('_ZN', 3)):
+        if body.startswith(prefix):
+            body = body[cut:]
+            break
+    while body[:1] in ('K', 'V', 'r'):
+        body = body[1:]
+    digits = ''
+    while body[:1].isdigit():
+        digits += body[0]
+        body = body[1:]
+    if digits:
+        body = body[int(digits):]
+    return body
+
+'''
+
+
 def patch_bindings_comparison(tree: Path) -> None:
-    """`build-native-virtio-bindings.py` 用 `demangled.split('::', 1)[1]` 比方法名，
-    但有些名字（`operator delete(void*)` 之类）反解后没有 `::`，于是直接 IndexError。
-    这里把它换成一个不会炸的 `_tail()`，并把出错时的名字打出来。幂等；只改树内副本。"""
+    """`build-native-virtio-bindings.py` 用 `demangled.split('::', 1)[1]` 比方法名：
+    ① 有些名字反解后没有 `::`（`operator delete(void*)`），直接 IndexError；
+    ② `xcrun c++filt` 有时会把符号原样吐回（例如 `_ZNK14NativeRamBlock12getMetaClassEv`），
+       这时两边的「尾巴」其实是整串 mangled 名，必然不等 → 误报 slot 不匹配。
+    改成用 `_r11_mangled_tail()` 直接从 mangled 名里切出方法段，并把出错名字打全。
+    幂等（标记 `_r11_mangled_tail`）；只改装配树里的副本。"""
     script = tree / 'scripts' / 'build-native-virtio-bindings.py'
     if not script.is_file():
         log('警告: 装配树里没有 build-native-virtio-bindings.py，跳过比较修补')
         return
     text = script.read_text(encoding='utf-8')
-    if '_r11_tail' in text:
+    if HELPER_MARKER in text:
         log('绑定脚本比较已修补过')
         return
     anchor = "readable = dict(zip(all_names, demangled))\n"
     if anchor not in text:
-        log('警告: 绑定脚本结构变了，没能插入 _r11_tail')
+        log('警告: 绑定脚本结构变了，没能插入 %s' % HELPER_MARKER)
         return
-    helper = (anchor +
-              "def _r11_tail(text):\n"
-              "    return text.split('::', 1)[1] if '::' in text else text\n")
-    text = text.replace(anchor, helper, 1)
-    old = ("        if not own or (row['slot'] not in (0, 1) and readable[actual].split('::', 1)[1] "
-           "!= readable[expected].split('::', 1)[1]):\n"
-           "            raise SystemExit('Concrete subclass dispatch mismatch at slot ' + str(row['slot']))")
-    new = ("        if not own or (row['slot'] not in (0, 1) and _r11_tail(readable[actual]) "
-           "!= _r11_tail(readable[expected])):\n"
+    # 上一版（`_r11_tail`）先撤掉，避免同一个文件里两套 helper。
+    text = text.replace(anchor +
+                        "def _r11_tail(text):\n"
+                        "    return text.split('::', 1)[1] if '::' in text else text\n",
+                        anchor, 1)
+    text = text.replace(anchor, anchor + BINDINGS_HELPER, 1)
+    new = ("        if not own or (row['slot'] not in (0, 1) and _r11_mangled_tail(readable[actual]) "
+           "!= _r11_mangled_tail(readable[expected])):\n"
            "            raise SystemExit('Concrete subclass dispatch mismatch at slot ' + str(row['slot']) +\n"
            "                             ' actual=' + str(actual) + ' (' + readable[actual] + ')' +\n"
-           "                             ' expected=' + str(expected) + ' (' + readable[expected] + ')')")
-    if old not in text:
-        log('警告: 绑定脚本的比较语句变了，只补了 _r11_tail 没改调用点')
-    else:
-        text = text.replace(old, new, 1)
+           "                             ' expected=' + str(expected) + ' (' + readable[expected] + ')' +\n"
+           "                             ' tails=' + _r11_mangled_tail(readable[actual]) + '/' +\n"
+           "                             _r11_mangled_tail(readable[expected]))")
+    patched = False
+    for old in ("        if not own or (row['slot'] not in (0, 1) and readable[actual].split('::', 1)[1] "
+                "!= readable[expected].split('::', 1)[1]):\n"
+                "            raise SystemExit('Concrete subclass dispatch mismatch at slot ' + str(row['slot']))",
+                "        if not own or (row['slot'] not in (0, 1) and _r11_tail(readable[actual]) "
+                "!= _r11_tail(readable[expected])):\n"
+                "            raise SystemExit('Concrete subclass dispatch mismatch at slot ' + str(row['slot']) +\n"
+                "                             ' actual=' + str(actual) + ' (' + readable[actual] + ')' +\n"
+                "                             ' expected=' + str(expected) + ' (' + readable[expected] + ')')"):
+        if old in text:
+            text = text.replace(old, new, 1)
+            patched = True
+            break
+    if not patched:
+        log('警告: 绑定脚本的比较语句变了，只插入了 %s 没改调用点' % HELPER_MARKER)
     with open(script, 'w', encoding='utf-8', newline='\n') as handle:
         handle.write(text)
-    log('绑定脚本比较已修补（_r11_tail + 打印出错名字）')
+    log('绑定脚本比较已修补（%s + 打印出错名字）' % HELPER_MARKER)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
