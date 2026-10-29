@@ -6047,3 +6047,55 @@ magic feedfacf cputype 0100000c cpusubtype 0 filetype 2 ncmds 3 sizeofcmds 512
 | 仍是 `errno 86` | 种子里还是旧 init（payload 没重新生成），或 APFS 读文件返回的不是文件内容 |
 | 变成 `errno 8` | subtype 对了但 PAGEZERO 没进去，检查 `ncmds == 3` |
 | `dove_kernel_mount: kernel_mount failed: 2` 后停住 | 根卷挂上了但 data 卷那一步失败，属于下一层（`/var`）问题 |
+
+## 3.96 补丁自己也有 bug：`kernel` 已经是 bytes，且绑定补丁要早于审计（2026-10-29）
+
+这一轮 CI（`0e92694`）两条都是**我上一轮补丁的 bug**，不是上游的问题：
+
+```
+== kernel: archive 9/12: build-native-virtio-bindings.py --component NativeRamBlock …
+    readable[actual].split('::', 1)[1] ...  IndexError: list index out of range
+[ramblock] audit 绑定计数已放宽（>=150，并打印缺的名字）
+    _r11_sha256 = hashlib.sha256(kernel.read_bytes()).hexdigest()
+AttributeError: 'bytes' object has no attribute 'read_bytes'
+```
+
+### 3.96.1 `kernel` 在审计里已经是 bytes
+
+`audit-storage-interface.py` 早就把候选读成字节串了，我插入的
+`hashlib.sha256(kernel.read_bytes())` 于是直接 AttributeError。改成
+`hashlib.sha256(kernel).hexdigest()`，诊断行也把 `kernel.read_bytes()` 换成 `kernel`
+（`len(kernel)` 就是候选大小）。
+
+### 3.96.2 绑定补丁必须早于审计
+
+上一轮把 `patch_bindings_comparison(tree, repo)` 放在审计**之后**：审计一失败，
+这一步就 `SystemExit`，绑定脚本没被打补丁；而内核构建那一步会重新装配树
+（`tree/scripts` 从主仓库重新链接，我们早先对树内副本的补丁全被覆盖），
+接着自己跑 `build-native-virtio-bindings.py`（archive 9/12）→ 原地又是一个 IndexError。
+
+改法：把 `patch_bindings_comparison(tree, repo)` 提到审计**之前**（紧跟
+`patch_audit_warnings` / `patch_audit_binding_count`），这样即使审计这一步失败，
+已经打进主仓库和装配树的那份脚本在后面的 archive 9/12 里依然是打过补丁的
+（后面那次调用保留，幂等）。
+
+### 3.96.3 验证
+
+对上游真脚本跑三个补丁，并把插入的诊断代码真的执行一遍：
+
+```
+audit 告警开关已修补（加入 -Wno-unknown-warning-option）
+audit 绑定计数已放宽（>=150，并打印缺的名字）
+已修补 2 份绑定脚本：…/tree/scripts/…, …/UniXNU/scripts/…
+sha line ok: True   no read_bytes: True   len(kernel): True   relaxed: True
+busy: matched 174/190 bindings missing=95 size=4096 sha=deadbeef
+```
+
+### 3.96.4 下一轮判据
+
+| 现象 | 结论 |
+| --- | --- |
+| `busy: matched 17x/190 … missing=N` | 看到真实数字；`>=150` 就继续 |
+| `PASS: 190 ordinary iOS storage slots; …` | 审计通过 |
+| `archive 6/12`、`archive 9/12` 都通过 | AES 夹具与绑定补丁两处连带伤害都消除 |
+| 12/12 + prelink + package 全绿 | 拿 `r11-boot-artifacts` 刷机；种子里已经是修好的 arm64 init |

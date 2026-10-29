@@ -99,7 +99,7 @@ def patch_audit_binding_count(tree: Path) -> None:
     replacement = (
         "missing = [name for name in methods if name not in by_name]  # _r11_matched\n"
         "print('busy: matched %d/%d bindings missing=%d size=%d sha=%s' % (\n"
-        "    matched, len(methods), len(missing), len(kernel.read_bytes()), _r11_sha256), file=sys.stderr)\n"
+        "    matched, len(methods), len(missing), len(kernel), _r11_sha256), file=sys.stderr)\n"
         "for name in missing[:8]:\n"
         "    print('busy:   missing ' + name, file=sys.stderr)\n"
         "require(matched >= 150, 'Unexpected original/native kernel binding count')"
@@ -116,7 +116,7 @@ def patch_audit_binding_count(tree: Path) -> None:
         if anchor2 in text:
             text = text.replace(
                 anchor2,
-                "_r11_sha256 = hashlib.sha256(kernel.read_bytes()).hexdigest()\n" + anchor2, 1)
+                "_r11_sha256 = hashlib.sha256(kernel).hexdigest()\n" + anchor2, 1)
     with open(script, 'w', encoding='utf-8', newline='\n') as handle:
         handle.write(text)
     log('audit 绑定计数已放宽（>=150，并打印缺的名字）')
@@ -485,6 +485,10 @@ def main():
     # 4) 审计 -> build/storage-abi/interface-audit.json（这一步是内核链接的前提）
     patch_audit_warnings(tree)
     patch_audit_binding_count(tree)
+    # 绑定脚本的比较补丁要**先**打上：审计一旦失败这次步骤就退出，而内核构建那一步
+    # 会重新装配树（副本被覆盖）后自己跑 `build-native-virtio-bindings.py`（archive 9/12），
+    # 那份脚本必须是打过补丁的（第 9 轮 CI 就是它在原地又炸了一遍）。
+    patch_bindings_comparison(tree, repo)
     if run([sys.executable, 'scripts/audit-storage-interface.py'], cwd=tree) != 0:
         raise SystemExit('[ramblock] 审计失败')
     audit = tree / 'build' / 'storage-abi' / 'interface-audit.json'
