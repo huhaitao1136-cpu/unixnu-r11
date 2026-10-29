@@ -5281,3 +5281,31 @@ HTTP range 取出来的（`scripts/unixnu/ipsw.py:198-229`，落在 `out/ipsw/<b
 
 下一轮要看的仍然是 §3.85.5 那三处，先看 `ramblock.log` 有没有 `审计: slots=190 …` 与
 `PASS: …libNativeRamBlock.a`。
+
+### 3.85.7 第二轮 CI：kernelcache 拿对了，`kits/` 还没铺（2026-10-29 16:15）
+
+`ramblock.log` 这次出现了前半截好消息：
+
+```
+[ramblock] refer/IOStorageFamily -> out/feeds/IOStorageFamily-ad2e13e0
+[ramblock] 本地还没有 kernelcache，让 unixnu 从 IPSW 里取（只走 HTTP range，不下载整包）
+[ramblock] kernelcache: out/ipsw/21H461/kernelcache.decompressed
+```
+
+随后死在 `emit_prelink.py` 不存在：
+
+```
+can't open file '…/out/r11/tree/kits/NativePrelink/emit_prelink.py': [Errno 2] No such file or directory
+```
+
+原因：`kits/`、`scripts/`、`drivers/` 这些模块是 `./unixnu tree`（也就是 `build` 的第一步）
+才铺进装配树的；我们的绑定步骤排在编译内核之前，那一轮装配树里只有缓存恢复出来的
+`.cache/` 与 `build/`，`kits/` 还是空的。CI 缓存只缓存 `out/feeds`、
+`out/r11/tree/.cache`、`out/r11/tree/build`，不含 `out/r11/tree/kits`。
+
+修法两处：
+
+1. 工作流这一步开头先 `( cd UniXNU && ./unixnu tree -D ../device )`，把装配树铺好；
+2. 脚本新增 `prelink_tool()`：优先用装配树里的 `kits/NativePrelink/emit_prelink.py`，
+   找不到就退回主仓库同名文件（两处内容相同，都是 kits 模块的副本），
+   这样即使装配树没铺也能出候选。

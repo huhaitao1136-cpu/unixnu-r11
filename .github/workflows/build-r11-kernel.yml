@@ -79,6 +79,10 @@ jobs:
       - name: 生成 RamBlock 的 IOStorageFamily 绑定（审计 + .set）
         continue-on-error: true
         run: |
+          set -e
+          # 先把装配树铺出来：kits/（emit_prelink.py）与 scripts/（审计、绑定）都在里面，
+          # 而本步骤排在编译内核之前，不能指望 build 自己刚铺过。
+          ( cd UniXNU && ./unixnu tree -D ../device 2>&1 | tail -20 )
           python3 device/scripts/make-ramblock-bindings.py UniXNU device/board.toml 2>&1 | tee /tmp/ramblock.log | tail -40
           echo "== ramblock.log =="; wc -l /tmp/ramblock.log
 

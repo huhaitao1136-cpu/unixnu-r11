@@ -52,6 +52,16 @@ def feed_dir(feeds: Path, name: str) -> Path:
     return matches[-1]
 
 
+def prelink_tool(repo: Path, tree: Path, relative: str) -> Path:
+    """emit_prelink.py 在装配树里，但装配树的 kits/ 要等 ./unixnu tree 才出现 ——
+    所以先找树里的，找不到就退回主仓库那份（两者内容相同，都是 kits/ 模块）。"""
+    for base in (tree, repo):
+        candidate = base / relative
+        if candidate.is_file():
+            return candidate
+    raise SystemExit(f'[ramblock] 找不到 {relative}（先跑 ./unixnu tree -D ../device）')
+
+
 def find_kernelcache(repo: Path, cache_root: Path, device: Path) -> Path:
     """kernelcache.decompressed：先找现成的，没有就让 unixnu 去 IPSW 里取。"""
     for candidate in sorted(cache_root.glob('*/kernelcache.decompressed')):
@@ -114,7 +124,7 @@ def main():
     for stale in (positive, positive.with_suffix('.json')):
         stale.unlink(missing_ok=True)
 
-    command = [sys.executable, str(tree / spec['tool']),
+    command = [sys.executable, str(prelink_tool(repo, tree, spec['tool'])),
                '--kernel', str(noctf), '--prelinked', str(kernelcache),
                f'--slide={spec["slide"]}', '--output', str(positive)]
     for root in spec.get('roots', []):
