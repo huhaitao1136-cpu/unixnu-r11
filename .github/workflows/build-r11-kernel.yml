@@ -178,15 +178,22 @@ jobs:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
           set -o pipefail
-          # 为什么这里干脆不带种子：
-          #   --data-ramdisk 要的是稠密 raw（.raw），但 --skip-setup 的
-          #   seed-data-skip-setup.py 只会解析 DBRDISK1 打包件，传 .raw 会
-          #   ValueError: Invalid packed RAM disk header；
-          #   而打包件（.dbr）只能通过 PackedRAMDisk 交给 NativeRamBlock，
-          #   那个驱动这一阶段没开。
-          # 所以本阶段用「不带种子的 payload」——这也正是之前真机刷过的配置，
-          # 存储探测发生在 IOKit 匹配期，比挂根卷早，不需要 Data 卷。
-          ./unixnu build -D ../device payload 2>&1 | tee /tmp/payload.log | tail -50
+          # RamBlock 支线：payload 要带上稠密 raw 的 Data 镜像（.raw），ADT 用
+          # --data-ramdisk 声明它 → UniXNU 往 /chosen/memory-map 写 RAMDisk →
+          # 内核里的 NativeRamBlock 把它发布成块设备 → IOMedia → APFS 根卷。
+          # 注意不能用 --skip-setup（那个工具只认 DBRDISK1 打包件），所以种子里的
+          # Setup 状态由 make-data-seed.sh 自己写好（com.apple.purplebuddy.plist）。
+          SEED="$RUNNER_TEMP/seed.dbr.raw"
+          # 注意：runner 的 /bin/bash 是 3.2，set -u 下空数组展开会报
+          # "unbound variable"，所以用字符串而不是数组拼参数。
+          SEED_ARG=""
+          if [ -f "$SEED" ]; then
+            SEED_ARG="--data-ramdisk $SEED"
+            ls -l "$SEED"
+          else
+            echo "::warning::没有 $SEED，payload 将不带 Data 镜像（NativeRamBlock 无法上线）"
+          fi
+          ./unixnu build -D ../device payload $SEED_ARG 2>&1 | tee /tmp/payload.log | tail -50
 
       - name: 失败时也上传日志
         if: always()
