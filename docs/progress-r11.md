@@ -5410,3 +5410,74 @@ TCR_EL1=22a51a251a  SCTLR_EL1=3454593d  TTBR0_EL1=4c384000  TTBR1_EL1=4c385000
 审计通过 → `build-native-virtio-bindings.py` 生成 `.set` 绑定 → 链接期 15 个
 `IOBlockStorageDevice` 符号消失 → `NativeRamBlock` 上线 → `payload --data-ramdisk`
 把 Data 镜像发布成块设备 → `BSD root` 变成 disk 设备 → APFS 挂卷 → 真 launchd。
+
+## 3.87 官方审计通过了 —— 只剩绑定脚本自己的一个反解崩溃（2026-10-29）
+
+### 3.87.1 第 5 轮 CI 的实际结果
+
+`r11-logs (5).zip` 的 `tmp/ramblock.log`：
+
+```
+[ramblock] dispatch: vtable=0xfffffff005cb44c0 meta=0xfffffff006add1d0 service=0xfffffff007b0cc38
+[ramblock] 活体夹具: …/tree/build/darwinboot-storage-native-metadata/gdb-stop.json
+[ramblock] 元类偏移夹具: …/tree/build/image4-ignition/aes-interface-audit.json
+PASS: 190 ordinary iOS storage slots; 176 kernel bindings (162 inherited + 14 pure virtual)
+Live original block/service sizes 0x90/0x88 and native 4K.
+[ramblock] 审计: slots=190 live4k=True
+NativeRamBlock: -Werror build and actual ARM64/iOS 17 object audit passed
+[ramblock] $ python3 scripts/build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block
+Traceback (most recent call last):
+  File ".../scripts/build-native-virtio-bindings.py", line 58, in <module>
+    if not own or (row['slot'] not in (0, 1) and readable[actual].split('::', 1)[1] != readable[expected].split('::', 1)[1]):
+IndexError: list index out of range
+```
+
+也就是说：**官方 `audit-storage-interface.py` 在我们这套候选内核上第一次跑通**
+（190 个方法槽、176 个内核绑定、活体元类 `0x90/0x88`、4 KiB 页），`NativeRamBlock.o`
+也通过了它自己的 `-Werror` + ARM64/iOS 17 对象审计。剩下的是绑定生成器**自己**的 bug。
+
+### 3.87.2 根因
+
+`build-native-virtio-bindings.py:57` 用「反解后的方法名尾巴」判断子类是不是**同名覆盖**：
+
+```python
+readable = dict(zip(all_names, demangled))          # all_names → xcrun c++filt
+...
+readable[actual].split('::', 1)[1] != readable[expected].split('::', 1)[1]
+```
+
+`c++filt` 对某些符号反解不出 `类::方法` 的形状（例如 `operator delete(void*)`、
+`__cxa_pure_virtual`、纯 C 名字），`split('::', 1)` 只有 1 段，`[1]` 直接 `IndexError`。
+这个分支只在「子类覆盖了基类方法但名字不完全相同」时才会走到 —— 我们的
+`NativeRamBlock` 覆盖了全部 190 槽，所以必然踩上。
+
+### 3.87.3 修法
+
+`scripts/make-ramblock-bindings.py` 新增 `patch_bindings_comparison(tree)`（幂等，只改装配树里的那份副本）：
+
+1. 在 `readable = dict(zip(all_names, demangled))` 之后插入
+   `def _r11_tail(text): return text.split('::', 1)[1] if '::' in text else text`；
+2. 把比较语句换成 `_r11_tail(readable[actual]) != _r11_tail(readable[expected])`；
+3. 失败时把 `actual` / `expected` 的 mangled 名和反解名一起打进 `SystemExit`
+   （下一轮若真有不匹配，日志能直接看出是哪个槽）。
+
+本地验证（`E:\DeepSeekWorkspace\out\test-bindings-patch.sh`）：用上游原始脚本建
+`/tmp/rbtest/scripts/`，连续调两次 `patch_bindings_comparison()` → 第一次打补丁、
+第二次幂等；`helper: 1 / call-site: 1 / old-form left: 0`。
+
+提交：`04f8034 ramblock: make the bindings generator's method-name comparison tolerant of undemanglable slots`。
+
+### 3.87.4 下一轮要看的
+
+| 现象 | 结论 |
+| --- | --- |
+| `PASS: …/libNativeRamBlock.a (… B)，IOBlockStorageDevice 相关符号 N 行` | 绑定成功，编译内核时那 15 个符号应该消失 |
+| `Concrete subclass dispatch mismatch at slot N actual=… expected=…` | 我们的子类槽位与审计记录的基类方法顺序不一致，按打印出的槽号核对 |
+| `Unqualified original storage import` | `possible` 里缺符号（多半是 `getProperty`/`setProperties`/`requestIdle` 这类 OSObject 方法），需要把它们也放进 `possible` |
+| `Concrete block class has missing/additional/pure virtual methods` | 子类没有覆盖满 190 槽 |
+| `Concrete driver must not invoke abstract complete/deleting destruction` | 驱动里出现了 `IOBlockStorageDeviceD0/D1` 的调用 |
+
+绑定成功之后：`./unixnu build -D ../device kernel package` 链接期不再缺 `IOBlockStorageDevice`，
+`NativeRamBlock` 真正被链进内核；payload 带 `--data-ramdisk` 时它会读
+`/chosen/memory-map` 的 `RAMDisk`（16 字节：物理地址 + 长度）并发布成块设备 —— 那一步才是
+`BSD root:` 从 `md0` 变成磁盘、APFS 挂上自己卷的起点。
