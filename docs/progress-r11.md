@@ -5562,3 +5562,45 @@ _ZdlPv                                        -> _ZdlPv
 | `Concrete subclass dispatch mismatch at slot N … tails=a/b` | 真的签名不一致，按 `tails=` 对比 |
 | `Unqualified original storage import` | `possible` 里缺符号（`getProperty`/`setProperties`/`requestIdle` 之类） |
 | `Concrete block class has missing/additional/pure virtual methods` | 子类没覆盖满 190 槽 |
+
+## 3.89 绑定前先对账：把「没被审计覆盖的符号」提前打出来（2026-10-29）
+
+`build-native-virtio-bindings.py` 的门槛有三层：槽位比对（§3.88 修完）→
+`possible` 覆盖检查（`Unqualified original storage import`）→ 生成汇编并 `ar`。
+第二层的失败信息只有一句 `Unqualified original storage import`，看不出是哪个符号，
+而每跑一次 CI 要十几分钟。
+
+所以 `scripts/make-ramblock-bindings.py` 加了两件事，都在**绑定脚本之前**：
+
+1. `object_undefined(obj)`：自己解析 `build/native-ram-block/NativeRamBlock.o` 的
+   `LC_SYMTAB`，取出 `n_type == 1`（`N_UNDF|N_EXT`）且名字含 `IOBlockStorageDevice` 的符号
+   —— 与绑定脚本里的判法完全一致（`<IBBHQ` 的第二个字段 == 1）；
+2. `report_undefined(obj, record)`：用与绑定脚本**同一套**规则算出 `possible`
+   （`audit['methods']` 里 `kernel_names` 为空的 `reference_name` → `candidate_target`，
+   外加构造函数/析构/元类/vtable 四个显式项），然后打印
+
+```
+[ramblock] 未解析符号: N 个，审计覆盖 A 个，缺 M 个
+[ramblock] 审计里带 kernel_names 的槽: K 个（这些不走 candidate_target 绑定）
+[ramblock]   缺: <name> (slot S, kernel_names=[...])      # 或 (不在 vtable 槽里：构造函数/init/OSObject 方法一类)
+```
+
+本地用合成对象验证（`E:\DeepSeekWorkspace\out\test-report-undefined.sh`：手写 Mach-O 头 +
+`LC_SYMTAB` + 三条未定义符号 + 一条已定义符号）：
+
+```
+undefined: ['__ZTV20IOBlockStorageDevice', '__ZN20IOBlockStorageDevice4initEP12OSDictionary', '__ZN20IOBlockStorageDevice17doSynchronizeCacheEv']
+[ramblock] 未解析符号: 3 个，审计覆盖 1 个，缺 2 个
+[ramblock]   缺: __ZN20IOBlockStorageDevice4initEP12OSDictionary (不在 vtable 槽里：构造函数/init/OSObject 方法一类)
+[ramblock]   缺: __ZN20IOBlockStorageDevice17doSynchronizeCacheEv (slot 9, kernel_names=[...])
+```
+
+（第一次测的时候 `undefined: []`，是自己合成的假对象把 `cmdsize` 写成 16 而实际写了 24 字节，
+不是解析器的问题；改成 24 就够了。）
+
+这样下一轮 CI 只有两种结局，都很明确：
+
+* `PASS: …/libNativeRamBlock.a (… B)` —— 15 个符号全部被绑定，链接期不再缺；
+* 仍然失败，但日志里已经列清 `缺:` 的每个符号和它的槽位/`kernel_names`，我们可以据此决定
+  是扩展 `possible`（对 `kernel_names` 非空的槽改绑到 prelink 后的 kernel 地址），
+  还是回驱动里少覆盖几个可选槽。

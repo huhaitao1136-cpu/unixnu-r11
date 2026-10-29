@@ -256,6 +256,62 @@ def patch_bindings_comparison(tree: Path) -> None:
         handle.write(text)
     log('绑定脚本比较已修补（%s + 打印出错名字）' % HELPER_MARKER)
 
+def object_undefined(obj: Path) -> list[str]:
+    """读出 Mach-O 对象里 `N_UNDF|N_EXT` 且名字含 IOBlockStorageDevice 的符号。
+    与 `build-native-virtio-bindings.py` 里的判法一致（`<IBBHQ` 的第二个字段 == 1）。"""
+    data = obj.read_bytes()
+    magic, _cputype, _cpusubtype, _filetype, ncmds, _sizeofcmds, _flags, _res = struct.unpack_from('<8I', data, 0)
+    if magic not in (0xFEEDFACF, 0xFEEDFACD):
+        return []
+    offset = 32
+    symtab = None
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from('<II', data, offset)
+        if cmd == 2:                       # LC_SYMTAB
+            symtab = struct.unpack_from('<4I', data, offset + 8)
+        offset += cmdsize
+    if not symtab:
+        return []
+    symoff, nsyms, stroff, _strsize = symtab
+    names = []
+    for index in range(nsyms):
+        strx, ntype, _sect, _desc, _value = struct.unpack_from('<IBBHQ', data, symoff + index * 16)
+        if ntype != 1:                     # N_UNDF | N_EXT
+            continue
+        end = data.index(b'\0', stroff + strx)
+        name = data[stroff + strx:end].decode('utf-8', 'replace')
+        if 'IOBlockStorageDevice' in name:
+            names.append(name)
+    return names
+
+
+def report_undefined(obj: Path, record: dict) -> None:
+    """在跑绑定脚本之前把「对象里还没解析的 IOBlockStorageDevice 符号」对照审计记录列出来。
+    这样一旦下一轮还是在绑定阶段失败，日志里就能直接看到是哪个符号没被审计覆盖。"""
+    undefined = object_undefined(obj)
+    if not undefined:
+        log('对象里没有未解析的 IOBlockStorageDevice 符号')
+        return
+    methods = record.get('methods', [])
+    possible = {row['reference_name'] for row in methods if not row.get('kernel_names')}
+    possible.update({'__ZN20IOBlockStorageDeviceC2EPK11OSMetaClass',
+                     '__ZN20IOBlockStorageDeviceD2Ev',
+                     '__ZN20IOBlockStorageDevice10gMetaClassE',
+                     '__ZTV20IOBlockStorageDevice'})
+    missing = [name for name in undefined if name not in possible]
+    covered = len(undefined) - len(missing)
+    log(f'未解析符号: {len(undefined)} 个，审计覆盖 {covered} 个，缺 {len(missing)} 个')
+    whole = [row for row in methods if row.get('kernel_names')]
+    log(f'审计里带 kernel_names 的槽: {len(whole)} 个（这些不走 candidate_target 绑定）')
+    for name in missing:
+        hint = ''
+        row = next((r for r in methods if r.get('reference_name') == name), None)
+        if row is not None:
+            hint = f" (slot {row.get('slot')}, kernel_names={row.get('kernel_names')})"
+        else:
+            hint = ' (不在 vtable 槽里：构造函数/init/OSObject 方法一类)'
+        log(f'  缺: {name}{hint}')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('repo', help='UniXNU 主仓库目录')
@@ -333,6 +389,7 @@ def main():
         return 0
 
     # 5) 生成绑定归档 build/native-ram-block/libNativeRamBlock.a
+    report_undefined(obj, record)
     patch_bindings_comparison(tree)
     if run([sys.executable, 'scripts/build-native-virtio-bindings.py',
             '--component', 'NativeRamBlock', '--directory', 'build/native-ram-block'], cwd=tree) != 0:
