@@ -52,6 +52,29 @@ def feed_dir(feeds: Path, name: str) -> Path:
     return matches[-1]
 
 
+def patch_audit_warnings(tree: Path) -> None:
+    """审计脚本给参考对象硬塞了一串 `-Wno-*`，其中 `-Wno-unnecessary-virtual-specifier`
+    在 CI 的 clang 上不存在；叠上它自己加的 `-Werror` 就是“unknown warning option”直接失败。
+    这里补一个 `-Wno-unknown-warning-option`，让"不认识的告警开关"退化成噪音。
+    幂等；只改装配树里的副本（每次构建都会从主仓库重新铺一份）。"""
+    script = tree / 'scripts' / 'audit-storage-interface.py'
+    if not script.is_file():
+        log('警告: 装配树里没有 audit-storage-interface.py，跳过告警开关修补')
+        return
+    text = script.read_text(encoding='utf-8')
+    if '-Wno-unknown-warning-option' in text:
+        log('audit 告警开关已修补过')
+        return
+    anchor = "'-Wno-deprecated-enum-enum-conversion']"
+    if anchor not in text:
+        log('警告: audit 脚本的告警开关列表变了，没能插入 -Wno-unknown-warning-option')
+        return
+    text = text.replace(anchor, "'-Wno-deprecated-enum-enum-conversion',\n            '-Wno-unknown-warning-option']", 1)
+    with open(script, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(text)
+    log('audit 告警开关已修补（加入 -Wno-unknown-warning-option）')
+
+
 def prelink_tool(repo: Path, tree: Path, relative: str) -> Path:
     """emit_prelink.py 在装配树里，但装配树的 kits/ 要等 ./unixnu tree 才出现 ——
     所以先找树里的，找不到就退回主仓库那份（两者内容相同，都是 kits/ 模块）。"""
@@ -137,6 +160,7 @@ def main():
     log(f'候选: {positive} ({positive.stat().st_size} B)')
 
     # 3) 审计 -> build/storage-abi/interface-audit.json（这一步是内核链接的前提）
+    patch_audit_warnings(tree)
     if run([sys.executable, 'scripts/audit-storage-interface.py'], cwd=tree) != 0:
         raise SystemExit('[ramblock] 审计失败')
     audit = tree / 'build' / 'storage-abi' / 'interface-audit.json'

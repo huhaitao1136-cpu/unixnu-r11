@@ -5309,3 +5309,34 @@ can't open file '…/out/r11/tree/kits/NativePrelink/emit_prelink.py': [Errno 2]
 2. 脚本新增 `prelink_tool()`：优先用装配树里的 `kits/NativePrelink/emit_prelink.py`，
    找不到就退回主仓库同名文件（两处内容相同，都是 kits 模块的副本），
    这样即使装配树没铺也能出候选。
+
+### 3.85.8 第三轮 CI：候选出来了，审计卡在一个不存在的告警开关（2026-10-29 16:30）
+
+这一轮 progress 很明确：
+
+```
+[ramblock] kernelcache: out/ipsw/21H461/kernelcache.decompressed
+Experimental candidate: 54034432 bytes; executable bytes unchanged; runtime unqualified
+[ramblock] 候选: …/build/native-prelink/native-apfs-load-positive.macho (54034432 B)
+[ramblock] $ python3.14 scripts/audit-storage-interface.py
+error: unknown warning option '-Wno-unnecessary-virtual-specifier';
+       did you mean '-Wno-duplicate-decl-specifier'? [-Werror,-Wunknown-warning-option]
+[ramblock] 审计失败
+```
+
+即 §3.85.7 的两处修法生效了（装配树铺好、`emit_prelink` 出候选），新的失败点是审计**自己**：
+`scripts/audit-storage-interface.py:48-50` 在调用记录之外又硬塞了一串告警开关——
+
+```python
+'-Wall', '-Wextra', '-Werror', …,
+'-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-unnecessary-virtual-specifier',
+'-Wno-deprecated-enum-enum-conversion'
+```
+
+`-Wno-unnecessary-virtual-specifier` 是较新 clang 才有的开关，CI runner 的 clang 不认；
+配上它自己加的 `-Werror`，一个"不认识的告警开关"就让整个审计崩掉。
+
+修法（`scripts/make-ramblock-bindings.py` 新增 `patch_audit_warnings()`）：跑审计之前，
+在装配树里那份 `scripts/audit-storage-interface.py` 的开关列表末尾补
+`-Wno-unknown-warning-option`，让"不认识的告警开关"退化成噪音；幂等，且只改装配树里的
+副本（每次构建都会从主仓库重新铺一份，不污染上游）。
