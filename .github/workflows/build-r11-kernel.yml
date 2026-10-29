@@ -71,6 +71,17 @@ jobs:
         working-directory: UniXNU
         run: python3 ../device/scripts/patch-tree-for-sdhci.py
 
+      # NativeRamBlock 的归档要引用 IOBlockStorageDevice 的 15 个符号，必须靠 `.set`
+      # 绑定到原版 kext 被 slide 后的绝对地址。绑定地址来自审计，而审计需要一份
+      # prelink 候选（输入是上一次成功编译出来的 noctf）。所以这一步要排在编译内核之前，
+      # 靠缓存里的 noctf 干活；冷缓存（第一次跑 / 缓存被清）时它会跳过并失败，
+      # 此时内核链接会因缺符号失败 —— 再跑一次即恢复正常。
+      - name: 生成 RamBlock 的 IOStorageFamily 绑定（审计 + .set）
+        continue-on-error: true
+        run: |
+          python3 device/scripts/make-ramblock-bindings.py UniXNU device/board.toml 2>&1 | tee /tmp/ramblock.log | tail -40
+          echo "== ramblock.log =="; wc -l /tmp/ramblock.log
+
       - name: 编译内核（耗时最长）
         working-directory: UniXNU
         # macos-15 的 arm64 runner 只有 3 核 / 7 GB 内存，-j4 在链接 54 MB 内核时
@@ -187,6 +198,7 @@ jobs:
             /tmp/payload.log
             /tmp/seed.log
             /tmp/diag.log
+            /tmp/ramblock.log
             UniXNU/out/r11/logs/**
           if-no-files-found: ignore
 

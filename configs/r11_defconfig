@@ -18,7 +18,11 @@ CONFIG_XNU_NATIVE_AES=y
 # NativeRamBlock 会让内核链接期缺 IOBlockStorageDevice 的符号，
 # 探测阶段只保留 NativeSdhci（纯 IOService，不碰 storage 层）。
 CONFIG_XNU_NATIVE_VIRTIO_BLOCK=n
-CONFIG_XNU_NATIVE_RAM_BLOCK=n
+# RamBlock：把内存里的 Data 镜像发布成块设备，APFS 根卷走这条线（不依赖 eMMC）。
+# 打开后链接期需要 IOBlockStorageDevice 的 15 个符号，由 board.toml 里紧跟其后的
+# build-native-virtio-bindings.py（配合 device/scripts/make-ramblock-bindings.py
+# 预先生成的审计）以 `.set` 绑定补齐。
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
 CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y

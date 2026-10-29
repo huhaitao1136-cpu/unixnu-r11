@@ -58,10 +58,12 @@ archives = [
   "build-native-aes-bindings.py",
   # eMMC 块设备驱动（我们自己写的，见 drivers/NativeSdhci）
   "build-arm-driver.py NativeSdhci",
-  # NativeRamBlock 依赖 IOStorageFamily 的原版绑定审计，探测阶段不需要：
-  # 它的归档一旦链进来，链接期就缺 IOBlockStorageDevice 的 15 个符号（见 docs §3.44）。
-  # 波形：先证明 eMMC 能读（NativeSdhci 探测模式），再做绑定审计把块设备层打开。
-  # "build-arm-driver.py NativeRamBlock",
+  # NativeRamBlock：把内存里的 Data 镜像发布成块设备（APFS 根卷走这条线，不依赖 eMMC）。
+  # 它的归档引用 IOBlockStorageDevice 的 15 个符号（docs §3.44），所以必须紧跟绑定脚本 ——
+  # 后者把这些符号 `.set` 到原版 kext 被 slide 之后的绝对地址。绑定需要一次成功的内核
+  # 编译产物（noctf）+ 审计，CI 里由 device/scripts/make-ramblock-bindings.py 预先备好。
+  "build-arm-driver.py NativeRamBlock",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
 # VIRTIO 归档已停用（R11 无 virtio）
   # "build-arm-driver.py NativeVirtioBlock",
   # R11 第一阶段不启用块存储栈（依赖参考内核候选），改用 mockfs
