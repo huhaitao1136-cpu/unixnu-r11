@@ -5741,3 +5741,63 @@ if aes_fixture.is_file():
 刷机后要验证的第一批日志：`NativeRamBlock` 是否被 personality 匹配（`KernelConfigTables.cpp` 里
 `XNU_NATIVE_RAM_BLOCK` 段），以及 `/chosen/memory-map` 里是 `RAMDisk`（dense）还是 `PackedRAMDisk`
 —— 若拿到的是 16 字节 `RAMDisk`，`BSD root:` 就不再是 `md0`，而是它发布出来的块设备。
+
+## 3.92 补丁被重新装配覆盖：必须改主仓库那份源码（2026-10-29）
+
+### 3.92.1 第 9 轮 CI
+
+AES 恢复正常了（`kernel.log` 里 archive 6/12 干净通过），但同一个脚本在**内核构建自己的 archive 9/12**
+里又炸了，而且报的是**原始**那句比较：
+
+```
+== kernel: archive 9/12: build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block
+  File ".../tree/scripts/build-native-virtio-bindings.py", line 58, in <module>
+    if not own or (row['slot'] not in (0, 1) and readable[actual].split('::', 1)[1] != ...
+IndexError: list index out of range
+```
+
+而我们那一步单独跑的时候明明是 `PASS: 190 concrete slots, 24 overrides …`。
+
+### 3.92.2 根因：`./unixnu build` 每次都会重新装配树
+
+`scripts/unixnu/tree.py` 每次 `assemble()` 都用**主仓库** `UniXNU/scripts/**` 重新建立
+`out/<dev>/tree/scripts/**` 的硬链接。我们之前只改了树内那份副本
+（`tree/scripts/build-native-virtio-bindings.py`），所以：
+
+1. 我们的步骤里：打补丁 → 跑绑定 → PASS（用的就是打过补丁的树内副本）；
+2. `./unixnu build`：重新装配 → 树内副本被主仓库的原始文件替换 → 补丁消失；
+3. archive 9/12 又跑 `build-native-virtio-bindings.py` → 回到原始代码 → IndexError。
+
+同一个原因也解释了为什么 `audit-storage-interface.py` 的告警开关补丁**一直有效**：
+它是「打补丁 → 立刻跑审计」，中间没有重新装配。
+
+### 3.92.3 修法：两份都改
+
+`scripts/make-ramblock-bindings.py` 拆成
+
+* `patch_one_bindings_script(script)`：就地修补一份，幂等，返回是否动过；
+* `patch_bindings_comparison(tree, repo=None)`：依次修补
+  `tree/scripts/…`、`repo/scripts/…`，以及 `repo.glob('out/*/tree')` / `out/*/*/*/tree` 下所有副本
+  （工厂布局两种都试，主仓库和装配树位置不同的情况都覆盖）。
+
+调用点改成 `patch_bindings_comparison(tree, repo)`。
+
+### 3.92.4 验证（`E:\DeepSeekWorkspace\out\test-reassembly-survival.sh`）
+
+造一套假布局（`/tmp/rbtree2/UniXNU` + `/tmp/rbtree2/UniXNU/out/r11/tree`，各放一份上游原始脚本）：
+
+```
+[ramblock] 已修补 2 份绑定脚本：…/tree/scripts/…, …/UniXNU/scripts/…
+tree patched: 1 / repo patched: 1
+[模拟 ./unixnu build 用主仓库覆盖树内那份]
+after re-assembly, tree still patched: 1        ← 关键：补丁活过了重新装配
+idempotent, tree: 1 repo: 1
+```
+
+### 3.92.5 下一轮判据
+
+| 现象 | 结论 |
+| --- | --- |
+| archive 9/12 打出 `PASS: 190 concrete slots, …` | 补丁活过装配，绑定进内核归档 |
+| 之后 `LD mach.development.bcm2837.unstripped.noctf` 报 `Undefined symbols:` | 11 个导入里有没被 vtable 绑定覆盖的，按名字补 `possible` |
+| 链接通过 + prelink + package 全绿 | 拿 `r11-boot-artifacts` 刷机，看 `NativeRamBlock` 是否上线 |

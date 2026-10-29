@@ -225,27 +225,17 @@ def _r11_same_method(actual, expected, readable):
 '''
 
 
-def patch_bindings_comparison(tree: Path) -> None:
-    """`build-native-virtio-bindings.py` 用 `demangled.split('::', 1)[1]` 比方法名，有三个坑：
-    ① 有些名字反解后没有 `::`（`operator delete(void*)`），直接 IndexError；
-    ② `xcrun c++filt` 有时把符号原样吐回（slot 7 的 `getMetaClass` 就是这样），
-       两边「尾巴」都是整串 mangled 名，必然不等 → 误报；
-    ③ Itanium 的 `S_` 替换使同一签名文本不同（`5startEPS_` vs `5startEP9IOService`），
-       纯文本比较仍会误报。
-    改成 `_r11_same_method()`：反解成功就按上游语义比整段尾巴，否则只比方法标识符。
-    幂等（标记 `_r11_same_method`）；只改装配树里的副本。"""
-    script = tree / 'scripts' / 'build-native-virtio-bindings.py'
+def patch_one_bindings_script(script: Path) -> bool:
+    """就地修补一份 `build-native-virtio-bindings.py`；幂等。返回是否动过。"""
     if not script.is_file():
-        log('警告: 装配树里没有 build-native-virtio-bindings.py，跳过比较修补')
-        return
+        return False
     text = script.read_text(encoding='utf-8')
     if HELPER_MARKER in text:
-        log('绑定脚本比较已修补过')
-        return
+        return False
     anchor = "readable = dict(zip(all_names, demangled))\n"
     if anchor not in text:
-        log('警告: 绑定脚本结构变了，没能插入 %s' % HELPER_MARKER)
-        return
+        log('警告: %s 结构变了，没能插入 %s' % (script, HELPER_MARKER))
+        return False
     # 撤掉早先版本的 helper，避免同一个文件里出现多套。
     text = text.replace(anchor +
                         "def _r11_tail(text):\n"
@@ -291,7 +281,34 @@ def patch_bindings_comparison(tree: Path) -> None:
         log('警告: 绑定脚本的比较语句变了，只插入了 %s 没改调用点' % HELPER_MARKER)
     with open(script, 'w', encoding='utf-8', newline='\n') as handle:
         handle.write(text)
-    log('绑定脚本比较已修补（%s + 打印出错名字）' % HELPER_MARKER)
+    log('绑定脚本比较已修补（%s + 打印出错名字）: %s' % (HELPER_MARKER, script))
+    return True
+
+
+def patch_bindings_comparison(tree: Path, repo: Path | None = None) -> None:
+    """`build-native-virtio-bindings.py` 用 `demangled.split('::', 1)[1]` 比方法名，有三个坑：
+    ① 有些名字反解后没有 `::`（`operator delete(void*)`），直接 IndexError；
+    ② `xcrun c++filt` 有时把符号原样吐回（slot 7 的 `getMetaClass` 就是这样），
+       两边「尾巴」都是整串 mangled 名，必然不等 → 误报；
+    ③ Itanium 的 `S_` 替换使同一签名文本不同（`5startEPS_` vs `5startEP9IOService`），
+       纯文本比较仍会误报。
+    改成 `_r11_same_method()`：反解成功就按上游语义比整段尾巴，否则只比方法标识符。
+
+    **必须同时改主仓库那份源码**：`./unixnu build` 每次都会重新装配 `out/<dev>/tree`，
+    组装时从主仓库重新链接 `scripts/`，只改树内的副本会被覆盖（第 9 轮 CI 就是这么被打回去的）。
+    幂等（标记 `_r11_same_method`）。"""
+    targets = [tree / 'scripts' / 'build-native-virtio-bindings.py']
+    if repo is not None:
+        targets.append(repo / 'scripts' / 'build-native-virtio-bindings.py')
+        for other in sorted(repo.glob('out/*/tree')) + sorted(repo.glob('out/*/*/*/tree')):
+            candidate = other / 'scripts' / 'build-native-virtio-bindings.py'
+            if candidate not in targets:
+                targets.append(candidate)
+    changed = [str(path) for path in targets if patch_one_bindings_script(path)]
+    if not changed:
+        log('绑定脚本比较已修补过（或找不到脚本体）')
+    else:
+        log('已修补 %d 份绑定脚本：%s' % (len(changed), ', '.join(changed)))
 
 def object_undefined(obj: Path) -> list[str]:
     """读出 Mach-O 对象里 `N_UNDF|N_EXT` 且名字含 IOBlockStorageDevice 的符号。
@@ -436,7 +453,7 @@ def main():
 
     # 5) 生成绑定归档 build/native-ram-block/libNativeRamBlock.a
     report_undefined(obj, record)
-    patch_bindings_comparison(tree)
+    patch_bindings_comparison(tree, repo)
     if run([sys.executable, 'scripts/build-native-virtio-bindings.py',
             '--component', 'NativeRamBlock', '--directory', 'build/native-ram-block'], cwd=tree) != 0:
         raise SystemExit('[ramblock] 生成绑定失败')
