@@ -234,6 +234,37 @@ def write_fixtures(tree: Path, candidate: Path, values: dict) -> None:
 
 HELPER_MARKER = '_r11_same_method'
 
+POSSIBLE_MARKER = '_r11_all_rows'
+
+# 上游 `possible` 表只收「没有 kernel_names」的槽：
+#
+#     possible = {r['reference_name']: int(r['candidate_target'], 16) for r in audit['methods'] if not r['kernel_names']}
+#
+# 意思是「带 kernel_names 的槽，原版 kext 有导出名，链接器会按导出名解析」。
+# 但我们的 `kernel.macho` 的 LC_SYMTAB 里**没有**这些导出（`llvm-nm` 实测 0 个
+# `IOBlockStorageDevice` 符号，它们只活在 prelink 的 __PRELINK_INFO/导出表里），
+# 于是 `NativeRamBlock.o` 里那 11 个真实的原始实现引用永远进不了 `possible`，
+# 第 72 行就抛 `Unqualified original storage import`（第 11 轮 CI 的现场）。
+# 修法：190 个槽一律按 `candidate_target` 绑定，并把 `kernel_names` 登记成别名
+# （同一地址的另一个拼写，绑到同一处完全等价）。
+POSSIBLE_OLD = ("possible = {r['reference_name']: int(r['candidate_target'], 16) for r in "
+                "audit['methods'] if not r['kernel_names']}")
+POSSIBLE_NEW = (
+    "possible = {r['reference_name']: int(r['candidate_target'], 16) for r in audit['methods']}  "
+    "# " + POSSIBLE_MARKER + "\n"
+    "for _r11_row in audit['methods']:\n"
+    "    for _r11_alias in _r11_row['kernel_names']:\n"
+    "        possible.setdefault(_r11_alias, int(_r11_row['candidate_target'], 16))\n")
+
+
+def patch_possible_table(text: str) -> str:
+    """把上游 `possible` 表放宽到全部 190 槽；幂等（标记 `_r11_all_rows`）。"""
+    if POSSIBLE_MARKER in text:
+        return text
+    if POSSIBLE_OLD not in text:
+        return text
+    return text.replace(POSSIBLE_OLD, POSSIBLE_NEW.rstrip('\n'), 1)
+
 # 三个 helper：
 #  * `_r11_mangled_tail` 从 mangled 名切出「类之后」的部分（反解失败时用）；
 #  * `_r11_mangled_ident` 再往前一步，只取方法**标识符**（`5startEP9IOService` → `start`），
@@ -285,12 +316,21 @@ def patch_one_bindings_script(script: Path) -> bool:
     if not script.is_file():
         return False
     text = script.read_text(encoding='utf-8')
-    if HELPER_MARKER in text:
-        return False
+    changed = False
+    widened = patch_possible_table(text)
+    if widened != text:
+        text = widened
+        changed = True
+        log('绑定脚本 possible 表已放宽到全部 190 槽（%s）: %s' % (POSSIBLE_MARKER, script))
     anchor = "readable = dict(zip(all_names, demangled))\n"
-    if anchor not in text:
-        log('警告: %s 结构变了，没能插入 %s' % (script, HELPER_MARKER))
-        return False
+    if HELPER_MARKER in text or anchor not in text:
+        if anchor not in text:
+            log('警告: %s 结构变了，没能插入 %s' % (script, HELPER_MARKER))
+        if not changed:
+            return False
+        with open(script, 'w', encoding='utf-8', newline='\n') as handle:
+            handle.write(text)
+        return True
     # 撤掉早先版本的 helper，避免同一个文件里出现多套。
     text = text.replace(anchor +
                         "def _r11_tail(text):\n"

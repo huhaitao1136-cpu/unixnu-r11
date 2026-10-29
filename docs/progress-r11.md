@@ -6099,3 +6099,105 @@ busy: matched 174/190 bindings missing=95 size=4096 sha=deadbeef
 | `PASS: 190 ordinary iOS storage slots; …` | 审计通过 |
 | `archive 6/12`、`archive 9/12` 都通过 | AES 夹具与绑定补丁两处连带伤害都消除 |
 | 12/12 + prelink + package 全绿 | 拿 `r11-boot-artifacts` 刷机；种子里已经是修好的 arm64 init |
+
+## 3.97 第 11 轮 CI：审计全绿，绑定脚本却把 11 个"真原始实现"挡在门外（2026-10-30）
+
+这一轮 `archive 6/12`（AES 绑定）第一次自己通过了，`archive 7/12`（NativeSdhci）、
+`archive 8/12`（NativeRamBlock）也过，卡在 `archive 9/12`：
+
+```
+== kernel: archive 9/12: build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block
+Unqualified original storage import
+```
+
+`ramblock.log` 里我们自己加的对账行把 11 个未解析符号点了名，且它们**全都有
+`kernel_names`**：
+
+```
+[ramblock]   缺: __ZN20IOBlockStorageDevice13setPropertiesEP8OSObject (slot 44, kernel_names=[...])
+[ramblock]   缺: __ZN20IOBlockStorageDevice20doGetProvisionStatusEyyPjP35IOBlockStorageProvisionDeviceExtenty (slot 189 …)
+[ramblock]   缺: __ZN20IOBlockStorageDevice4initEP12OSDictionary (slot 21 …)
+[ramblock]   缺: __ZN20IOBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj (slot 186 …)
+[ramblock]   缺: __ZNK20IOBlockStorageDevice11getPropertyEPK8OSSymbol (slot 33 …)
+```
+
+### 3.97.1 根因：`possible` 表只收了一半的槽
+
+上游 `build-native-virtio-bindings.py:66`：
+
+```python
+possible = {r['reference_name']: int(r['candidate_target'], 16) for r in audit['methods'] if not r['kernel_names']}
+```
+
+第 72 行再用它做门禁：
+
+```python
+if any(name not in possible for name in undefined):
+    raise SystemExit('Unqualified original storage import')
+```
+
+上游的语义是：`kernel_names` 非空 = 原版 kext 在那个地址上有**导出名**，
+链接器会按导出名解析，所以不必（也不该）用 `.set` 绑死。判断依据是
+`audit['methods'][i]['kernel_names'] = exports.get(pointers[i], [])`——
+`exports` 来自 prelink 报告（`np.exports`），读的是 `__PRELINK_INFO` 里的导出表。
+
+问题是：**我们的 `kernel.macho` 的 `LC_SYMTAB` 里根本没有这些导出**
+（`llvm-nm` 实测 `IOBlockStorageDevice` 相关 0 条，因为它们是 prelink 阶段
+被合并进内核、只活在 `__PRELINK_INFO` 里的 kext 符号）。于是
+`NativeRamBlock.o` 里那 11 个"真实引用了原版实现"的符号既不会被链接器
+按导出名解析、也进不了 `possible` → 必然报 `Unqualified original storage import`。
+
+### 3.97.2 修法：190 槽一律按 `candidate_target` 绑定，`kernel_names` 登记为别名
+
+`patch_one_bindings_script()` 里再加一段幂等替换（标记 `_r11_all_rows`）：
+
+```python
+possible = {r['reference_name']: int(r['candidate_target'], 16) for r in audit['methods']}  # _r11_all_rows
+for _r11_row in audit['methods']:
+    for _r11_alias in _r11_row['kernel_names']:
+        possible.setdefault(_r11_alias, int(_r11_row['candidate_target'], 16))
+```
+
+语义上与上游一致：`candidate_target` 就是审计在候选 `__DATA_CONST` 里
+扫到的第 i 个 vtable 指针，也就是原版实现的 prelink 地址；把 `kernel_names`
+登记成别名只是允许"按 kext 导出名拼写"的引用绑到同一处地址。
+
+顺带把 `patch_one_bindings_script()` 的结构改成"两段补丁各自幂等"：
+早先版本是 `if HELPER_MARKER in text: return False`，一旦 helper 已经插过，
+新一轮的 `possible` 补丁就会被直接跳过。现在先打 `possible` 表，再看 helper
+是否需要插，两者都按各自的标记判断。
+
+### 3.97.3 验证（对上游真脚本，两轮调用）
+
+```
+[ramblock] 绑定脚本 possible 表已放宽到全部 190 槽（_r11_all_rows）: /tmp/rbpossible/build-native-virtio-bindings.py
+[ramblock] 绑定脚本比较已修补（_r11_same_method + 打印出错名字）: /tmp/rbpossible/build-native-virtio-bindings.py
+first changed : True
+second changed: False
+idempotent    : True
+possible mark : 1
+old filter    : 0
+helper mark   : 2
+alias loop    : 1
+--- possible block ---
+possible = {r['reference_name']: int(r['candidate_target'], 16) for r in audit['methods']}  # _r11_all_rows
+for _r11_row in audit['methods']:
+    for _r11_alias in _r11_row['kernel_names']:
+        possible.setdefault(_r11_alias, int(_r11_row['candidate_target'], 16))
+syntax        : ok
+```
+
+### 3.97.4 下一轮判据
+
+| 现象 | 结论 |
+| --- | --- |
+| `PASS: 190 concrete slots, N overrides and 11 genuine original storage imports` | 11 个"真原始实现"引用全部绑上，绑定完成 |
+| `libNativeRamBlock.a (… B)` | 归档生成成功 |
+| `archive 12/12` + `LD …` 无 `Undefined symbols` | 链接期彻底干净 |
+| prelink + package 全绿 | 拿 `r11-boot-artifacts` 重铺 payload → 打补丁 → 刷机，等屏幕上的 `R11_EL0_INIT_OK` |
+
+### 3.97.5 教训
+
+官方绑定脚本的 `possible` 过滤条件是**给"链接器能按导出名解析"的场合**准备的；
+我们的内核是 prelink 合并产物，kext 符号不在 `LC_SYMTAB` 里，所以这条假设不成立。
+凡是"上游根据自己的产物形态做的假设"，接到我们这套 prelink 产物上都要重新验一遍。
