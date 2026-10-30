@@ -64,9 +64,12 @@ chmod 600 "$MNT/private/var/mobile/Library/Preferences/com.apple.purplebuddy.pli
 #   /usr/appleinternal/sbin/launchd.development
 #   /sbin/launchd
 # 三处都放同一份最小程序，确保任意分支都能 exec 成功。
-INIT_BIN="$(cd "$(dirname "$0")/.." && pwd)/seed/init.macho"
+# 用哪个程序当 PID 1：默认我们手搓的 init.macho，
+# 用 R11_INIT_FILE=launchd.apple 可换成苹果真正的 /sbin/launchd。
+INIT_FILE="${R11_INIT_FILE:-init.macho}"
+INIT_BIN="$(cd "$(dirname "$0")/.." && pwd)/seed/$INIT_FILE"
 if [ -f "$INIT_BIN" ]; then
-  echo "== 安装最小 init（$(stat -f%z "$INIT_BIN") B）"
+  echo "== 安装 PID 1（$INIT_FILE, $(stat -f%z "$INIT_BIN") B）"
   mkdir -p "$MNT/sbin" "$MNT/usr/appleinternal/sbin"
   # kern_exec.c 的候选顺序：launchd.debug → launchd.development → /sbin/launchd
   # 目录必须存在且可遍历，否则内核 namei 会返回 ENOENT

@@ -5,6 +5,11 @@ name: make-data-seed
 
 on:
   workflow_dispatch:
+    inputs:
+      init_file:
+        description: "seed/ 里当 PID 1 的文件名（init.macho 或 launchd.apple）"
+        required: false
+        default: init.macho
 
 jobs:
   seed:
@@ -22,6 +27,8 @@ jobs:
           ls UniXNU/drivers/DarwinBoot | head -20
 
       - name: 生成最小 Data 种子
+        env:
+          R11_INIT_FILE: ${{ inputs.init_file }}
         run: |
           bash device/scripts/make-data-seed.sh "$RUNNER_TEMP/seed" 32 2>&1 | tee /tmp/seed.log
           echo "---- UUID ----"
