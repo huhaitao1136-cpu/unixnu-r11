@@ -66,7 +66,7 @@ PROBES = {
     'plat': ('_proc_setplatformdata', 'plain', b'R11: proc_setplatformdata\n\0'),
     'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
     'lerr': ('_load_return_to_errno', 'arg0', b'R11: load_return_to_errno lret=%x\n\0'),
-    'mfilefail': ('0xfffffff0076d4b5c', 'arg0', b'R11: load_machfile FAILED lret=%x\n\0'),
+    'mfilefail': ('0xfffffff0076d4b64', 'reg24', b'R11: load_machfile FAILED lret=%x\n\0'),
     'mfok': ('0xfffffff0076d4bb0', 'plain', b'R11: load_machfile OK\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
@@ -255,6 +255,8 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     elif kind == 'elr':
         words.append(ENC_MRS_ELR_EL1); pc += 4
         words.append(ENC_MRS_SPSR_EL1); pc += 4
+    elif kind == 'reg24':
+        words.append(enc_mov_wd_ws(1, 24)); pc += 4     # x1 = (uint32_t) w24
     elif kind == 'arg0':
         words.append(enc_mov_wd_ws(1, 0)); pc += 4      # x1 = (uint32_t) 第一个参数
     elif kind == 'svc':
