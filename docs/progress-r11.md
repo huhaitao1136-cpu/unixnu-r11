@@ -6433,3 +6433,36 @@ R11: load_machfile enter          <- 停在这里
 判读：`mmap` 出现但 `mfileexit` 不出现 → 卡在文件后端映射/页入；
 `ubc`/`getattr` 之后就没有 → 卡在 Vnode 属性或 UBC 尺寸；
 `upl` 出现后没有 `mmap` → 卡在建 UPL。
+
+## 3.102 `load_machfile` 返回了 —— 卡点在它之后、`activate_exec_state` 之前（2026-10-30 18:5x）
+
+九探针真机顺序（照片）：
+
+```
+R11: LIP enter
+R11: vnode_getattr
+R11: exec_mach_imgact enter
+R11: load_machfile enter
+R11: load_machfile exit elr=fffffff0076d2f18 spsr=00000000
+```
+
+三条结论：
+
+1. **`load_machfile` 正常返回了**（`elr=0xfffffff0076d2f18` 是 `exec_mach_imgact` 里的返回地址，
+   `spsr=0`），所以建地址空间、建 pager、映射可执行段这一段都没问题 —— UBC 页入这条假设被排除。
+2. `_ubc_getsize` / `_ubc_create_upl` / `_VNOP_MMAP` **一次都没被调用**（探针没打），
+   说明这个内核版本的 `load_machfile` 不走那条路径（XNU 用的是 `vnode_pager_setup` + `pmap` 直接装页表）。
+3. 于是卡点在 `exec_mach_imgact` 里 `load_machfile` 之后的那几段：
+   `exec_extract_strings` → `exec_handle_sugid` → `create_unix_stack` → `exec_copyout_strings` → `activate_exec_state`。
+
+所以把探针换成这条链（12 个，默认 `lip,exec,machfile,mfileexit,getattr,extract,sugid,stack,copyout,act,lipexit,svc`），
+新符号：
+
+| 探针 | 符号 | 地址 |
+|---|---|---|
+| `extract` | `_exec_extract_strings` | `0xfffffff0076d9e40` |
+| `sugid` | `_exec_handle_sugid` | `0xfffffff0076da2a8` |
+| `stack` | `_create_unix_stack` | `0xfffffff0076da8d8` |
+| `copyout` | `_exec_copyout_strings` | `0xfffffff0076dbab8` |
+
+12 个跳板约 2.9 KB，仍在 4096 的空穴内。判读：屏幕最后一行就是卡点。

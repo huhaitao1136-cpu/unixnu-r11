@@ -58,9 +58,14 @@ PROBES = {
     'ubc': ('_ubc_getsize', 'plain', b'R11: ubc_getsize\n\0'),
     'upl': ('_ubc_create_upl', 'plain', b'R11: ubc_create_upl\n\0'),
     'mmap': ('_VNOP_MMAP', 'plain', b'R11: VNOP_MMAP\n\0'),
+    'extract': ('_exec_extract_strings', 'plain', b'R11: exec_extract_strings\n\0'),
+    'sugid': ('_exec_handle_sugid', 'plain', b'R11: exec_handle_sugid\n\0'),
+    'stack': ('_create_unix_stack', 'plain', b'R11: create_unix_stack\n\0'),
+    'copyout': ('_exec_copyout_strings', 'plain', b'R11: exec_copyout_strings\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = 'lip,exec,machfile,getattr,ubc,upl,mmap,mfileexit,svc'
+DEFAULT_PROBES = ('lip,exec,machfile,mfileexit,getattr,extract,sugid,'
+                  'stack,copyout,act,lipexit,svc')
 
 
 def select_probes(spec):
