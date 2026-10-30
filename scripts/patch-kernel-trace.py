@@ -48,8 +48,9 @@ HOOKS = (
 
 SLOT = 60 * 4            # 每个跳板预留 60 条指令
 
-# 默认只装这两个：
+# 默认装三个：
 #   lip  `_load_init_program` 入口   —— 证明内核走到"要 exec PID 1 了"
+#   eret `_return_to_user`（arm64 最后一步 ERET 前的标号）—— 证明有线程真的要回 EL0
 #   svc  `_unix_syscall` 入口        —— 证明有线程真的从 EL0 发了 svc
 # 返回路径上的三个（bootstrap/exc/arm64-exc）会把 init 线程的回用户态过程
 # 也拦下来；2026-10-30 那两轮真机都停在 bootstrap_return 之后，怀疑就是
@@ -59,9 +60,10 @@ PROBES = {
     'boot': ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
     'ret': ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
     'to': ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
+    'eret': ('return_to_user', 'plain', b'R11: ERET to user\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = 'lip,svc'
+DEFAULT_PROBES = 'lip,eret,svc'
 
 
 def select_probes(spec):

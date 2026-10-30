@@ -6303,3 +6303,27 @@ cpusubtype 0 filetype 2 ncmds 3 sizeofcmds 512`、入口 `0x0000000100000220`、
   `_unix_syscall 0xfffffff007829608: d101c3ff -> b 0xfffffff007a302a8`；
   回读 `_thread_bootstrap_return` 仍是 `97fb8c67`（完全没被动），`R11: to-user elr` 0 处。
 - 这一轮不需要跑 CI：探针是本地 `patch-payload-full.py` 装的。
+
+### 3.99.1 真机第一步：`R11: LIP enter` 打出来了（2026-10-30 18:2x）
+
+`lip,svc` 这两个探针刷上去之后，屏幕出现：
+
+```
+No POST boot-arg set.
+R11: LIP enter
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+```
+
+三条结论：
+
+1. `load_init_program()` 确实被调用、`_load_init_program` 入口的钩子正常（跳板 + 重放都对）。
+2. 只出现一次 `attempting to load`，没有 `failed loading … errno N` —— 按 `kern_exec.c` 的规则，
+   第一个候选（`.development`）返回 0（成功）就会 `return`，失败但不是 ENOENT 才会打印
+   `failed loading`。所以 **PID 1 的 exec 成功**。
+3. 之后完全没有 `R11: svc=` —— 说明 exec 成功之后，从来没有任何线程从 EL0 发过一条系统调用。
+
+下一步（3.99.2）就是补 `eret` 探针：`return_to_user`（`_arm64_thread_exception_return` 里
+ERET 前最后那个标号，`0xfffffff0073ef84c`，首条 `d538d083` = `mrs x3, tpidr_el0`）。
+- 有 `R11: ERET to user`、没有 `svc=` → 内核真的把线程送进了 EL0，但用户态第一条指令没生效
+  （入口地址/页权限/`spsr` 出错），下一步查 `elr`/`spsr`/页表。
+- 连 `ERET` 都没有 → 线程根本没被调度回用户态，查 `activate_exec_state` 之后的 run 队列。
