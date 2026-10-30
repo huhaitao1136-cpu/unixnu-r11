@@ -54,7 +54,18 @@
  * v4 = 自己把 sdcc1_apps_clk_src 的根时钟打开（v3 实测 CMD_RCGR=0 → ROOT_EN=0，
  *      分支 CBCR 显示"已开"但根没开 → 读 SDCC 寄存器总线整机挂死）。
  * 屏幕上的 `NativeSdhci[v4]:` 前缀就是"刷进去的是这一版"的证据。 */
-#define kSdhciTag         "v37"
+#define kSdhciTag         "v38"
+/*
+ * 日志分两档：
+ *   SDHCI_INFO —— 结论性的少数几行，永远打印。
+ *   SDHCI_LOG  —— 调试用的寄存器 dump 与逐命令跟踪，默认关掉：这块板子的
+ *                 控制台是 framebuffer，每行 IOLog 都要滚动重绘，v37 那一轮
+ *                 几百行 dump 让一次启动多花好几分钟。
+ * 需要时把 kSdhciVerbose 改成 true 重新编译即可。
+ */
+static const bool kSdhciVerbose = false;
+#define SDHCI_LOG(...)  do { if (kSdhciVerbose) { IOLog(__VA_ARGS__); } } while (0)
+#define SDHCI_INFO(...) do { IOLog(__VA_ARGS__); } while (0)
 
 /* SDM660 GCC（Global Clock Controller）：eMMC 的 iface/core 时钟由它门控。
  * 偏移来自 drivers/clk/qcom/gcc-sdm660.c：
@@ -419,12 +430,12 @@ IOService *NativeSdhci::probe (IOService *provider, SInt32 *score)
             len = text ? strlen (text) : 0;
         }
         if (text && sdhciContains (text, len, "sdhci")) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: probe saw compatible=%.*s but no match\n", (int) (len < 96 ? len : 96), text);
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: probe saw compatible=%.*s but no match\n", (int) (len < 96 ? len : 96), text);
         }
         return nullptr;
     }
     native_sdhci_matched = 1;
-    IOLog ("NativeSdhci[" kSdhciTag "]: matched DT node, probing controller\n");
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: matched DT node, probing controller\n");
     if (score) {
         *score = 1000;
     }
@@ -435,7 +446,7 @@ bool NativeSdhci::mapRegisters (IOService *provider)
 {
     /* 优先用 provider 给的 IODeviceMemory（ADT 的 reg 段），失败则用板级常量 */
     bool ok = false;
-    IOLog ("NativeSdhci[" kSdhciTag "]: mapRegisters: provider=%p memCount=%u\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: mapRegisters: provider=%p memCount=%u\n",
            provider, provider ? (unsigned) provider->getDeviceMemoryCount () : 0U);
     if (fCore == 0) {
         if (provider && provider->getDeviceMemoryCount () > 0) {
@@ -452,7 +463,7 @@ bool NativeSdhci::mapRegisters (IOService *provider)
     if (!ok) {
         fCore = sdhciMapPhys (R11_SDHCI_CORE_PHYS, R11_SDHCI_REG_SIZE, fCoreMap);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: mapRegisters: core va=%p\n", (void *) fCore);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: mapRegisters: core va=%p\n", (void *) fCore);
     if (!fCore) {
         return false;
     }
@@ -469,7 +480,7 @@ bool NativeSdhci::mapRegisters (IOService *provider)
     if (!fVendor) {
         fVendor = sdhciMapPhys (R11_SDHCI_VENDOR_PHYS, R11_SDHCI_REG_SIZE, fVendorMap);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: mapRegisters: vendor va=%p\n", (void *) fVendor);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: mapRegisters: vendor va=%p\n", (void *) fVendor);
     return fVendor != 0;
 }
 
@@ -480,7 +491,7 @@ void NativeSdhci::logGccState ()
     OSSharedPtr<IOMemoryMap> gccMap;
     uintptr_t gcc = sdhciMapPhys (R11_GCC_PHYS, R11_GCC_REG_SIZE, gccMap);
     if (!gcc) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed\n");
         return;
     }
     uint32_t apps = sdhciRead32 (gcc, GCC_SDCC1_APPS_CBCR);
@@ -491,8 +502,8 @@ void NativeSdhci::logGccState ()
     uint32_t m    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_M);
     uint32_t n    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_N);
     uint32_t d    = sdhciRead32 (gcc, GCC_SDCC1_APPS_RCGR + GCC_RCG_D);
-    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: apps=%08x ahb=%08x ice=%08x\n", apps, ahb, ice);
-    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: root cmd=%08x cfg=%08x src=%u div=%u m/n/d=%08x/%08x/%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: apps=%08x ahb=%08x ice=%08x\n", apps, ahb, ice);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: root cmd=%08x cfg=%08x src=%u div=%u m/n/d=%08x/%08x/%08x\n",
            cmd, cfg, (cfg >> 8) & 0x7, cfg & 0x1f, m, n, d);
     native_sdhci_gcc_apps = apps;
     native_sdhci_gcc_cfg  = cmd;
@@ -506,7 +517,7 @@ bool NativeSdhci::enableGccClocks ()
     OSSharedPtr<IOMemoryMap> gccMap;
     uintptr_t gcc = sdhciMapPhys (R11_GCC_PHYS, R11_GCC_REG_SIZE, gccMap);
     if (!gcc) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed, cannot enable clocks\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed, cannot enable clocks\n");
         return false;
     }
     const uint32_t rcgr = GCC_SDCC1_APPS_RCGR;
@@ -533,7 +544,7 @@ bool NativeSdhci::enableGccClocks ()
         sdhciDelayUs (10);
     }
     uint32_t cmdNow = sdhciRead32 (gcc, rcgr + GCC_RCG_CMD);
-    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: root enabled -> cmd=%08x%s\n", cmdNow,
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: root enabled -> cmd=%08x%s\n", cmdNow,
            rootOn ? "" : "  (ROOT_OFF still set!)");
 
     /* 5) 分支门控：先读改写再判定，别把别人的位清掉 */
@@ -553,7 +564,7 @@ bool NativeSdhci::enableGccClocks ()
             }
             sdhciDelayUs (10);
         }
-        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: branch %s=%08x%s\n", branches[i].name,
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: branch %s=%08x%s\n", branches[i].name,
                sdhciRead32 (gcc, branches[i].off), on ? "" : "  (CLK_OFF stuck)");
         allOn = allOn && on;
     }
@@ -566,12 +577,12 @@ bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
      * 用整字读写访问（v6 起不再有任何 8 位访问）。 */
     uint32_t before = sdhciReadClockWord (fCore);
     sdhciWriteClockWord (fCore, (before & 0x00FFFFFFu) | (((uint32_t) which) << 24));
-    IOLog ("NativeSdhci[" kSdhciTag "]: reset: assert=%02x word %08x -> %08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: reset: assert=%02x word %08x -> %08x\n",
            which, before, sdhciReadClockWord (fCore));
 
     for (uint32_t i = 0; i < loops; i++) {
         if (((sdhciReadClockWord (fCore) >> 24) & which) == 0) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: reset: cleared after %u polls, word=%08x\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: reset: cleared after %u polls, word=%08x\n",
                    i, sdhciReadClockWord (fCore));
             return true;
         }
@@ -587,7 +598,7 @@ bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
     uint32_t stuck = sdhciReadClockWord (fCore);
     sdhciWriteClockWord (fCore, stuck & 0x00FFFFFFu);
     uint32_t forced = sdhciReadClockWord (fCore);
-    IOLog ("NativeSdhci[" kSdhciTag "]: reset: never cleared (word=%08x), forced 0 -> %08x, continuing\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: reset: never cleared (word=%08x), forced 0 -> %08x, continuing\n",
            stuck, forced);
     return true;
 }
@@ -598,7 +609,7 @@ bool NativeSdhci::softReset (uint32_t which, uint32_t loops)
  * 并清空两个中断状态寄存器，让后续命令能正常下发。 */
 void NativeSdhci::recoverCommandState (const char *why)
 {
-    IOLog ("NativeSdhci[" kSdhciTag "]: recover: %s (state=%08x nis=%04x eis=%04x mstat=%08x)\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: recover: %s (state=%08x nis=%04x eis=%04x mstat=%08x)\n",
            why, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
            sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS),
            sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
@@ -607,7 +618,7 @@ void NativeSdhci::recoverCommandState (const char *why)
     sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, (uint16_t) 0xFFFF);
     (void) softReset (SDHCI_RESET_CMD | SDHCI_RESET_DATA, kSdhciCmdLoops);
     sdhciDelayUs (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: recover: done (state=%08x)\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: recover: done (state=%08x)\n",
            sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
 }
 
@@ -633,7 +644,7 @@ bool NativeSdhci::setBusPowerAndClock ()
      * 连命令阶段的日志都出不来 —— 说明 MSM 在 DMA Select=SDMA(00) 时会真的启动
      * SDMA 引擎去 0x58 里的野指针搬运，把 AHB 挂死。所以这里**保持**原值，
      * 改成每次数据命令前把 0x58 清零（见 sendCommand）。 */
-    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%02x (DMA select=%u, keep as-is)\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: bus: hostctl=%02x (DMA select=%u, keep as-is)\n",
            hostCtrl & 0xFFu, (hostCtrl >> 3) & 0x3u);
 
     uint16_t hostCtrl2 = sdhciRead16 (fCore, SDHCI_HOST_CONTROL2);
@@ -646,7 +657,7 @@ bool NativeSdhci::setBusPowerAndClock ()
     hostWord = (hostWord & 0xFFFF0000u) | ((uint32_t) (SDHCI_POWER_ON | SDHCI_POWER_330) << 8) | hostCtrl;
     sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
     sdhciDelayUs (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: bus: hostctl2=%04x word28=%08x (1-bit, 3.3V)\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: bus: hostctl2=%04x word28=%08x (1-bit, 3.3V)\n",
            hostCtrl2, sdhciReadHostWord (fCore));
 
     /* 超时计数器取最大（0x2E，在 0x2C 字的次高字节） */
@@ -671,7 +682,7 @@ bool NativeSdhci::configureVendorSpec ()
     uint32_t vs3   = sdhciRead32 (fCore, CORE_VENDOR_SPEC3);
     uint32_t mci   = sdhciRead32 (fCore, CORE_MCI_VERSION_REG);
     uint32_t mstat = sdhciRead32 (fCore, CORE_MCI_STATUS_REG);
-    IOLog ("NativeSdhci[" kSdhciTag "]: vendor: mci=%08x (core %u.%02x) vs0=%08x caps0=%08x vs3=%08x mstat=%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: vendor: mci=%08x (core %u.%02x) vs0=%08x caps0=%08x vs3=%08x mstat=%08x\n",
            mci, (mci >> 28) & 0xF, mci & 0xFF, vs0, caps0, vs3, mstat);
 
     uint32_t next = vs0;
@@ -697,7 +708,7 @@ bool NativeSdhci::configureVendorSpec ()
 
     uint32_t vs0Now = sdhciRead32 (fCore, CORE_VENDOR_SPEC);
     uint32_t vs3Now = sdhciRead32 (fCore, CORE_VENDOR_SPEC3);
-    IOLog ("NativeSdhci[" kSdhciTag "]: vendor: io18=%u mclk_sel=%u select_in=%u vs0=%08x vs3=%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: vendor: io18=%u mclk_sel=%u select_in=%u vs0=%08x vs3=%08x\n",
            io18 ? 1 : 0, (vs0Now >> 8) & 3, (vs0Now >> 19) & 7, vs0Now, vs3Now);
     return true;
 }
@@ -711,7 +722,7 @@ bool NativeSdhci::setGccSdccRate (uint32_t m, uint32_t n, uint32_t hidDiv)
     OSSharedPtr<IOMemoryMap> gccMap;
     uintptr_t gcc = sdhciMapPhys (R11_GCC_PHYS, R11_GCC_REG_SIZE, gccMap);
     if (!gcc) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed, cannot set rate\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: mapping failed, cannot set rate\n");
         return false;
     }
     const uint32_t rcgr = GCC_SDCC1_APPS_RCGR;
@@ -762,7 +773,7 @@ bool NativeSdhci::setGccSdccRate (uint32_t m, uint32_t n, uint32_t hidDiv)
     if ((cfgNow & 0x3000u) && nNow) {
         hz = (uint32_t) (((uint64_t) hz * mNow) / nNow);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: gcc: m/n/hid=%u/%u/%u -> %u Hz (cfg=%08x m=%08x n=%08x d=%08x)\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc: m/n/hid=%u/%u/%u -> %u Hz (cfg=%08x m=%08x n=%08x d=%08x)\n",
            mNow, nNow, hidNow, hz, cfgNow,
            sdhciRead32 (gcc, rcgr + GCC_RCG_M),
            sdhciRead32 (gcc, rcgr + GCC_RCG_N),
@@ -811,7 +822,7 @@ bool NativeSdhci::setBusClock (uint32_t hz)
     uint32_t st = sdhciReadClockWord (fCore);
     sdhciWriteClockWord (fCore, tail | SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN);
     sdhciDelayUs (1000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: clock: %u Hz (gcc m/n=%u/%u) int=%08x now=%08x\n",
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: clock: %u Hz (gcc m/n=%u/%u) int=%08x now=%08x\n",
            hz, m, n, st, sdhciReadClockWord (fCore));
     return true;
 }
@@ -834,7 +845,7 @@ bool NativeSdhci::waitCommandComplete ()
          * 也能走到读 RESPONSE 那一步，把 OCR 打出来。 */
         if (nis & SDHCI_INT_RESPONSE) {
             if (nis & SDHCI_INT_ERROR) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: cmd done, error flag ignored: word=%08x nis=%04x eis=%04x eis16=%04x\n",
+                SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cmd done, error flag ignored: word=%08x nis=%04x eis=%04x eis16=%04x\n",
                        word, nis, eis, eis16);
             }
             sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, nis);
@@ -842,7 +853,7 @@ bool NativeSdhci::waitCommandComplete ()
             return true;
         }
         if (nis & SDHCI_INT_ERROR) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: cmd error before complete: word=%08x nis=%04x eis=%04x eis16=%04x\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cmd error before complete: word=%08x nis=%04x eis=%04x eis16=%04x\n",
                    word, nis, eis, eis16);
             sdhciWrite16 (fCore, SDHCI_NORMAL_INT_STATUS, nis);
             sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, (uint16_t) 0xFFFF);
@@ -850,7 +861,7 @@ bool NativeSdhci::waitCommandComplete ()
         }
         sdhciDelayUs (1);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: cmd timeout state=%08x\n", sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cmd timeout state=%08x\n", sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     return false;
 }
 
@@ -861,7 +872,7 @@ bool NativeSdhci::waitTransferComplete ()
         if (status & SDHCI_INT_ERROR) {
             uint16_t err = sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS);
             sdhciWrite16 (fCore, SDHCI_ERROR_INT_STATUS, err);
-            IOLog ("NativeSdhci[" kSdhciTag "]: data error int=%04x err=%04x\n", status, err);
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: data error int=%04x err=%04x\n", status, err);
             return false;
         }
         if (status & SDHCI_INT_DATA_END) {
@@ -870,7 +881,7 @@ bool NativeSdhci::waitTransferComplete ()
         }
         sdhciDelayUs (1);
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: data timeout nis=%04x eis=%04x state=%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: data timeout nis=%04x eis=%04x state=%08x\n",
            sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS),
            sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
            sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
@@ -912,7 +923,7 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
         if (!fDmaArmed) {
             sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, 0);
         }
-        IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u pre state=%08x adma=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cmd%u pre state=%08x adma=%08x\n",
                index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS));
     }
@@ -924,7 +935,7 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
 
     if (isData) {
         /* 打出这一行就说明"写 COMMAND 寄存器"本身没有把总线挂死 */
-        IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u posted state=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cmd%u posted state=%08x\n",
                index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     }
 
@@ -935,7 +946,7 @@ bool NativeSdhci::sendCommand (uint32_t index, uint32_t arg, uint32_t flags, uin
         return false;
     }
     if (isData) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: cmd%u complete state=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cmd%u complete state=%08x\n",
                index, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
     }
     if (resp) {
@@ -964,7 +975,7 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
         for (UInt32 i = 0; i < cap; i++) {
             if (!sdhciWaitSet (fCore, SDHCI_PRESENT_STATE, SDHCI_DATA_AVAILABLE, kSdhciDataLoops)) {
                 if (n == 0) {
-                    IOLog ("NativeSdhci[" kSdhciTag "]: pio read starved at word 0/%u state=%08x nis=%08x\n",
+                    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: pio read starved at word 0/%u state=%08x nis=%08x\n",
                            count, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                            sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS));
                     return false;
@@ -973,7 +984,7 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
             }
             uint32_t w = sdhciRead32 (fCore, SDHCI_BUFFER);
             if ((n & 31u) == 0) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: pio word %u = %08x state=%08x\n",
+                SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: pio word %u = %08x state=%08x\n",
                        n, w, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
             }
             if (n < 4) {
@@ -986,16 +997,16 @@ bool NativeSdhci::pioTransfer (bool read, void *buffer, UInt32 bytes)
             n++;
         }
 
-        IOLog ("NativeSdhci[" kSdhciTag "]: pio got %u words (block=%u) first=%08x %08x %08x %08x last=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: pio got %u words (block=%u) first=%08x %08x %08x %08x last=%08x\n",
                n, count, first[0], first[1], first[2], first[3], last);
-        IOLog ("NativeSdhci[" kSdhciTag "]: pio after state=%08x nis=%08x eis=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: pio after state=%08x nis=%08x eis=%08x\n",
                sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                sdhciRead32 (fCore, SDHCI_NORMAL_INT_STATUS),
                sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
     } else {
         for (UInt32 i = 0; i < count; i++) {
             if (!sdhciWaitSet (fCore, SDHCI_PRESENT_STATE, SDHCI_SPACE_AVAILABLE, kSdhciDataLoops)) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: pio write stalled at word %u\n", i);
+                SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: pio write stalled at word %u\n", i);
                 return false;
             }
             sdhciWrite32 (fCore, SDHCI_BUFFER, words[i]);
@@ -1011,13 +1022,13 @@ bool NativeSdhci::logCardStatus (const char *who)
     /* CMD13 = SEND_STATUS，R1（48 位），arg = RCA << 16 */
     if (!sendCommand (13 /* SEND_STATUS */, (uint32_t) fRca << 16,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, r1)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: status(%s) CMD13 failed state=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: status(%s) CMD13 failed state=%08x\n",
                who, sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
         return false;
     }
 
     /* R1 低 8 位是错误/状态标志，bits 12..9 是 CURRENT_STATE */
-    IOLog ("NativeSdhci[" kSdhciTag "]: status(%s) r1=%08x current_state=%u (%s) ready=%u\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: status(%s) r1=%08x current_state=%u (%s) ready=%u\n",
            who, r1[0], (r1[0] >> 9) & 0xFu,
            sdhciCardStateName ((r1[0] >> 9) & 0xFu), (r1[0] >> 8) & 1u);
     return true;
@@ -1045,33 +1056,33 @@ void NativeSdhci::dumpRegs (const char *tag)
         }
         gSdhciSnapshotValid = true;
 
-        IOLog ("NativeSdhci[" kSdhciTag "]: ===== snapshot %s: %u regs held =====\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: ===== snapshot %s: %u regs held =====\n",
                tag, (unsigned) kSdhciDumpCount);
         return;
     }
 
     /* 第二次起只打"变了的"，一屏看得完 */
-    IOLog ("NativeSdhci[" kSdhciTag "]: ===== diff %s (only changed regs) =====\n", tag);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: ===== diff %s (only changed regs) =====\n", tag);
     uint32_t changes = 0;
     for (size_t i = 0; i < kSdhciDumpCount; i++) {
         uint32_t now = sdhciRead32 (fCore, kSdhciDumpOffsets[i]);
         if (now != gSdhciSnapshot[i]) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x -> %08x\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: %s %03x: %08x -> %08x\n",
                    tag, kSdhciDumpOffsets[i], gSdhciSnapshot[i], now);
             changes++;
         }
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: %s changed=%u/%u\n", tag, changes,
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: %s changed=%u/%u\n", tag, changes,
            (unsigned) kSdhciDumpCount);
 
     /* 固定关注项：总线电源、IO pad、时钟、DLL、DDR、MCI 电源控制 */
-    IOLog ("NativeSdhci[" kSdhciTag "]: %s key host28=%08x clk2c=%08x state24=%08x\n", tag,
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: %s key host28=%08x clk2c=%08x state24=%08x\n", tag,
            sdhciRead32 (fCore, 0x028), sdhciRead32 (fCore, 0x02C),
            sdhciRead32 (fCore, 0x024));
-    IOLog ("NativeSdhci[" kSdhciTag "]: %s key dll200=%08x dllst208=%08x vs20c=%08x\n", tag,
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: %s key dll200=%08x dllst208=%08x vs20c=%08x\n", tag,
            sdhciRead32 (fCore, 0x200), sdhciRead32 (fCore, 0x208),
            sdhciRead32 (fCore, 0x20C));
-    IOLog ("NativeSdhci[" kSdhciTag "]: %s key pwr240=%08x pwr24c=%08x ddr25c=%08x mstat324=%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: %s key pwr240=%08x pwr24c=%08x ddr25c=%08x mstat324=%08x\n",
            tag, sdhciRead32 (fCore, 0x240), sdhciRead32 (fCore, 0x24C),
            sdhciRead32 (fCore, 0x25C), sdhciRead32 (fCore, 0x324));
 }
@@ -1090,7 +1101,7 @@ void NativeSdhci::setHostBusWidth (uint32_t bits)
     }
     sdhciWrite32 (fCore, SDHCI_HOST_CONTROL, hostWord);
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: bus width=%u hostctl=%02x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: bus width=%u hostctl=%02x\n",
            bits, sdhciRead32 (fCore, SDHCI_HOST_CONTROL) & 0xFFu);
 }
 
@@ -1142,10 +1153,10 @@ void NativeSdhci::ensureBusState (const char *why)
         sdhciWrite32 (fCore, 0x20Cu, vs0bNew);
     }
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: bus[%s] host28=%08x -> %08x vs0=%08x -> %08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: bus[%s] host28=%08x -> %08x vs0=%08x -> %08x\n",
            why, word, sdhciRead32 (fCore, SDHCI_HOST_CONTROL),
            vs0, sdhciRead32 (fCore, 0x20Cu));
-    IOLog ("NativeSdhci[" kSdhciTag "]: path[%s] dll=%08x -> %08x ddr=%08x -> %08x vs0=%08x -> %08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: path[%s] dll=%08x -> %08x ddr=%08x -> %08x vs0=%08x -> %08x\n",
            why, dll, sdhciRead32 (fCore, 0x200u),
            ddr, sdhciRead32 (fCore, 0x25Cu),
            vs0b, sdhciRead32 (fCore, 0x20Cu));
@@ -1235,7 +1246,7 @@ bool NativeSdhci::setupDmaMemory ()
     fDmaDesc = IOBufferMemoryDescriptor::withCapacity (R11_DMA_DESC_SIZE, kIODirectionOutIn, true);
     fDmaData = IOBufferMemoryDescriptor::withCapacity (R11_DMA_DATA_SIZE, kIODirectionOutIn, true);
     if (!fDmaDesc || !fDmaData) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: dma: buffer allocation failed (desc=%p data=%p)\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: buffer allocation failed (desc=%p data=%p)\n",
                fDmaDesc, fDmaData);
         return false;
     }
@@ -1245,7 +1256,7 @@ bool NativeSdhci::setupDmaMemory ()
     /* 第三个参数是 IOOptionBits（不是 IODirection），0 = 走默认映射 */
     fDmaDescPhys = (IOPhysicalAddress) fDmaDesc->getPhysicalSegment (0, &descLen, 0);
     fDmaDataPhys = (IOPhysicalAddress) fDmaData->getPhysicalSegment (0, &dataLen, 0);
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: desc va=%p phys=%08llx len=%llu / data va=%p phys=%08llx len=%llu\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: desc va=%p phys=%08llx len=%llu / data va=%p phys=%08llx len=%llu\n",
            fDmaDesc->getBytesNoCopy (), (unsigned long long) fDmaDescPhys,
            (unsigned long long) descLen, fDmaData->getBytesNoCopy (),
            (unsigned long long) fDmaDataPhys, (unsigned long long) dataLen);
@@ -1280,12 +1291,12 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
     const bool     hasSdma  = (caps & 0x00400000u) != 0;
     const bool     has64    = (caps & 0x10000000u) != 0;
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: caps=%08x adma2=%u sdma=%u 64bit=%u descphys=%08llx dataphys=%08llx\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: caps=%08x adma2=%u sdma=%u 64bit=%u descphys=%08llx dataphys=%08llx\n",
            caps, hasAdma2 ? 1u : 0u, hasSdma ? 1u : 0u, has64 ? 1u : 0u,
            (unsigned long long) fDmaDescPhys, (unsigned long long) fDmaDataPhys);
 
     if (!hasAdma2) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: dma: controller does not advertise ADMA2, cannot arm DMA\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: controller does not advertise ADMA2, cannot arm DMA\n");
         return false;
     }
 
@@ -1298,7 +1309,7 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
 
     /* 32 位 ADMA2 描述符：8 字节 = [attr|len][addr]。物理地址都必须在 32 位内。 */
     if ((uint64_t) fDmaDescPhys > 0xFFFFFFFFull || (uint64_t) fDmaDataPhys > 0xFFFFFFFFull) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: dma: phys above 4 GiB (desc=%08llx data=%08llx), 32-bit ADMA2 cannot reach it\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: phys above 4 GiB (desc=%08llx data=%08llx), 32-bit ADMA2 cannot reach it\n",
                (unsigned long long) fDmaDescPhys, (unsigned long long) fDmaDataPhys);
         return false;
     }
@@ -1316,7 +1327,7 @@ bool NativeSdhci::beginDmaRead (UInt32 bytes)
     sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS, (uint32_t) (fDmaDescPhys & 0xFFFFFFFFu));
     sdhciWrite32 (fCore, SDHCI_ADMA_ADDRESS_HI, 0);
     fDmaArmed = true;
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: armed layout=32 select=%u caps=%08x bytes=%u desc0=%08x %08x %08x %08x adma=%08x/%08x hostctl=%02x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: armed layout=32 select=%u caps=%08x bytes=%u desc0=%08x %08x %08x %08x adma=%08x/%08x hostctl=%02x\n",
            dmaSelect, caps, bytes, desc[0], desc[1], desc[2], desc[3],
            sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS_HI), sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS),
            hostWord & 0xFFu);
@@ -1336,7 +1347,7 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
 
     fDmaData->complete (kIODirectionIn);
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: done ok=%u state=%08x nis=%08x eis=%04x adma=%08x err=%08x/%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: done ok=%u state=%08x nis=%08x eis=%04x adma=%08x err=%08x/%08x\n",
            ok ? 1 : 0, state, nis, eis, sdhciRead32 (fCore, SDHCI_ADMA_ADDRESS), ea0, ea1);
     /* 前四个字 + EXT_CSD[212] 所在的第 53 个字（SEC_COUNT），一眼看出数据是不是真的 */
     fDmaArmed = false;
@@ -1349,7 +1360,7 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
     }
 
     if (!ok) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: dma: ctx blksz=%04x cnt=%04x mode=%04x hostctl=%08x vs0=%08x vs3=%08x mstat=%08x\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: ctx blksz=%04x cnt=%04x mode=%04x hostctl=%08x vs0=%08x vs3=%08x mstat=%08x\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE),
                sdhciRead32 (fCore, SDHCI_HOST_CONTROL),
@@ -1357,7 +1368,7 @@ bool NativeSdhci::endDmaRead (void *dst, UInt32 bytes)
                sdhciRead32 (fCore, CORE_VENDOR_SPEC3),
                sdhciRead32 (fCore, CORE_MCI_STATUS_REG));
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x untouched=%u/128\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma: data %08x %08x %08x %08x | w52=%08x w53=%08x w126=%08x w127=%08x untouched=%u/128\n",
            data[0], data[1], data[2], data[3], data[52], data[53], data[126], data[127], untouched);
 
     if (!ok || dst == nullptr) {
@@ -1385,7 +1396,7 @@ bool NativeSdhci::readExtCsd ()
 {
     uint8_t ext[kSdhciBlockSize] __attribute__ ((aligned (64)));
 
-    for (uint32_t attempt = 0; attempt < 2; attempt++) {
+    for (uint32_t attempt = 0; attempt < 1; attempt++) {   /* v38: 只试一次，别在 400 kHz 上反复空转 */
         memset (ext, 0, sizeof (ext));
         poisonDmaBuffer ();
 
@@ -1403,7 +1414,7 @@ bool NativeSdhci::readExtCsd ()
         sdhciWrite16 (fCore, SDHCI_TRANSFER_MODE,
                       (uint16_t) (SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN));
 
-        IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD8 setup blksz=%04x cnt=%04x mode=%04x word28=%08x attempt=%u\n",
                sdhciRead16 (fCore, SDHCI_BLOCK_SIZE), sdhciRead16 (fCore, SDHCI_BLOCK_COUNT),
                sdhciRead16 (fCore, SDHCI_TRANSFER_MODE), sdhciReadHostWord (fCore), attempt);
 
@@ -1411,30 +1422,30 @@ bool NativeSdhci::readExtCsd ()
         uint32_t r1[4] = { 0, 0, 0, 0 };
 
         if (!armed) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 dma arm failed\n");
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD8 dma arm failed\n");
             fDmaArmed = false;
         } else if (!sendCommand (MMC_SEND_EXT_CSD, 0,
                                  SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                                  r1)) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
+            SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: CMD8 (SEND_EXT_CSD) failed (attempt %u)\n", attempt);
             fDmaArmed = false;
         } else {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD8 r1=%08x current_state=%u (%s)\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD8 r1=%08x current_state=%u (%s)\n",
                    r1[0], (r1[0] >> 9) & 0xFu, sdhciCardStateName ((r1[0] >> 9) & 0xFu));
 
             bool drained = endDmaRead (ext, (UInt32) kSdhciBlockSize);
             uint32_t *w = reinterpret_cast<uint32_t *> (ext);
-            IOLog ("NativeSdhci[" kSdhciTag "]: ext w0=%08x w1=%08x w52=%08x w53=%08x w126=%08x w127=%08x drained=%u\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: ext w0=%08x w1=%08x w52=%08x w53=%08x w126=%08x w127=%08x drained=%u\n",
                    w[0], w[1], w[52], w[53], w[126], w[127], drained ? 1u : 0u);
 
             /* EXT_CSD[212..215] 是 SEC_COUNT，0 就说明这一块根本没读到东西。 */
             if (w[52] != 0 || w[53] != 0) {
-                IOLog ("NativeSdhci[" kSdhciTag "]: CMD8: SEC_COUNT lo=%u hi=%u => %llu blocks\n",
+                SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: CMD8: SEC_COUNT lo=%u hi=%u => %llu blocks\n",
                        w[52], w[53],
                        (unsigned long long) ((((unsigned long long) w[53]) << 32) | w[52]));
                 ok = true;
             } else {
-                IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD empty (attempt %u)\n", attempt);
+                SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: EXT_CSD empty (attempt %u)\n", attempt);
             }
         }
 
@@ -1451,7 +1462,7 @@ bool NativeSdhci::readExtCsd ()
         if (secCount) {
             fBlockCount = secCount;
         }
-        IOLog ("NativeSdhci[" kSdhciTag "]: EXT_CSD rev=%u SEC_COUNT=%llu (%llu MiB) BUS_WIDTH=%u HS_TIMING=%u\n",
+        SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: EXT_CSD rev=%u SEC_COUNT=%llu (%llu MiB) BUS_WIDTH=%u HS_TIMING=%u\n",
                ext[192], (unsigned long long) secCount,
                (unsigned long long) (secCount / 2048), ext[183], ext[185]);
         return true;
@@ -1475,7 +1486,7 @@ bool NativeSdhci::probeMedia ()
 
             if (!extOk) {
                 uint32_t st = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
-                IOLog ("NativeSdhci[" kSdhciTag "]: width %u: EXT_CSD still empty (state=%08x dat=%u%u%u%u)\n",
+                SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: width %u: EXT_CSD still empty (state=%08x dat=%u%u%u%u)\n",
                        kWidths[wi], st,
                        (st >> 23) & 1u, (st >> 22) & 1u, (st >> 21) & 1u, (st >> 20) & 1u);
             }
@@ -1484,10 +1495,10 @@ bool NativeSdhci::probeMedia ()
 
     memset (block, 0, sizeof (block));
     if (readBlocks (0, 1, block) != kIOReturnSuccess) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: LBA0 read FAILED\n");
+        SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: LBA0 read FAILED\n");
         return false;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: LBA0 ok sig=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: LBA0 ok sig=%02x%02x%02x%02x%02x%02x%02x%02x\n",
            block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7]);
 
     if (block[510] == 0x55 && block[511] == 0xAA) {
@@ -1499,7 +1510,7 @@ bool NativeSdhci::probeMedia ()
             }
             sdhciCopyLe (&start, entry + 8, 4);
             sdhciCopyLe (&sectors, entry + 12, 4);
-            IOLog ("NativeSdhci[" kSdhciTag "]:   MBR p%d type=0x%02x start=%llu count=%llu\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]:   MBR p%d type=0x%02x start=%llu count=%llu\n",
                    i + 1, entry[4], (unsigned long long) start, (unsigned long long) sectors);
         }
     }
@@ -1510,7 +1521,7 @@ bool NativeSdhci::probeMedia ()
         return true;
     }
     if (memcmp (header, "EFI PART", 8) != 0) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: no GPT (LBA1 sig=%02x%02x%02x%02x)\n",
+        SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: no GPT (LBA1 sig=%02x%02x%02x%02x)\n",
                header[0], header[1], header[2], header[3]);
         return true;
     }
@@ -1521,7 +1532,7 @@ bool NativeSdhci::probeMedia ()
     sdhciCopyLe (&entriesLba,  header + 0x48, 8);
     sdhciCopyLe (&entryCount,  header + 0x50, 4);
     sdhciCopyLe (&entrySize,   header + 0x54, 4);
-    IOLog ("NativeSdhci[" kSdhciTag "]: GPT ok entries=%llu size=%llu table_lba=%llu usable=%llu..%llu\n",
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: GPT ok entries=%llu size=%llu table_lba=%llu usable=%llu..%llu\n",
            (unsigned long long) entryCount, (unsigned long long) entrySize,
            (unsigned long long) entriesLba,
            (unsigned long long) firstUsable, (unsigned long long) lastUsable);
@@ -1535,7 +1546,7 @@ bool NativeSdhci::probeMedia ()
         uint8_t table[kSdhciBlockSize] __attribute__ ((aligned (64)));
         memset (table, 0, sizeof (table));
         if (readBlocks (entriesLba + i / perBlock, 1, table) != kIOReturnSuccess) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: GPT table read failed at entry %llu\n", (unsigned long long) i);
+            SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: GPT table read failed at entry %llu\n", (unsigned long long) i);
             break;
         }
         for (uint32_t j = 0; j < perBlock && i + j < entryCount; j++) {
@@ -1560,13 +1571,13 @@ bool NativeSdhci::probeMedia ()
             sdhciFormatGuid (entry, type);
             sdhciCopyLe (&first, entry + 32, 8);
             sdhciCopyLe (&last,  entry + 40, 8);
-            IOLog ("NativeSdhci[" kSdhciTag "]:   GPT[%u] %s %llu..%llu type=%s\n",
+            SDHCI_INFO ("NativeSdhci[" kSdhciTag "]:   GPT[%u] %s %llu..%llu type=%s\n",
                    (unsigned) (i + j), name, (unsigned long long) first,
                    (unsigned long long) last, type);
             shown++;
         }
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: GPT non-empty=%u shown=%u\n", found, shown);
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: GPT non-empty=%u shown=%u\n", found, shown);
     native_sdhci_step = 10;
     return true;
 }
@@ -1576,19 +1587,19 @@ bool NativeSdhci::cardInit ()
     uint32_t resp[4] = {0, 0, 0, 0};
 
     native_sdhci_step = 1;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD0 (f0f0f0f0 reset)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD0 (f0f0f0f0 reset)\n");
     /* CMD0 参数用 0xF0F0F0F0：JEDEC 规定这是带 HS400 状态机在内的软件复位；
      * 参数为 0 的 CMD0 只回 idle，**不会**退出 HS400。ABL 是按 HS200/HS400 配好
      * eMMC 才跳进内核的，所以必须用这个参数才能把卡拉回 SDR/1 位。 */
     if (!sendCommand (MMC_GO_IDLE_STATE, 0xF0F0F0F0u, SDHCI_CMD_RESP_NONE, nullptr)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: CMD0 failed\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD0 failed\n");
         return false;
     }
     sdhciDelayUs (10000);
 
     /* CMD1：SEND_OP_COND，直到卡退出 busy（HCS=1 表示支持 1.8V 高容量） */
     native_sdhci_step = 2;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 (op cond)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 (op cond)\n");
     bool ready = false;
     uint32_t fails = 0;
     for (uint32_t i = 0; i < 300; i++) {
@@ -1597,7 +1608,7 @@ bool NativeSdhci::cardInit ()
         if (!sendCommand (MMC_SEND_OP_COND, 0x40FF8000U,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_INDEX, resp)) {
             fails++;
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD1 failed (%u) state=%08x norm=%04x err=%04x mstat=%08x\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD1 failed (%u) state=%08x norm=%04x err=%04x mstat=%08x\n",
                    fails, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                    sdhciRead16 (fCore, SDHCI_NORMAL_INT_STATUS),
                    sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS),
@@ -1609,7 +1620,7 @@ bool NativeSdhci::cardInit ()
             continue;
         }
         if (i < 3 || (i % 100) == 0) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 resp[%u]=%08x state=%08x\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD1 resp[%u]=%08x state=%08x\n",
                    i, resp[0], sdhciRead32 (fCore, SDHCI_PRESENT_STATE));
         }
         if (resp[0] & 0x80000000U) {
@@ -1619,10 +1630,10 @@ bool NativeSdhci::cardInit ()
         sdhciDelayUs (10000);
     }
     if (!ready) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: card never left busy (CMD1), last=%08x\n", resp[0]);
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: card never left busy (CMD1), last=%08x\n", resp[0]);
         return false;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: OCR=%08x\n", resp[0]);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: OCR=%08x\n", resp[0]);
 
     /* CMD1 完成时带着幽灵 error 汇总位（v12 实测 word=00008001），清掉 NIS 之后
      * 控制器里可能还留着错误锁存，先复位一次命令状态机再发 CMD2。 */
@@ -1636,10 +1647,10 @@ bool NativeSdhci::cardInit ()
      * 永远等一个不会出现的索引（v13 实测：CMD2/CMD9 卡在 CMD_INHIBIT、
      * 既不完成也不报错，而 48 位 R1 的 CMD3/CMD7/CMD16 都正常）。 */
     native_sdhci_step = 3;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 (cid)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 (cid)\n");
     if (!sendCommand (MMC_ALL_SEND_CID, 0,
                       SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC, resp)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 failed, continuing without CID\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD2 failed, continuing without CID\n");
         native_sdhci_cid0 = 0;
         recoverCommandState ("after CMD2 failure");
     } else {
@@ -1649,14 +1660,14 @@ bool NativeSdhci::cardInit ()
     /* CMD3：分配 RCA（eMMC 由 host 指定） */
     native_sdhci_step = 4;
     fRca = 0x0001;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 (rca=1), cid0=%08x\n", native_sdhci_cid0);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 (rca=1), cid0=%08x\n", native_sdhci_cid0);
     if (!sendCommand (MMC_SET_RELATIVE_ADDR, (uint32_t) fRca << 16,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 failed, retrying after recovery\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 failed, retrying after recovery\n");
         recoverCommandState ("after CMD3 failure");
         if (!sendCommand (MMC_SET_RELATIVE_ADDR, (uint32_t) fRca << 16,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 failed twice\n");
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD3 failed twice\n");
             return false;
         }
     }
@@ -1664,12 +1675,12 @@ bool NativeSdhci::cardInit ()
 
     /* CMD9：读 CSD，拿容量 */
     native_sdhci_step = 5;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD9 (csd)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD9 (csd)\n");
     (void) readCsd ();
 
     /* CMD7：选中卡 */
     native_sdhci_step = 6;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD7 (select)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD7 (select)\n");
     if (!sendCommand (MMC_SELECT_CARD, (uint32_t) fRca << 16,
                       SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
         return false;
@@ -1677,7 +1688,7 @@ bool NativeSdhci::cardInit ()
 
     /* CMD16：块长 512 */
     native_sdhci_step = 7;
-    IOLog ("NativeSdhci[" kSdhciTag "]: cardInit: CMD16 (blklen 512)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: cardInit: CMD16 (blklen 512)\n");
     if (!sendCommand (16 /* SET_BLOCKLEN */, (uint32_t) kSdhciBlockSize,
                       SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, resp)) {
         return false;
@@ -1698,7 +1709,7 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
         return kIOReturnUnsupported;   /* TODO: CMD18 + 多块 PIO/ADMA2 */
     }
 
-    for (uint32_t attempt = 0; attempt < 2; attempt++) {
+    for (uint32_t attempt = 0; attempt < 1; attempt++) {   /* v38: 只试一次，别在 400 kHz 上反复空转 */
         ensureBusState ("cmd17");
 
         /* v34：先武装 DMA（写 0x58），再写 BLOCK_SIZE/COUNT 与 Transfer Mode。 */
@@ -1712,16 +1723,16 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
         uint32_t r1[4] = { 0, 0, 0, 0 };
 
         if (!armed) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 dma arm failed\n");
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD17 dma arm failed\n");
             fDmaArmed = false;
         } else if (!sendCommand (MMC_READ_SINGLE_BLOCK, (uint32_t) block,
                           SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
                           r1)) {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 lba=%llu failed (attempt %u)\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD17 lba=%llu failed (attempt %u)\n",
                    (unsigned long long) block, attempt);
             fDmaArmed = false;
         } else {
-            IOLog ("NativeSdhci[" kSdhciTag "]: CMD17 r1=%08x current_state=%u (%s)\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: CMD17 r1=%08x current_state=%u (%s)\n",
                    r1[0], (r1[0] >> 9) & 0xFu, sdhciCardStateName ((r1[0] >> 9) & 0xFu));
             bool drained = endDmaRead (buffer, (UInt32) kSdhciBlockSize);
             /* buffer 是调用方给的，不保证 4 字节对齐 → 用 sdhciCopyLe 逐字节拼装，
@@ -1732,7 +1743,7 @@ IOReturn NativeSdhci::readBlocks (UInt64 block, UInt32 count, void *buffer)
             sdhciCopyLe (&w1, b + 4, 4);
             sdhciCopyLe (&w126, b + 504, 4);
             sdhciCopyLe (&w127, b + 508, 4);
-            IOLog ("NativeSdhci[" kSdhciTag "]: lba%llu w0=%08x w1=%08x w126=%08x w127=%08x drained=%u\n",
+            SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: lba%llu w0=%08x w1=%08x w126=%08x w127=%08x drained=%u\n",
                    (unsigned long long) block, (uint32_t) w0, (uint32_t) w1,
                    (uint32_t) w126, (uint32_t) w127, drained ? 1u : 0u);
             if (drained || w0 != 0 || w1 != 0 || w126 != 0 || w127 != 0) {
@@ -1767,14 +1778,14 @@ IOReturn NativeSdhci::writeBlocks (UInt64 block, UInt32 count, const void *buffe
 
 bool NativeSdhci::start (IOService *provider)
 {
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: enter\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: enter\n");
     if (!IOService::start (provider)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: start: super::start failed\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: super::start failed\n");
         return false;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: super ok, mapping registers\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: super ok, mapping registers\n");
     if (!mapRegisters (provider)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: register mapping failed\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: register mapping failed\n");
         goto fail;
     }
 
@@ -1782,7 +1793,7 @@ bool NativeSdhci::start (IOService *provider)
     logGccState ();
     if (!enableGccClocks ()) {
         /* 打不开根时钟就不要读 SDCC —— 那一步会让整机静默挂死，连 panic 都打不出来 */
-        IOLog ("NativeSdhci[" kSdhciTag "]: gcc clocks not ready, giving up before touching SDCC\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: gcc clocks not ready, giving up before touching SDCC\n");
         goto fail;
     }
     logGccState ();
@@ -1795,20 +1806,20 @@ bool NativeSdhci::start (IOService *provider)
     /* 第一次触 SDCC：先用 32 位、4 字节对齐的 PRESENT_STATE(0x24) 探活，
      * 再用 16 位读 HOST_VERSION(0xFE)。v3/v4 在这里用 32 位读 0xFE 是错位访问，
      * 总线直接不应答，所以连这行 log 都打不出来。 */
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: probing SDCC @0x24 (32-bit, aligned)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: probing SDCC @0x24 (32-bit, aligned)\n");
     native_sdhci_state = sdhciRead32 (fCore, SDHCI_PRESENT_STATE);
-    IOLog ("NativeSdhci[" kSdhciTag "]: state=%08x\n", native_sdhci_state);
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: state=%08x\n", native_sdhci_state);
 
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: probing SDCC @0xFE (16-bit)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: probing SDCC @0xFE (16-bit)\n");
     native_sdhci_version = sdhciRead16 (fCore, SDHCI_HOST_VERSION) & 0xFF;
     native_sdhci_caps    = sdhciRead32 (fCore, SDHCI_CAPABILITIES);
     native_sdhci_caps1   = sdhciRead32 (fCore, SDHCI_CAPABILITIES_1);
-    IOLog ("NativeSdhci[" kSdhciTag "]: ver=%02x caps=%08x caps1=%08x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: ver=%02x caps=%08x caps1=%08x\n",
            native_sdhci_version, native_sdhci_caps, native_sdhci_caps1);
 
     /* 0x00 / 0xff 都说明控制器没应答（时钟关或地址错），继续下去没意义 */
     if (native_sdhci_version == 0x00 || native_sdhci_version == 0xff) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: controller not responding, giving up\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: controller not responding, giving up\n");
         goto fail;
     }
 
@@ -1818,11 +1829,11 @@ bool NativeSdhci::start (IOService *provider)
     {
         uint32_t freq = (uint32_t) sdhciCounterFreq ();
         uint64_t startTicks = sdhciCounter ();
-        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%u cntpct=%08x%08x)\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: delay probe: begin (cntfrq=%u cntpct=%08x%08x)\n",
                freq, (uint32_t) (startTicks >> 32), (uint32_t) startTicks);
         sdhciDelayUs (100);
         uint64_t delta = sdhciCounter () - startTicks;
-        IOLog ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%08x%08x)\n",
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: delay probe: done (advanced=%08x%08x)\n",
                (uint32_t) (delta >> 32), (uint32_t) delta);
     }
 
@@ -1830,16 +1841,16 @@ bool NativeSdhci::start (IOService *provider)
     configureVendorSpec ();
 
     /* 只复位 CMD/DATA 状态机：全复位会关掉卡时钟并且在本平台卡住（v7 实测） */
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (CMD|DATA, 0x2C word)\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: asserting software reset (CMD|DATA, 0x2C word)\n");
     if (!softReset (SDHCI_RESET_CMD | SDHCI_RESET_DATA, kSdhciCmdLoops)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: reset timed out\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: reset timed out\n");
         goto fail;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: reset done\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: reset done\n");
     if (!setBusPowerAndClock ()) {
         goto fail;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: clock done\n");
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: start: clock done\n");
 
     /* 我们从没写过中断使能寄存器。Linux 的 sdhci_enable() 第一步就是写这两个：
      * 状态位使能全部打开、信号全部关掉（我们纯轮询，不要中断线）。
@@ -1850,35 +1861,35 @@ bool NativeSdhci::start (IOService *provider)
     sdhciWrite16 (fCore, SDHCI_ERROR_INT_ENABLE, 0xFFFF);
     sdhciWrite16 (fCore, SDHCI_NORMAL_INT_SIGNAL, 0x0000);
     sdhciWrite16 (fCore, SDHCI_ERROR_INT_SIGNAL, 0x0000);
-    IOLog ("NativeSdhci[" kSdhciTag "]: int: enable=%04x/%04x signal=%04x/%04x\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: int: enable=%04x/%04x signal=%04x/%04x\n",
            sdhciRead16 (fCore, SDHCI_NORMAL_INT_ENABLE),
            sdhciRead16 (fCore, SDHCI_ERROR_INT_ENABLE),
            sdhciRead16 (fCore, SDHCI_NORMAL_INT_SIGNAL),
            sdhciRead16 (fCore, SDHCI_ERROR_INT_SIGNAL));
     if (!setupDmaMemory ()) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: dma memory not available, giving up\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: dma memory not available, giving up\n");
         goto fail;
     }
     if (!cardInit ()) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: card init failed at step %u (state=%08x err=%04x)\n",
+        SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: card init failed at step %u (state=%08x err=%04x)\n",
                native_sdhci_step, sdhciRead32 (fCore, SDHCI_PRESENT_STATE),
                sdhciRead16 (fCore, SDHCI_ERROR_INT_STATUS));
         goto fail;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: card init done\n");
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: start: card init done\n");
 
     native_sdhci_step = 9;
     /* 先按 400 kHz 做介质探测：v13 实测在 19.2 MHz 下第一次数据读
      * （CMD8 SEND_EXT_CSD）会 data timeout，先用最低速把链路跑通，
      * 探测成功之后再升频。 */
-    IOLog ("NativeSdhci[" kSdhciTag "]: start: probing media at 400 kHz\n");
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: start: probing media at 400 kHz\n");
     if (!probeMedia ()) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: media probe failed at step %u\n", native_sdhci_step);
+        SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: media probe failed at step %u\n", native_sdhci_step);
         goto fail;
     }
     /* 探测通了再升频：19.2 MHz（M/N = 1/1），给后续块读取用 */
     if (!setBusClock (19200000)) {
-        IOLog ("NativeSdhci[" kSdhciTag "]: could not raise the transfer clock, staying at 400 kHz\n");
+        SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: could not raise the transfer clock, staying at 400 kHz\n");
         setBusClock (400000);
     }
 
@@ -1897,7 +1908,7 @@ bool NativeSdhci::start (IOService *provider)
     }
     fBlockDevice->registerService ();
 #else
-    IOLog ("NativeSdhci[" kSdhciTag "]: probe mode, %llu blocks, block device NOT registered\n",
+    SDHCI_INFO ("NativeSdhci[" kSdhciTag "]: probe mode, %llu blocks, block device NOT registered\n",
            (unsigned long long) fBlockCount);
 #endif
     return true;
@@ -1968,7 +1979,7 @@ bool NativeSdhciBlock::start (IOService *provider)
     if (!IOBlockStorageDevice::start (provider)) {
         return false;
     }
-    IOLog ("NativeSdhci[" kSdhciTag "]: block device online, %llu blocks\n",
+    SDHCI_LOG ("NativeSdhci[" kSdhciTag "]: block device online, %llu blocks\n",
            (unsigned long long) fController->deviceBlockCount ());
     return true;
 }
