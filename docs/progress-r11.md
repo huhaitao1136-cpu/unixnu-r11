@@ -6283,3 +6283,23 @@ cpusubtype 0 filetype 2 ncmds 3 sizeofcmds 512`、入口 `0x0000000100000220`、
 | panic 提到 SIGTRAP | devfs 还是没挂上，下一步查 `devfs_kernel_mount` |
 | panic 提到 SIGILL | console 能开但写失败，查 tty / `cons_ops` |
 | 仍是只有 `attempting …` 且无 panic | 用户态没跑起来，回到 exec 路径查 |
+
+## 3.99 探针改成只装两个（lip / svc）—— 给 init 线程的回用户态让路（2026-10-30）
+
+- 五探针那两轮真机，屏幕都停在 `R11: bootstrap_return()` 之后，连
+  `load_init_program: attempting to load …` 都不再出现（三探针那轮还有）。
+- 判断：`_thread_exception_return` / `_arm64_thread_exception_return` 是 init 线程回
+  EL0 的必经路径，在函数入口再插一手，很可能把线程的状态/栈过渡打断。
+- 改法：`scripts/patch-kernel-trace.py` 新增 `--probes lip,svc|all`，默认 `lip,svc`
+  —— 只钩 `_load_init_program`（打 `R11: LIP enter`）和 `_unix_syscall`（打 `R11: svc=`）。
+- 判读表：
+  - 有 `R11: LIP enter`、没有 `R11: svc=` → 内核进了 exec 流程，但 EL0 一条指令都没跑
+  - 有 `R11: svc=` → EL0 通了
+  - 连 `LIP enter` 都没有（且屏幕上也没有 `attempting to load`）→ 在 `load_init_program` 之前就停了
+- 顺手修的坑：`--symbols <path>` 的值原先被当成第二个位置参数，`dst` 会指向
+  `kernel-symbols.txt`（把符号表覆盖成内核字节）；现在按选项吃掉自己的值。
+- 本地验证（`ci-art60` 内核）：`探针集合: lip,svc`、
+  `_load_init_program 0xfffffff0076d997c: d104c3ff -> b 0xfffffff007a301b8`、
+  `_unix_syscall 0xfffffff007829608: d101c3ff -> b 0xfffffff007a302a8`；
+  回读 `_thread_bootstrap_return` 仍是 `97fb8c67`（完全没被动），`R11: to-user elr` 0 处。
+- 这一轮不需要跑 CI：探针是本地 `patch-payload-full.py` 装的。

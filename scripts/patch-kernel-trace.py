@@ -48,6 +48,34 @@ HOOKS = (
 
 SLOT = 60 * 4            # 每个跳板预留 60 条指令
 
+# 默认只装这两个：
+#   lip  `_load_init_program` 入口   —— 证明内核走到"要 exec PID 1 了"
+#   svc  `_unix_syscall` 入口        —— 证明有线程真的从 EL0 发了 svc
+# 返回路径上的三个（bootstrap/exc/arm64-exc）会把 init 线程的回用户态过程
+# 也拦下来；2026-10-30 那两轮真机都停在 bootstrap_return 之后，怀疑就是
+# 拦得太狠。要装全用 --probes all。
+PROBES = {
+    'lip': ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
+    'boot': ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
+    'ret': ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
+    'to': ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
+    'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
+}
+DEFAULT_PROBES = 'lip,svc'
+
+
+def select_probes(spec):
+    if spec.strip() == 'all':
+        names = list(PROBES)
+    else:
+        names = [n.strip() for n in spec.split(',') if n.strip()]
+    out = []
+    for name in names:
+        if name not in PROBES:
+            raise SystemExit(f'!! 未知探针 {name}（可选 {", ".join(PROBES)} 或 all）')
+        out.append(PROBES[name])
+    return out
+
 
 # ---------- Mach-O ----------
 
@@ -223,13 +251,27 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig):
 
 def main():
     argv = sys.argv[1:]
-    positional = [a for a in argv if not a.startswith('--')]
     symbols_path = None
-    for i, a in enumerate(argv):
-        if a == '--symbols' and i + 1 < len(argv):
-            symbols_path = argv[i + 1]
-        elif a.startswith('--symbols='):
+    probes_spec = DEFAULT_PROBES
+    positional = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--symbols', '--probes') and i + 1 < len(argv):
+            value = argv[i + 1]
+            if a == '--symbols':
+                symbols_path = value
+            else:
+                probes_spec = value
+            i += 2
+            continue
+        if a.startswith('--symbols='):
             symbols_path = a.split('=', 1)[1]
+        elif a.startswith('--probes='):
+            probes_spec = a.split('=', 1)[1]
+        elif not a.startswith('--'):
+            positional.append(a)
+        i += 1
     if not positional or not symbols_path:
         print(__doc__)
         return 2
@@ -247,8 +289,9 @@ def main():
     table = parse_symbols(symbols_path)
     kprintf = sym(table, SYM_KPRINTF)
     hooks = []
-    for name, kind, msg in HOOKS:
+    for name, kind, msg in select_probes(probes_spec):
         hooks.append(dict(name=name, kind=kind, msg=msg, va=sym(table, name)))
+    print(f'  探针集合: {probes_spec}')
     print('  符号: ' + ' '.join(f'{h["name"]}={h["va"]:#x}' for h in hooks)
           + f' {SYM_KPRINTF}={kprintf:#x}')
 
