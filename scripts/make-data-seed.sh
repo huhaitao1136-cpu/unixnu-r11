@@ -85,6 +85,23 @@ else
   echo "!! 找不到 $INIT_BIN，seed 里不会有 init"
 fi
 
+# ---- 附带动态库：launchd 是 MH_DYLDLINK|MH_PIE，内核需要 /usr/lib/dyld ----
+# seed/lib/ 下放什么就装到 /usr/lib 下（dyld、libSystem.B.dylib 等）。
+LIB_DIR="$(cd "$(dirname "$0")/.." && pwd)/seed/lib"
+if [ -d "$LIB_DIR" ]; then
+  echo "== 安装 /usr/lib 动态库（R11_SEED_LIB）"
+  mkdir -p "$MNT/usr/lib"
+  chmod 755 "$MNT/usr" "$MNT/usr/lib" 2>/dev/null || true
+  for f in "$LIB_DIR"/*; do
+    [ -f "$f" ] || continue
+    cp "$f" "$MNT/usr/lib/$(basename "$f")"
+    chmod 755 "$MNT/usr/lib/$(basename "$f")"
+    echo "   /usr/lib/$(basename "$f")  $(ls -l "$MNT/usr/lib/$(basename "$f")" | awk '{print $1, $5}')"
+  done
+else
+  echo "== 没有 seed/lib，跳过动态库"
+fi
+
 echo "== 卸载并转成稠密 raw（UDRW）"
 sync
 hdiutil detach "$MNT" >/dev/null
