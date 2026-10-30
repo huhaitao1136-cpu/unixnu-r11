@@ -6365,3 +6365,37 @@ exec 之后这个线程应当继续 ERET 到新的用户上下文。所以真正
 - `LIP exit elr=0x100000220 spsr=0x0 …` → exec 之后的用户上下文是对的，问题在返回路径/调度
 - `elr=0` 或 `spsr` 的 M[3:0] 不是 0 → exec 之后线程状态没被换成用户态
 - 连 `LIP exit` 都没有 → `load_init_program` 内部没走到返回（`exec` 卡住）
+
+## 3.100 `LIP exit` 没打出来 —— exec 卡在 `load_init_program` 内部（2026-10-30 19:0x）
+
+`lip,lipexit,svc` 刷上去后屏幕仍是：
+
+```
+R11: LIP enter
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+```
+
+**没有 `R11: LIP exit`**。钩子在 `_load_init_program` 的最后一个 `ret`（`0xfffffff0076d9b88`），
+它没被执行，就说明这个函数还没返回 —— 也就是说 exec 这一段是**卡住**的，而不是"成功之后没人跑"。
+（之前"没有 failed loading 就算 exec 成功"的推断是错的：卡在内部同样不会有任何输出。）
+
+于是把 `load_init_program` 内部切成四段，装六个探针（默认 `lip,exec,machfile,act,lipexit,svc`）：
+
+| 探针 | 符号 | 说明 |
+|---|---|---|
+| `lip` | `_load_init_program` 入口 | 进函数 |
+| `exec` | `_exec_mach_imgact` 入口 | 走到 Mach-O 装载 |
+| `machfile` | `_load_machfile` 入口 | 开始建地址空间/映射段 |
+| `act` | `_activate_exec_state` 入口 | 提交 exec、换用户上下文 |
+| `lipexit` | `_load_init_program` 最后一个 `ret` | 函数返回（exec 完成） |
+| `svc` | `_unix_syscall` 入口 | EL0 发系统调用 |
+
+地址（`ci-art60` 内核）：`_exec_mach_imgact=0xfffffff0076d48a4`、
+`_load_machfile=0xfffffff007762688`、`_activate_exec_state=0xfffffff0076da7d4`、
+`lipexit @0xfffffff0076d9b88`。六个跳板共 1440 字节 + 格式串，仍在 2048 的空穴内。
+
+判读：屏幕最后停在哪一行，就说明卡在它和下一行之间。
+- 停在 `load_machfile enter` → 卡在建立地址空间/映射可执行段（UBC 页入、pmap 分配）
+- 停在 `exec_mach_imgact enter` → 卡在读 Mach-O 头/Vnode 读
+- 停在 `activate_exec_state enter` → 卡在提交 exec、改用户上下文
+- 出现 `LIP exit` 但没有 `svc` → 才回到"返回路径/调度"那类问题

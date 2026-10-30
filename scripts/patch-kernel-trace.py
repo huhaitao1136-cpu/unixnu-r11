@@ -37,24 +37,11 @@ PREFER = ('__TEXT_EXEC', '__TEXT', '__PLK_TEXT_EXEC')
 
 SYM_KPRINTF = '_kprintf'
 
-# (符号, 类型, 文本)
-HOOKS = (
-    ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
-    ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
-    ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
-    ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
-    ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
-)
-
 SLOT = 60 * 4            # 每个跳板预留 60 条指令
 
-# 默认装三个：
-#   lip  `_load_init_program` 入口   —— 证明内核走到"要 exec PID 1 了"
-#   eret `_return_to_user`（arm64 最后一步 ERET 前的标号）—— 证明有线程真的要回 EL0
-#   svc  `_unix_syscall` 入口        —— 证明有线程真的从 EL0 发了 svc
-# 返回路径上的三个（bootstrap/exc/arm64-exc）会把 init 线程的回用户态过程
-# 也拦下来；2026-10-30 那两轮真机都停在 bootstrap_return 之后，怀疑就是
-# 拦得太狠。要装全用 --probes all。
+# 探针表。`lip`/`lipexit`/`exec`/`machfile`/`act`/`pagein` 用来把
+# `load_init_program` 内部切成几段，定位 exec 到底卡在哪一步；
+# `svc` 是"EL0 真的跑起来了"的硬证据。
 PROBES = {
     'lip': ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
     'boot': ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
@@ -62,9 +49,13 @@ PROBES = {
     'to': ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
     'eret': ('return_to_user', 'elr', b'R11: ERET elr=%08lx spsr=%08lx\n\0'),
     'lipexit': ('_load_init_program', 'lipexit', b'R11: LIP exit elr=%08lx spsr=%08lx\n\0'),
+    'exec': ('_exec_mach_imgact', 'plain', b'R11: exec_mach_imgact enter\n\0'),
+    'machfile': ('_load_machfile', 'plain', b'R11: load_machfile enter\n\0'),
+    'act': ('_activate_exec_state', 'plain', b'R11: activate_exec_state enter\n\0'),
+    'pagein': ('_vnode_pagein', 'plain', b'R11: vnode_pagein\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = 'lip,lipexit,svc'
+DEFAULT_PROBES = 'lip,exec,machfile,act,lipexit,svc'
 
 
 def select_probes(spec):
