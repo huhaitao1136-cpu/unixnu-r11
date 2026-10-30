@@ -6327,3 +6327,41 @@ ERET 前最后那个标号，`0xfffffff0073ef84c`，首条 `d538d083` = `mrs x3,
 - 有 `R11: ERET to user`、没有 `svc=` → 内核真的把线程送进了 EL0，但用户态第一条指令没生效
   （入口地址/页权限/`spsr` 出错），下一步查 `elr`/`spsr`/页表。
 - 连 `ERET` 都没有 → 线程根本没被调度回用户态，查 `activate_exec_state` 之后的 run 队列。
+
+### 3.99.2 `R11: ERET to user` 那个探针是假的；改成量 `load_init_program` 的出口（2026-10-30 18:4x）
+
+`lip,eret,svc` 刷上去后屏幕是：
+
+```
+R11: ERET to user          ← 出现在 LIP enter 之前
+No POST boot-arg set.
+R11: LIP enter
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+```
+
+`ERET` 排在 `LIP enter` 前面就已经说明它不可信。回头反汇编 `return_to_user`（`0xfffffff0073ef84c`）
+看到的是 `aa0003f3` = `MOV x19, x0` —— **它是函数体内的一个普通标号，不是 ERET 指令**，
+所以那个探针只是"某条路径路过这里"，没有任何语义。
+
+另外搞清了 PID 1 是怎么起来的（`bsd/kern/kern_sig.c:3410-3415`）：
+
+```
+if (!bsd_init_done) {
+        bsd_init_done = 1;
+        bsdinit_task();
+}
+```
+
+这段在 **`bsd_ast()`** 里，而 `bsd_ast()` 是线程"回用户态之前"跑的 AST。也就是说
+`bsdinit_task()` → `load_init_program()` → exec 全部发生在**同一个线程即将 ERET 之前的那一刻**，
+exec 之后这个线程应当继续 ERET 到新的用户上下文。所以真正该量的是"exec 做完之后
+`ELR_EL1`/`SPSR_EL1` 是什么"，而不是猜某个返回标号。
+
+于是新增 `lipexit` 探针：钩 `_load_init_program` 的**最后一个 `ret`**（`0xfffffff0076d9b88`，
+函数范围到下一个符号 `_load_init_program_at_path` `0xfffffff0076d9bb0` 为止），
+打印 `R11: LIP exit elr=… spsr=…` 后再 `ret`。默认探针组改成 `lip,lipexit,svc`。
+
+判读：
+- `LIP exit elr=0x100000220 spsr=0x0 …` → exec 之后的用户上下文是对的，问题在返回路径/调度
+- `elr=0` 或 `spsr` 的 M[3:0] 不是 0 → exec 之后线程状态没被换成用户态
+- 连 `LIP exit` 都没有 → `load_init_program` 内部没走到返回（`exec` 卡住）

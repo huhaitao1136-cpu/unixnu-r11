@@ -60,10 +60,11 @@ PROBES = {
     'boot': ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
     'ret': ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
     'to': ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
-    'eret': ('return_to_user', 'plain', b'R11: ERET to user\n\0'),
+    'eret': ('return_to_user', 'elr', b'R11: ERET elr=%08lx spsr=%08lx\n\0'),
+    'lipexit': ('_load_init_program', 'lipexit', b'R11: LIP exit elr=%08lx spsr=%08lx\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = 'lip,eret,svc'
+DEFAULT_PROBES = 'lip,lipexit,svc'
 
 
 def select_probes(spec):
@@ -229,13 +230,13 @@ def replay_tail(orig, pc, hook):
     return [orig, enc_b(pc + 4, hook + 4)]
 
 
-def build_tramp(base, hook, kprintf, kind, fmt_va, orig):
+def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     words = []
     pc = base
     words.append(enc_stp_pre(29, 30, 31, -16)); pc += 4
     words.append(enc_stp_pre(0, 1, 31, -16)); pc += 4
     words.append(enc_stp_pre(2, 3, 31, -16)); pc += 4
-    if kind == 'elr':
+    if kind in ('elr', 'lipexit'):
         words.append(ENC_MRS_ELR_EL1); pc += 4
         words.append(ENC_MRS_SPSR_EL1); pc += 4
     elif kind == 'svc':
@@ -246,9 +247,28 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig):
     words.append(enc_ldp_post(2, 3, 31, 16)); pc += 4
     words.append(enc_ldp_post(0, 1, 31, 16)); pc += 4
     words.append(enc_ldp_post(29, 30, 31, 16)); pc += 4
-    for w in replay_tail(orig, pc, hook):
+    tail = tail_words if tail_words is not None else replay_tail(orig, pc, hook)
+    for w in tail:
         words.append(w); pc += 4
     return b''.join(struct.pack('<I', w) for w in words)
+
+
+def last_ret_in_function(data, segs, table, func_va):
+    """函数范围 [func_va, 下一个符号)，返回最后一个 `ret` 的地址。"""
+    addrs = sorted(set(v for v in table.values() if v > func_va))
+    end = addrs[0] if addrs else func_va + 0x4000
+    lo = va_to_off(segs, func_va)
+    if lo is None:
+        raise SystemExit(f'!! {func_va:#x} 不在文件里')
+    count = (end - func_va) // 4
+    hit = None
+    for k in range(count):
+        w = struct.unpack_from('<I', data, lo + 4 * k)[0]
+        if w == 0xD65F03C0:
+            hit = func_va + 4 * k
+    if hit is None:
+        raise SystemExit(f'!! {func_va:#x}..{end:#x} 里没有 ret')
+    return hit
 
 
 def main():
@@ -292,9 +312,17 @@ def main():
     kprintf = sym(table, SYM_KPRINTF)
     hooks = []
     for name, kind, msg in select_probes(probes_spec):
-        hooks.append(dict(name=name, kind=kind, msg=msg, va=sym(table, name)))
+        va = sym(table, name)
+        hook_va = va
+        tail = None
+        if kind == 'lipexit':
+            # 钩函数的最后一个 ret，而不是入口：exec 已经做完，
+            # 此时 ELR_EL1/SPSR_EL1 里就是"即将回到用户态的状态"。
+            hook_va = last_ret_in_function(data, segs, table, va)
+            tail = [0xD65F03C0]
+        hooks.append(dict(name=name, kind=kind, msg=msg, va=hook_va, func=va, tail=tail))
     print(f'  探针集合: {probes_spec}')
-    print('  符号: ' + ' '.join(f'{h["name"]}={h["va"]:#x}' for h in hooks)
+    print('  符号: ' + ' '.join(f'{h["name"]}={h["func"]:#x}' for h in hooks)
           + f' {SYM_KPRINTF}={kprintf:#x}')
 
     cave = find_cave(data, segs, CAVE_SIZE)
@@ -322,7 +350,7 @@ def main():
             raise SystemExit(f'!! {h["name"]} 不在可写的文件区间里')
         h['orig'] = struct.unpack_from('<I', data, hoff)[0]
         h['tramp'] = build_tramp(h['tramp_va'], h['va'], kprintf, h['kind'],
-                                 h['fmt_va'], h['orig'])
+                                 h['fmt_va'], h['orig'], h['tail'])
 
     blob = bytearray(MAGIC)
     for h in hooks:
