@@ -14,6 +14,7 @@
 用法:
   python3 patch-payload-full.py <payload.img> [--symbols <kernel-symbols.txt>]
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -161,8 +162,14 @@ def main() -> int:
     if '--no-trace' in sys.argv[1:]:
         print('   跳过（--no-trace）')
     else:
-        if run(['python3', SCRIPTS / 'patch-kernel-trace.py', kernel, kernel,
-                '--symbols', sym]).returncode != 0:
+        trace_args = ['python3', SCRIPTS / 'patch-kernel-trace.py', kernel, kernel,
+                      '--symbols', sym]
+        # 想换探针集合就设 R11_PROBES，例如：
+        #   R11_PROBES=lip,exec,lret0,lerr,mexit19,pmach,svc python3 scripts/patch-payload-full.py …
+        probes_env = os.environ.get('R11_PROBES')
+        if probes_env:
+            trace_args += ['--probes', probes_env]
+        if run(trace_args).returncode != 0:
             return 1
 
     print('== 写回 payload')

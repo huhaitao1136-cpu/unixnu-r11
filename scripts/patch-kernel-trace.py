@@ -66,6 +66,10 @@ PROBES = {
     'plat': ('_proc_setplatformdata', 'plain', b'R11: proc_setplatformdata\n\0'),
     'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
     'lerr': ('_load_return_to_errno', 'arg0', b'R11: load_return_to_errno lret=%x\n\0'),
+    'lret0': ('0xfffffff0076d4b5c', 'arg0', b'R11: [caller] w0=%x\n\0'),
+    'pmach': ('_parse_machfile', 'plain', b'R11: parse_machfile enter\n\0'),
+    'pmexit': ('_parse_machfile', 'lipexit', b'R11: parse_machfile exit ret=%x\n\0'),
+    'mexit19': ('0xfffffff007762a6c', 'reg19', b'R11: load_machfile returns w19=%x\n\0'),
     'mfilefail': ('0xfffffff0076d4b64', 'reg24', b'R11: load_machfile FAILED lret=%x\n\0'),
     'mfok': ('0xfffffff0076d4bb0', 'plain', b'R11: load_machfile OK\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
@@ -164,13 +168,17 @@ def enc_bl(pc, target):
     return 0x94000000 | ((delta >> 2) & 0x03FFFFFF)
 
 
-def enc_adrp_x0(pc, target):
+def enc_adrp_xd(pc, target, rd):
     page_delta = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12
     if not (-(1 << 20) <= page_delta < (1 << 20)):
         raise SystemExit(f'!! ADRP 超出 ±4GB {pc:#x} -> {target:#x}')
     immlo = page_delta & 0x3
     immhi = (page_delta >> 2) & 0x7FFFF
-    return 0x90000000 | (immlo << 29) | (immhi << 5)
+    return 0x90000000 | (immlo << 29) | (immhi << 5) | (rd & 31)
+
+
+def enc_adrp_x0(pc, target):
+    return enc_adrp_xd(pc, target, 0)
 
 
 def enc_add_x0_imm(imm12):
@@ -224,7 +232,13 @@ def sym(table, name):
 # ---------- 跳板 ----------
 
 def replay_tail(orig, pc, hook):
-    """把被钩函数的第一条指令补回来。"""
+    """把被钩函数的第一条指令补回来。
+
+    坑：以前非跳转指令是**原样照搬**的。ADRP/ADR 是 PC 相对指令，
+    挪到空穴里之后算出来的页就变了（实测 `adrp x8, 0x..7af1000` 被搬成
+    `0x..7e4d000`，后面 `ldr w8` 读到另一个全局，分支全被带偏）。
+    所以这两类必须按新地址重新编码。
+    """
     if (orig & 0xFC000000) == 0x14000000:                    # b
         imm = orig & 0x03FFFFFF
         if imm & (1 << 25):
@@ -235,6 +249,15 @@ def replay_tail(orig, pc, hook):
         if imm & (1 << 25):
             imm -= 1 << 26
         return [enc_bl(pc, pc + imm * 4), enc_b(pc + 4, hook + 4)]
+    if (orig & 0x9F000000) == 0x90000000:                    # adrp
+        rd = orig & 31
+        immlo = (orig >> 29) & 0x3
+        immhi = (orig >> 5) & 0x7FFFF
+        page = (immlo | (immhi << 2))
+        if page & (1 << 20):
+            page -= 1 << 21
+        target = ((hook + 4) & ~0xFFF) + (page << 12)
+        return [enc_adrp_xd(pc, target, rd), enc_b(pc + 4, hook + 4)]
     return [orig, enc_b(pc + 4, hook + 4)]
 
 
@@ -257,6 +280,8 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
         words.append(ENC_MRS_SPSR_EL1); pc += 4
     elif kind == 'reg24':
         words.append(enc_mov_wd_ws(1, 24)); pc += 4     # x1 = (uint32_t) w24
+    elif kind == 'reg19':
+        words.append(enc_mov_wd_ws(1, 19)); pc += 4     # x1 = (uint32_t) w19
     elif kind == 'arg0':
         words.append(enc_mov_wd_ws(1, 0)); pc += 4      # x1 = (uint32_t) 第一个参数
     elif kind == 'svc':
