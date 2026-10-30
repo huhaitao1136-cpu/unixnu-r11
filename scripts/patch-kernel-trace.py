@@ -1,90 +1,104 @@
 #!/usr/bin/env python3
-"""给内核装两个"用户态到底有没有跑起来"的探针（符号驱动，幂等）。
+"""在 kernel.macho 里装三个探针，用来判定"PID 1 到底有没有进 EL0"。
 
-背景：种子里的 init 已经是 arm64 + PAGEZERO 版，`load_init_program` 打出
-"attempting to load .../launchd.development" 之后既没有 `failed loading`、也没有
-`Process 1 exec of ... failed`，说明 exec 返回 0；但屏幕上既没有我们写的标记，
-也没有 `kill(1, SIGKILL)` 应该触发的 `unexpected SIGKILL of initproc` panic。
-也就是说：exec 成功了，但线程可能根本没回到 EL0。
+为什么要它：v5/v6 的 init（kill(1,SIGKILL) 都放了）在真机上一行输出都没有，
+而 `kern_sig.c` 对 PID 1 的 SIGKILL 是 `panic_plain("unexpected SIGKILL ...")`
+—— 没 panic 就等于用户态一条指令都没跑。所以要在内核侧打点。
 
-两个探针（都用 kprintf，走同一条能上屏的通道）：
+探针：
+  A  `_thread_bootstrap_return`       打印 `R11: bootstrap_return()`
+  B  `_arm64_thread_exception_return` 打印 `R11: to-user elr=.. spsr=..`
+     （xnu 回到用户态的唯一出口；spsr 的 M[3:2] 为 0 才是 EL0）
+  C  `_unix_syscall`                  打印 `R11: svc <x16>`（EL0 发起的系统调用）
 
-  A) `_thread_bootstrap_return` 入口 —— bsd_init 返回后内核就是从这里回用户态。
-     打印 `R11: bootstrap_return (pc=...)` 说明"回用户态"这一步真的走到了。
-  B) `_unix_syscall` 入口 —— EL0 的 `svc #0x80` 落在这里。
-     打印 `R11: svc %u` 说明用户态真的执行了指令并进了内核。
+判读：
+  A 出现但 B 没有            → 卡在 bootstrap 里没到 return_to_user
+  B 出现且 spsr=EL0、elr 是用户地址，但 C 从不出现 → 进了 EL0 但没发出任何 svc
+  C 出现                     → EL0 真的在跑
 
-结论表：
-  两个都打 → EL0 通了，问题在我们的 init 自己（console / 标记）
-  只打 A   → 回了用户态但第一条指令没执行成功（入口地址 / 页映射）
-  两个都不打 → 内核没走到 thread_bootstrap_return，问题在内核侧
+跳板要点：被钩函数的第一条指令必须**重放**（`_arm64_thread_exception_return`
+的第一条是 `mrs x0, tpidr_el1`，`_unix_syscall` 的第一条是 `sub sp,sp,#0x70`，
+跳过就会把栈搞坏）。所以跳板尾部按原指令类型分别处理：
+  `b T`  → 直接 `b T`
+  `bl T` → `bl T` 后 `b hook+4`
+  其它   → 原样重放后 `b hook+4`
 
-实现方式与 `patch-init-screen-gc.py` 相同：在可执行段里找一段全零的空洞，
-写入 8 字节魔数 `R11TRACE` + 跳板代码 + 格式串，再把目标函数的第一条指令
-改成 `b 跳板`；跳板末尾 `b 目标+4` 回到原函数。魔数在 = 已经打过补丁。
-
-用法:
-    python3 patch-kernel-trace.py <kernel> <输出> --symbols <kernel-symbols.txt>
+用法：
+  python3 patch-kernel-trace.py <kernel> [<output>] --symbols <kernel-symbols.txt>
 """
+
 import struct
 import sys
 from pathlib import Path
 
 MAGIC = b'R11TRACE'
-CAVE_SIZE = 0x400
+CAVE_SIZE = 1024
+PREFER = ('__TEXT_EXEC', '__TEXT', '__PLK_TEXT_EXEC')
 
-SYM_BOOTSTRAP = '_thread_bootstrap_return'
-SYM_SYSCALL = '_unix_syscall'
 SYM_KPRINTF = '_kprintf'
 
-MSG_A = b'R11: bootstrap_return (about to run PID 1 in EL0)\n\0'
-MSG_B = b'R11: svc %u (EL0 syscall reached the kernel)\n\0'
+# (符号, 类型, 文本)
+HOOKS = (
+    ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
+    ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
+    ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
+)
 
-LC_SEGMENT_64 = 0x19
+SLOT = 60 * 4            # 每个跳板预留 60 条指令
 
 
 # ---------- Mach-O ----------
 
 def parse_segments(data):
-    (magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds,
-     flags, reserved) = struct.unpack_from('<IIIIIIII', data, 0)
-    if magic != 0xFEEDFACF:
-        raise SystemExit(f'!! 不是 64 位 Mach-O: {magic:#x}')
+    magic, _, _, filetype, ncmds, _, _, _ = struct.unpack_from('<IIIIIIII', data, 0)
+    if magic not in (0xFEEDFACF, 0xFEEDFACE):
+        raise SystemExit('!! 不是 Mach-O')
     off = 32
     segs = []
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from('<II', data, off)
-        if cmd == LC_SEGMENT_64:
+        if cmd == 0x19:
             name = data[off + 8: off + 24].rstrip(b'\0').decode('ascii', 'replace')
-            vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, sflags = \
-                struct.unpack_from('<QQQQIIII', data, off + 24)
-            segs.append(dict(name=name, vmaddr=vmaddr, vmsize=vmsize, fileoff=fileoff,
-                             filesize=filesize, initprot=initprot, nsects=nsects))
-        if cmdsize <= 0:
-            raise SystemExit('!! load command 长度为 0')
+            vmaddr, vmsize, fileoff, filesize, maxprot, initprot = \
+                struct.unpack_from('<QQQQII', data, off + 24)
+            segs.append(dict(name=name, vmaddr=vmaddr, vmsize=vmsize,
+                             fileoff=fileoff, filesize=filesize,
+                             maxprot=maxprot, initprot=initprot))
         off += cmdsize
     return segs, filetype
 
 
 def va_to_off(segs, va):
     for s in segs:
-        if s['fileoff'] == 0 and s['filesize'] == 0:
-            continue
         if s['vmaddr'] <= va < s['vmaddr'] + s['filesize']:
             return s['fileoff'] + (va - s['vmaddr'])
     return None
 
 
-PREFER = ('__TEXT_EXEC', '__TEXT', '__PLK_TEXT_EXEC')
+def cave_in_segment(data, s, need):
+    base = s['fileoff']
+    blob = data[base: base + s['filesize']]
+    best = None
+    run_start = None
+    for i, byte in enumerate(blob):
+        if byte == 0:
+            if run_start is None:
+                run_start = i
+        elif run_start is not None:
+            length = i - run_start
+            if length >= need and (best is None or length > best[2]):
+                best = (s['vmaddr'] + run_start, base + run_start, length)
+            run_start = None
+    if run_start is not None:
+        length = len(blob) - run_start
+        if length >= need and (best is None or length > best[2]):
+            best = (s['vmaddr'] + run_start, base + run_start, length)
+    return best
 
 
 def find_cave(data, segs, need):
-    """在可执行段里找一段长度 >= need 的全零区，返回 (va, off, size)。
-
-    优先 __TEXT_EXEC：两个钩子就在这段里，确定被映射；gc_enable 的跳板也已经
-    在这段里被真机验证过。__PLK_TEXT_EXEC 里虽然有大片零区（prelink 后的 kext
-    之间），但那是别人的地盘，放最后。
-    """
+    """优先 __TEXT_EXEC：两个钩子就在这段里，确定被映射，而且 gc_enable 的
+    跳板已经在这段里被真机验证过；__PLK_TEXT_EXEC 里虽然有大片零区，放最后。"""
     for want in PREFER:
         for s in segs:
             if s['name'] != want or not (s['initprot'] & 0x4) or s['filesize'] < need:
@@ -95,55 +109,26 @@ def find_cave(data, segs, need):
     return None
 
 
-def cave_in_segment(data, s, need):
-    best = None
-    base = s['fileoff']
-    blob = data[base: base + s['filesize']]
-    run_start = None
-    i = 0
-    n = len(blob)
-    while i < n:
-        if blob[i] == 0:
-            if run_start is None:
-                run_start = i
-        else:
-            if run_start is not None:
-                length = i - run_start
-                if length >= need and (best is None or length > best[2]):
-                    best = (s['vmaddr'] + run_start, base + run_start, length)
-                run_start = None
-        i += 1
-    if run_start is not None:
-        length = n - run_start
-        if length >= need and (best is None or length > best[2]):
-            best = (s['vmaddr'] + run_start, base + run_start, length)
-    return best
-
-
 # ---------- 指令编码 ----------
 
 def enc_b(pc, target):
     delta = target - pc
-    if delta % 4:
-        raise SystemExit('!! B 偏移没对齐')
-    if not (-(1 << 27) <= delta < (1 << 27)):
-        raise SystemExit('!! B 偏移超出 ±128MB')
+    if delta % 4 or not (-(1 << 27) <= delta < (1 << 27)):
+        raise SystemExit(f'!! B 编码失败 {pc:#x} -> {target:#x}')
     return 0x14000000 | ((delta >> 2) & 0x03FFFFFF)
 
 
 def enc_bl(pc, target):
     delta = target - pc
-    if delta % 4:
-        raise SystemExit('!! BL 偏移没对齐')
-    if not (-(1 << 27) <= delta < (1 << 27)):
-        raise SystemExit('!! BL 偏移超出 ±128MB')
+    if delta % 4 or not (-(1 << 27) <= delta < (1 << 27)):
+        raise SystemExit(f'!! BL 编码失败 {pc:#x} -> {target:#x}')
     return 0x94000000 | ((delta >> 2) & 0x03FFFFFF)
 
 
 def enc_adrp_x0(pc, target):
     page_delta = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12
     if not (-(1 << 20) <= page_delta < (1 << 20)):
-        raise SystemExit('!! ADRP 超出 ±4GB')
+        raise SystemExit(f'!! ADRP 超出 ±4GB {pc:#x} -> {target:#x}')
     immlo = page_delta & 0x3
     immhi = (page_delta >> 2) & 0x7FFFF
     return 0x90000000 | (immlo << 29) | (immhi << 5)
@@ -154,19 +139,21 @@ def enc_add_x0_imm(imm12):
 
 
 def enc_stp_pre(rt, rt2, rn, offset):
-    """STP <rt>,<rt2>,[<rn>,#offset]!"""
     imm7 = (offset // 8) & 0x7F
     return 0xA9800000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt
 
 
 def enc_ldp_post(rt, rt2, rn, offset):
-    """LDP <rt>,<rt2>,[<rn>],#offset"""
     imm7 = (offset // 8) & 0x7F
     return 0xA8C00000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt
 
 
 def enc_mov_xd_xs(rd, rm):
     return 0xAA0003E0 | (rm << 16) | rd
+
+
+ENC_MRS_ELR_EL1 = 0xD5384021     # mrs x1, elr_el1
+ENC_MRS_SPSR_EL1 = 0xD5384002    # mrs x2, spsr_el1
 
 
 # ---------- 符号表 ----------
@@ -195,36 +182,40 @@ def sym(table, name):
 
 # ---------- 跳板 ----------
 
-def tramp_simple(base, hook, kprintf, fmt_va):
-    """只打印一行的跳板（用于 noreturn 的 thread_bootstrap_return）。"""
-    words = []
-    pc = base
-    words.append(enc_stp_pre(29, 30, 31, -16)); pc += 4        # stp x29,x30,[sp,#-16]!
-    words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
-    words.append(enc_add_x0_imm(fmt_va & 0xFFF)); pc += 4
-    words.append(enc_bl(pc, kprintf)); pc += 4
-    words.append(enc_ldp_post(29, 30, 31, 16)); pc += 4        # ldp x29,x30,[sp],#16
-    words.append(enc_b(pc, hook + 4))
-    return b''.join(struct.pack('<I', w) for w in words)
+def replay_tail(orig, pc, hook):
+    """把被钩函数的第一条指令补回来。"""
+    if (orig & 0xFC000000) == 0x14000000:                    # b
+        imm = orig & 0x03FFFFFF
+        if imm & (1 << 25):
+            imm -= 1 << 26
+        return [enc_b(pc, pc + imm * 4)]
+    if (orig & 0xFC000000) == 0x94000000:                    # bl
+        imm = orig & 0x03FFFFFF
+        if imm & (1 << 25):
+            imm -= 1 << 26
+        return [enc_bl(pc, pc + imm * 4), enc_b(pc + 4, hook + 4)]
+    return [orig, enc_b(pc + 4, hook + 4)]
 
 
-def tramp_syscall(base, hook, kprintf, fmt_va):
-    """保存 x0..x17 → 打印 x16 → 恢复 → 回原函数。"""
-    save = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9),
-            (10, 11), (12, 13), (14, 15), (16, 17)]
+def build_tramp(base, hook, kprintf, kind, fmt_va, orig):
     words = []
     pc = base
     words.append(enc_stp_pre(29, 30, 31, -16)); pc += 4
-    for a, b in save:
-        words.append(enc_stp_pre(a, b, 31, -16)); pc += 4
-    words.append(enc_mov_xd_xs(1, 16)); pc += 4                # mov x1, x16
+    words.append(enc_stp_pre(0, 1, 31, -16)); pc += 4
+    words.append(enc_stp_pre(2, 3, 31, -16)); pc += 4
+    if kind == 'elr':
+        words.append(ENC_MRS_ELR_EL1); pc += 4
+        words.append(ENC_MRS_SPSR_EL1); pc += 4
+    elif kind == 'svc':
+        words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
     words.append(enc_add_x0_imm(fmt_va & 0xFFF)); pc += 4
     words.append(enc_bl(pc, kprintf)); pc += 4
-    for a, b in reversed(save):
-        words.append(enc_ldp_post(a, b, 31, 16)); pc += 4
+    words.append(enc_ldp_post(2, 3, 31, 16)); pc += 4
+    words.append(enc_ldp_post(0, 1, 31, 16)); pc += 4
     words.append(enc_ldp_post(29, 30, 31, 16)); pc += 4
-    words.append(enc_b(pc, hook + 4))
+    for w in replay_tail(orig, pc, hook):
+        words.append(w); pc += 4
     return b''.join(struct.pack('<I', w) for w in words)
 
 
@@ -237,13 +228,13 @@ def main():
             symbols_path = argv[i + 1]
         elif a.startswith('--symbols='):
             symbols_path = a.split('=', 1)[1]
-    if len(positional) < 1 or not symbols_path:
+    if not positional or not symbols_path:
         print(__doc__)
         return 2
     src = Path(positional[0])
     dst = Path(positional[1]) if len(positional) > 1 else src
     data = bytearray(src.read_bytes())
-    segs, filetype = parse_segments(data)
+    segs, _ = parse_segments(data)
 
     if MAGIC in data:
         print('  已经装过 R11TRACE 探针，跳过')
@@ -252,63 +243,66 @@ def main():
         return 0
 
     table = parse_symbols(symbols_path)
-    hook_a = sym(table, SYM_BOOTSTRAP)
-    hook_b = sym(table, SYM_SYSCALL)
     kprintf = sym(table, SYM_KPRINTF)
-    print(f'  符号: {SYM_BOOTSTRAP}={hook_a:#x} {SYM_SYSCALL}={hook_b:#x} {SYM_KPRINTF}={kprintf:#x}')
+    hooks = []
+    for name, kind, msg in HOOKS:
+        hooks.append(dict(name=name, kind=kind, msg=msg, va=sym(table, name)))
+    print('  符号: ' + ' '.join(f'{h["name"]}={h["va"]:#x}' for h in hooks)
+          + f' {SYM_KPRINTF}={kprintf:#x}')
 
-    need = CAVE_SIZE
-    cave = find_cave(data, segs, need)
+    cave = find_cave(data, segs, CAVE_SIZE)
     if not cave:
-        raise SystemExit(f'!! 找不到 {need} 字节的全零空洞')
+        raise SystemExit(f'!! 找不到 {CAVE_SIZE} 字节的全零空穴')
     cave_va, cave_off, cave_len = cave
-    print(f'  空洞: {cave_va:#x}（{cave_len} 字节可用，取 {need}）')
+    print(f'  空洞: {cave_va:#x}（{cave_len} 字节可用，取 {CAVE_SIZE}）')
 
-    # 布局：魔数(8) + trampA + 对齐 + trampB + msgA + msgB
-    cursor = cave_va + 8
-    tramp_a_va = cursor
-    tramp_a = tramp_simple(tramp_a_va, hook_a, kprintf, cave_va)   # 先占位（用洞地址）只为量长度
-    cursor += len(tramp_a)
+    # 布局：魔数(8) → 每个钩子一个 SLOT → 三个格式串
+    cursor = cave_va + len(MAGIC)
+    tramps = []
+    for h in hooks:
+        h['tramp_va'] = cursor
+        cursor += SLOT
     cursor = (cursor + 7) & ~7
-    tramp_b_va = cursor
-    tramp_b = tramp_syscall(tramp_b_va, hook_b, kprintf, cave_va)
-    cursor += len(tramp_b)
-    cursor = (cursor + 7) & ~7
-    msg_a_va = cursor
-    cursor += len(MSG_A)
-    msg_b_va = cursor
-    cursor += len(MSG_B)
+    for h in hooks:
+        h['fmt_va'] = cursor
+        cursor += len(h['msg'])
     if cursor - cave_va > cave_len:
-        raise SystemExit('!! 空洞装不下探针')
+        raise SystemExit('!! 空穴装不下探针')
 
-    tramp_a = tramp_simple(tramp_a_va, hook_a, kprintf, msg_a_va)
-    tramp_b = tramp_syscall(tramp_b_va, hook_b, kprintf, msg_b_va)
-
-    blob = bytearray()
-    blob += MAGIC                                     # 8 字节
-    blob += tramp_a
-    blob += b'\0' * ((tramp_b_va - (cave_va + len(blob))) if tramp_b_va > cave_va + len(blob) else 0)
-    assert cave_off + len(blob) == va_to_off(segs, tramp_b_va) or True
-    blob += tramp_b
-    blob += b'\0' * ((msg_a_va - (cave_va + len(blob))) if msg_a_va > cave_va + len(blob) else 0)
-    blob += MSG_A
-    blob += MSG_B
-    off = cave_off
-    data[off: off + len(blob)] = blob
-
-    # 装钩子
-    for hook, tramp_va, name in ((hook_a, tramp_a_va, SYM_BOOTSTRAP),
-                                 (hook_b, tramp_b_va, SYM_SYSCALL)):
-        hoff = va_to_off(segs, hook)
+    for h in hooks:
+        hoff = va_to_off(segs, h['va'])
         if hoff is None:
-            raise SystemExit(f'!! {name} 不在可写的文件区间里')
-        old = struct.unpack_from('<I', data, hoff)[0]
-        struct.pack_into('<I', data, hoff, enc_b(hook, tramp_va))
-        print(f'  {name} {hook:#x}: {old:08x} -> b {tramp_va:#x}')
+            raise SystemExit(f'!! {h["name"]} 不在可写的文件区间里')
+        h['orig'] = struct.unpack_from('<I', data, hoff)[0]
+        h['tramp'] = build_tramp(h['tramp_va'], h['va'], kprintf, h['kind'],
+                                 h['fmt_va'], h['orig'])
+
+    blob = bytearray(MAGIC)
+    for h in hooks:
+        want = va_to_off(segs, h['tramp_va'])
+        here = cave_off + len(blob)
+        if want > here:
+            blob += b'\0' * (want - here)
+        blob += h['tramp']
+    for h in hooks:
+        want = va_to_off(segs, h['fmt_va'])
+        here = cave_off + len(blob)
+        if want > here:
+            blob += b'\0' * (want - here)
+        blob += h['msg']
+    if len(blob) > CAVE_SIZE:
+        raise SystemExit('!! 探针 blob 超出空穴')
+    data[cave_off: cave_off + len(blob)] = blob
+
+    for h in hooks:
+        hoff = va_to_off(segs, h['va'])
+        struct.pack_into('<I', data, hoff, enc_b(h['va'], h['tramp_va']))
+        print(f'  {h["name"]} {h["va"]:#x}: {h["orig"]:08x} -> b {h["tramp_va"]:#x}')
 
     dst.write_bytes(data)
     print(f'  输出: {dst}')
-    print(f'  探针: A @{tramp_a_va:#x} (msg {msg_a_va:#x}) / B @{tramp_b_va:#x} (msg {msg_b_va:#x})')
+    print('  探针: ' + ' / '.join(f'{h["kind"]}@{h["tramp_va"]:#x}(msg {h["fmt_va"]:#x})'
+                                 for h in hooks))
     return 0
 
 
