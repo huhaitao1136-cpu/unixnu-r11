@@ -62,10 +62,13 @@ PROBES = {
     'sugid': ('_exec_handle_sugid', 'plain', b'R11: exec_handle_sugid\n\0'),
     'stack': ('_create_unix_stack', 'plain', b'R11: create_unix_stack\n\0'),
     'copyout': ('_exec_copyout_strings', 'plain', b'R11: exec_copyout_strings\n\0'),
+    'zre': ('_zone_userspace_reboot_checks', 'plain', b'R11: zone_userspace_reboot_checks\n\0'),
+    'plat': ('_proc_setplatformdata', 'plain', b'R11: proc_setplatformdata\n\0'),
+    'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = ('lip,exec,machfile,mfileexit,getattr,extract,sugid,'
-                  'stack,copyout,act,lipexit,svc')
+DEFAULT_PROBES = ('lip,exec,machfile,mfileexit,extract,zre,plat,ovm,'
+                  'act,lipexit,svc')
 
 
 def select_probes(spec):
