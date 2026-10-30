@@ -4,17 +4,20 @@
 用途：放进 Data seed 的 /sbin/launchd 与 /usr/appleinternal/sbin/launchd.development，
 让 XNU 挂上根文件系统后能 exec 成功，从而验证 EL0 用户态执行链路。
 
-程序行为（手写指令，无汇编器）：
-  1. open("/dev/console", O_WRONLY)             XNU 系统调用 5
-  2. 成功则 write(fd, "R11_EL0_INIT_OK\\n", n)  系统调用 4
-  3. 再 write(1, "R11_EL0_INIT_OK\\n", n)
-  4. 死循环（保持 PID 1 存活，避免内核 panic）
+程序行为（手写指令，无汇编器），v5：
+  1. open("/dev/console", O_WRONLY|O_NONBLOCK)   XNU 系统调用 5
+     —— O_NONBLOCK 是关键：v4 的静默最可能是 open 卡在 tty 层，而不是失败。
+  2. 成功：write(fd, "A5\\n") → write(fd, "R11_EL0_INIT_OK\\n") → write(fd, "B5\\n")
+     然后把 PID 1 挂住（b .），屏幕上一行一行能看出走到哪一步。
+  3. 任一步失败：kill(1, SIGKILL)（系统调用 37）—— 内核会打印
+     "unexpected SIGKILL of %s %s"，这是不依赖 console 的"用户态确实跑起来了"证据。
+     （v4 用 brk/udf 想触发 panic，但 EL0 的 brk 只会变成 SIGTRAP，内核不打印。）
 
 XNU arm64 系统调用约定：
   x16 = 调用号，参数 x0..x7，`svc #0x80`，返回 x0，出错置 carry（b.cs 跳过）
 
 用法:
-  python3 make-minimal-init.py [输出路径，默认 build/init.macho]
+  python3 make-minimal-init.py [输出路径，默认 build/init.macho] [--pad=65536]
 """
 import struct
 import sys
@@ -31,7 +34,19 @@ LC_UNIXTHREAD = 0x5
 ARM_THREAD_STATE64 = 6
 ARM_THREAD_STATE64_COUNT = 68
 
+SYS_exit = 1
+SYS_write = 4
+SYS_open = 5
+SYS_kill = 37
+
+O_WRONLY = 0x1
+O_NONBLOCK = 0x4
+
+SIGKILL = 9
+
 MARKER = b'R11_EL0_INIT_OK\n'
+MK_A = b'A5\n'
+MK_B = b'B5\n'
 DEVPATH = b'/dev/console\0'
 
 
@@ -65,57 +80,88 @@ def b_cond(cond, imm):
     return 0x54000000 | (((imm >> 2) & 0x7FFFF) << 5) | cond
 
 
-def brk(imm16=0):
-    return 0xD4200000 | ((imm16 & 0xFFFF) << 5)
+B_AL = 0x14000000
 
 
 def build_code():
-    # 指令表：(助记符, 参数) —— ADR/分支的目标先占位，稍后按最终长度回填
-    L_TRAP = 19          # open 失败 → brk #0x11（SIGTRAP → 内核 panic，屏幕可见）
-    L_UDF = 20           # write 失败 → udf #0（SIGILL）
+    """返回 (code_bytes, data_bytes, msg_off, dev_off)。
 
-    instrs = [None] * 21
-    instrs[0] = ('adr', 0, 'devpath')
-    instrs[1] = ('raw', movz_w(1, 1))         # x1 = O_WRONLY
-    instrs[2] = ('raw', movz_x(2, 0))         # x2 = 0
-    instrs[3] = ('raw', movz_x(16, 5))        # x16 = SYS_open
-    instrs[4] = ('raw', svc())
-    instrs[5] = ('bcond', 2, L_TRAP)          # b.cs → open 失败，直接暴露
-    instrs[6] = ('raw', mov_xd_xs(3, 0))      # x3 = x0（console fd）
-    instrs[7] = ('adr', 1, 'marker')
-    instrs[8] = ('raw', movz_x(2, len(MARKER)))
-    instrs[9] = ('raw', mov_xd_xs(0, 3))      # x0 = x3
-    instrs[10] = ('raw', movz_x(16, 4))       # x16 = SYS_write
-    instrs[11] = ('raw', svc())
-    instrs[12] = ('bcond', 2, L_UDF)          # b.cs → 写 console 失败
-    instrs[13] = ('adr', 1, 'marker')
-    instrs[14] = ('raw', movz_x(2, len(MARKER)))
-    instrs[15] = ('raw', movz_x(0, 1))        # fd 1
-    instrs[16] = ('raw', movz_x(16, 4))       # x16 = SYS_write
-    instrs[17] = ('raw', svc())
-    instrs[18] = ('raw', 0x14000000)          # b .  ← 保持 PID 1 存活
-    instrs[19] = ('raw', brk(0x11))           # SIGTRAP：open("/dev/console") 失败
-    instrs[20] = ('raw', 0x00000000)          # UDF #0：write 到 console 失败
+    指令用 (kind, ...) 描述，标签用名字引用，最后统一回填。"""
+    # 布局（索引 = 指令序号）
+    program = [
+        ('label', 'start'),
+        ('adr', 0, 'devpath'),          # x0 = "/dev/console"
+        ('raw', movz_w(1, O_WRONLY | O_NONBLOCK)),
+        ('raw', movz_x(2, 0)),          # mode = 0
+        ('raw', movz_x(16, SYS_open)),
+        ('raw', svc()),
+        ('bcond', 2, 'kill'),           # b.cs → open 失败
+        ('raw', mov_xd_xs(3, 0)),       # x3 = console fd
+        ('adr', 1, 'mk_a'),
+        ('raw', movz_x(2, len(MK_A))),
+        ('raw', mov_xd_xs(0, 3)),
+        ('raw', movz_x(16, SYS_write)),
+        ('raw', svc()),
+        ('bcond', 2, 'kill'),           # b.cs → 写 A 失败
+        ('adr', 1, 'marker'),
+        ('raw', movz_x(2, len(MARKER))),
+        ('raw', mov_xd_xs(0, 3)),
+        ('raw', movz_x(16, SYS_write)),
+        ('raw', svc()),
+        ('bcond', 2, 'kill'),           # b.cs → 写标记失败
+        ('adr', 1, 'mk_b'),
+        ('raw', movz_x(2, len(MK_B))),
+        ('raw', mov_xd_xs(0, 3)),
+        ('raw', movz_x(16, SYS_write)),
+        ('raw', svc()),
+        ('bcond', 2, 'kill'),           # b.cs → 写 B 失败
+        ('raw', B_AL),                  # b .  ← 成功：把 PID 1 挂住
+        ('label', 'kill'),
+        ('raw', movz_w(0, 1)),          # kill(1, SIGKILL)
+        ('raw', movz_w(1, SIGKILL)),
+        ('raw', movz_x(16, SYS_kill)),
+        ('raw', svc()),
+        ('raw', B_AL),                  # b .（万一 kill 返回）
+    ]
 
-    code_len = len(instrs) * 4
-    msg_off = code_len
-    dev_off = msg_off + len(MARKER)
+    # 数据段顺序：mk_a / marker / mk_b / devpath
+    data = MK_A + MARKER + MK_B + DEVPATH
+    base = len([p for p in program if p[0] != 'label']) * 4
+    off = {}
+    cursor = base
+    for name, blob in (('mk_a', MK_A), ('marker', MARKER), ('mk_b', MK_B), ('devpath', DEVPATH)):
+        off[name] = cursor
+        cursor += len(blob)
+
+    # 标签 → 指令序号（只数真实指令）
+    labels = {}
+    index = 0
+    for item in program:
+        if item[0] == 'label':
+            labels[item[1]] = index
+        else:
+            index += 1
+    assert index * 4 == base, (index, base, '指令数/长度不一致')
 
     words = []
-    for index, item in enumerate(instrs):
+    for item in program:
+        if item[0] == 'label':
+            continue
+        pc = len(words) * 4
         if item[0] == 'raw':
             words.append(item[1])
         elif item[0] == 'adr':
-            rd, label = item[1], item[2]
-            target = msg_off if label == 'marker' else dev_off
-            words.append(adr(rd, target - index * 4))
+            rd, name = item[1], item[2]
+            words.append(adr(rd, off[name] - pc))
         elif item[0] == 'bcond':
-            cond, target_index = item[1], item[2]
-            words.append(b_cond(cond, (target_index - index) * 4))
+            cond, name = item[1], item[2]
+            target = labels[name] * 4
+            words.append(b_cond(cond, target - pc))
+        else:
+            raise ValueError(item)
 
-    instr = b''.join(struct.pack('<I', w) for w in words)
-    data = MARKER + DEVPATH
-    return instr, data, msg_off, dev_off
+    code = b''.join(struct.pack('<I', w) for w in words)
+    return code, data, off['marker'], off['devpath']
 
 
 def build_macho():
@@ -172,7 +218,8 @@ def main():
     print(f'已生成 {out}  ({len(blob)} B)')
     print(f'  入口 VA     : 0x{entry:016X}（文件偏移 0x{code_off:X}）')
     print(f'  指令长度    : {instr_len} B（{instr_len // 4} 条）')
-    print(f'  标记串      : {MARKER!r}')
+    print(f'  标记串      : {MARKER!r}（另加 {MK_A!r} / {MK_B!r} 两段进度标记）')
+    print(f'  失败动作    : kill(1, SIGKILL) → 内核打印 unexpected SIGKILL')
     if pad:
         print(f'  已填充到    : {len(blob)} B（--pad={pad}）')
     return 0
