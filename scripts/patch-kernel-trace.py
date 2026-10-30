@@ -67,10 +67,12 @@ PROBES = {
     'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
     'lerr': ('_load_return_to_errno', 'arg0', b'R11: load_return_to_errno lret=%x\n\0'),
     'lret0': ('0xfffffff0076d4b5c', 'arg0', b'R11: [caller] w0=%x\n\0'),
-    # parse_machfile 里唯一那条 os_reason_create 调用：0x7763b2c 刚把 x1 设成 w19（真 ret），
-    # 直接把 x1 打出来就是 load_return_t。不要挂 os_reason_create 入口 —— 它全内核 43 个
-    # 调用点（vm_fault_enter_prepare / vng_guard_violation / jetsam …）会先命中，看到的不是 exec 的错误码。
-    'reason': ('0xfffffff007763b30', 'arg1', b'R11: parse_machfile ret=%x\n\0'),
+    # parse_machfile 的统一收尾：0x7762c78 `mov x0, x19` → ret。
+    # 成功和失败都从这里出去，打 x19 就是它的返回值。
+    'pmret': ('0xfffffff007762c78', 'reg19', b'R11: parse_machfile -> x19=%x\n\0'),
+    # 全内核 43 个 os_reason_create 调用点，只有把返回地址也打出来才能认出是谁在报错。
+    'reason': ('_os_reason_create', 'ns_code_lr',
+               b'R11: reason ns=%x code=%x lr=%x\n\0'),
     'pmach': ('_parse_machfile', 'plain', b'R11: parse_machfile enter\n\0'),
     'pmexit': ('_parse_machfile', 'lipexit', b'R11: parse_machfile exit ret=%x\n\0'),
     'mexit19': ('0xfffffff007762a6c', 'reg19', b'R11: load_machfile returns w19=%x\n\0'),
