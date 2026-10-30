@@ -67,6 +67,7 @@ PROBES = {
     'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
     'lerr': ('_load_return_to_errno', 'arg0', b'R11: load_return_to_errno lret=%x\n\0'),
     'lret0': ('0xfffffff0076d4b5c', 'arg0', b'R11: [caller] w0=%x\n\0'),
+    'reason': ('_os_reason_create', 'arg1', b'R11: exec fail code=%x\n\0'),
     'pmach': ('_parse_machfile', 'plain', b'R11: parse_machfile enter\n\0'),
     'pmexit': ('_parse_machfile', 'lipexit', b'R11: parse_machfile exit ret=%x\n\0'),
     'mexit19': ('0xfffffff007762a6c', 'reg19', b'R11: load_machfile returns w19=%x\n\0'),
@@ -284,6 +285,9 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
         words.append(enc_mov_wd_ws(1, 19)); pc += 4     # x1 = (uint32_t) w19
     elif kind == 'arg0':
         words.append(enc_mov_wd_ws(1, 0)); pc += 4      # x1 = (uint32_t) 第一个参数
+    elif kind == 'arg1':
+        # 第二个参数本来就在 x1，前面只 stp 保存、没破坏它，直接打就行。
+        pass
     elif kind == 'svc':
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
