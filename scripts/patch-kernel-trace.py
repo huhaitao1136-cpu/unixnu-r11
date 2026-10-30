@@ -323,10 +323,21 @@ def main():
     segs, _ = parse_segments(data)
 
     if MAGIC in data:
-        print('  已经装过 R11TRACE 探针，跳过')
-        if dst != src:
-            dst.write_bytes(data)
-        return 0
+        # 以前这里是"静默跳过"。结果：payload 里没重铺干净内核时，
+        # 上一轮的旧探针会继续生效，屏幕上打出来的是旧地址/旧参数的
+        # 结果 —— 白白烧掉两轮刷机（lret 一直是野值就是这么来的）。
+        # 现在默认直接失败，逼出真正的原因。
+        if '--allow-existing' in argv:
+            print('  已经装过 R11TRACE 探针（--allow-existing，跳过）')
+            if dst != src:
+                dst.write_bytes(data)
+            return 0
+        print('  !! 这个内核里已经有 R11TRACE 探针（旧的一轮）。')
+        print('  !! 旧钩子不会因为这次调用而消失，屏幕上打出来的会是旧探针的结果。')
+        print('  !! 请先把干净内核铺回 payload，再打补丁，例如：')
+        print("  !!   mcopy -o -i <payload.img> <art>/kernel/kernel.macho '::/EFI/UniXNU/Payloads/kernel.macho'")
+        print('  !! 确实想保留旧探针、只重打 payload 的其它补丁，加 --allow-existing。')
+        return 3
 
     table = parse_symbols(symbols_path)
     kprintf = sym(table, SYM_KPRINTF)
