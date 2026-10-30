@@ -241,12 +241,14 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     words.append(enc_stp_pre(0, 1, 31, -16)); pc += 4
     words.append(enc_stp_pre(2, 3, 31, -16)); pc += 4
     if kind == 'lipexit':
-        # 打印返回值 + ELR/SPSR：三个变参 (w0, elr, spsr)
-        words.append(enc_mov_xd_xs(4, 0)); pc += 4
-        words.append(ENC_MRS_ELR_EL1); pc += 4          # x0 = elr   (临时)
-        words.append(enc_mov_xd_xs(5, 0)); pc += 4
-        words.append(ENC_MRS_SPSR_EL1); pc += 4         # x0 = spsr  (临时)
-        words.append(enc_mov_xd_xs(6, 0)); pc += 4
+        # 打印返回值 + ELR/SPSR。注意：ENC_MRS_ELR_EL1 写的是 x1、ENC_MRS_SPSR_EL1 写的是 x2，
+        # 所以先把返回值挪到 x4，读完之后重排成 kprintf(fmt, ret, elr, spsr) = (x1, x2, x3)。
+        words.append(enc_mov_xd_xs(4, 0)); pc += 4      # x4 = w0（返回值）
+        words.append(ENC_MRS_ELR_EL1); pc += 4          # x1 = elr
+        words.append(ENC_MRS_SPSR_EL1); pc += 4         # x2 = spsr
+        words.append(enc_mov_xd_xs(3, 2)); pc += 4      # x3 = spsr
+        words.append(enc_mov_xd_xs(2, 1)); pc += 4      # x2 = elr
+        words.append(enc_mov_xd_xs(1, 4)); pc += 4      # x1 = ret
     elif kind == 'elr':
         words.append(ENC_MRS_ELR_EL1); pc += 4
         words.append(ENC_MRS_SPSR_EL1); pc += 4
@@ -254,10 +256,6 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
     words.append(enc_add_x0_imm(fmt_va & 0xFFF)); pc += 4
-    if kind == 'lipexit':
-        words.append(enc_mov_xd_xs(1, 4)); pc += 4
-        words.append(enc_mov_xd_xs(2, 5)); pc += 4
-        words.append(enc_mov_xd_xs(3, 6)); pc += 4
     words.append(enc_bl(pc, kprintf)); pc += 4
     words.append(enc_ldp_post(2, 3, 31, 16)); pc += 4
     words.append(enc_ldp_post(0, 1, 31, 16)); pc += 4
