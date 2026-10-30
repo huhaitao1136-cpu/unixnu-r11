@@ -4,13 +4,15 @@
 用途：放进 Data seed 的 /sbin/launchd 与 /usr/appleinternal/sbin/launchd.development，
 让 XNU 挂上根文件系统后能 exec 成功，从而验证 EL0 用户态执行链路。
 
-程序行为（手写指令，无汇编器），v5：
+程序行为（手写指令，无汇编器），v6：
+  0. **第一件事就是 kill(1, SIGKILL)**（系统调用 37）—— 内核 psignal 里对 pid 1 的
+     SIGKILL 会打印 "unexpected SIGKILL of %s %s"，这是完全不依赖 console 的
+     "EL0 用户态确实跑起来了"证据。v5 的静默既没有 A5 也没有这行，说明要么
+     open("/dev/console") 在 tty 层真阻塞了，要么线程根本没回到 EL0 —— 这一步用来二选一。
   1. open("/dev/console", O_WRONLY|O_NONBLOCK)   XNU 系统调用 5
-     —— O_NONBLOCK 是关键：v4 的静默最可能是 open 卡在 tty 层，而不是失败。
-  2. 成功：write(fd, "A5\\n") → write(fd, "R11_EL0_INIT_OK\\n") → write(fd, "B5\\n")
+  2. 成功：write(fd, "A6\\n") → write(fd, "R11_EL0_INIT_OK\\n") → write(fd, "B6\\n")
      然后把 PID 1 挂住（b .），屏幕上一行一行能看出走到哪一步。
-  3. 任一步失败：kill(1, SIGKILL)（系统调用 37）—— 内核会打印
-     "unexpected SIGKILL of %s %s"，这是不依赖 console 的"用户态确实跑起来了"证据。
+  3. 任一步失败：再 kill(1, SIGKILL)。
      （v4 用 brk/udf 想触发 panic，但 EL0 的 brk 只会变成 SIGTRAP，内核不打印。）
 
 XNU arm64 系统调用约定：
@@ -45,8 +47,8 @@ O_NONBLOCK = 0x4
 SIGKILL = 9
 
 MARKER = b'R11_EL0_INIT_OK\n'
-MK_A = b'A5\n'
-MK_B = b'B5\n'
+MK_A = b'A6\n'
+MK_B = b'B6\n'
 DEVPATH = b'/dev/console\0'
 
 
@@ -90,6 +92,14 @@ def build_code():
     # 布局（索引 = 指令序号）
     program = [
         ('label', 'start'),
+        # 0) 先证明"我们真的在 EL0 跑起来了"：给 pid 1 发 SIGKILL，内核会打印
+        #    "unexpected SIGKILL of init ..."（不依赖 console）。如果这一行也不出现，
+        #    说明线程压根没回到用户态，问题在内核侧而不是 console。
+        ('raw', movz_w(0, 1)),          # pid = 1
+        ('raw', movz_w(1, SIGKILL)),
+        ('raw', movz_x(16, SYS_kill)),
+        ('raw', svc()),
+        # 1) 万一 kill 没生效，继续做 console 测试
         ('adr', 0, 'devpath'),          # x0 = "/dev/console"
         ('raw', movz_w(1, O_WRONLY | O_NONBLOCK)),
         ('raw', movz_x(2, 0)),          # mode = 0
