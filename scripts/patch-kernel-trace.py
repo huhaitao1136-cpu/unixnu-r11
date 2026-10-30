@@ -67,7 +67,10 @@ PROBES = {
     'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
     'lerr': ('_load_return_to_errno', 'arg0', b'R11: load_return_to_errno lret=%x\n\0'),
     'lret0': ('0xfffffff0076d4b5c', 'arg0', b'R11: [caller] w0=%x\n\0'),
-    'reason': ('_os_reason_create', 'arg1', b'R11: exec fail code=%x\n\0'),
+    # parse_machfile 里唯一那条 os_reason_create 调用：0x7763b2c 刚把 x1 设成 w19（真 ret），
+    # 直接把 x1 打出来就是 load_return_t。不要挂 os_reason_create 入口 —— 它全内核 43 个
+    # 调用点（vm_fault_enter_prepare / vng_guard_violation / jetsam …）会先命中，看到的不是 exec 的错误码。
+    'reason': ('0xfffffff007763b30', 'arg1', b'R11: parse_machfile ret=%x\n\0'),
     'pmach': ('_parse_machfile', 'plain', b'R11: parse_machfile enter\n\0'),
     'pmexit': ('_parse_machfile', 'lipexit', b'R11: parse_machfile exit ret=%x\n\0'),
     'mexit19': ('0xfffffff007762a6c', 'reg19', b'R11: load_machfile returns w19=%x\n\0'),
@@ -244,12 +247,14 @@ def replay_tail(orig, pc, hook):
         imm = orig & 0x03FFFFFF
         if imm & (1 << 25):
             imm -= 1 << 26
-        return [enc_b(pc, pc + imm * 4)]
+        # imm 是相对**原地址**的偏移，目标绝对地址必须先按 hook 算出来，
+        # 不能直接拿空穴地址加偏移（那样会跳到别处）。
+        return [enc_b(pc, hook + imm * 4)]
     if (orig & 0xFC000000) == 0x94000000:                    # bl
         imm = orig & 0x03FFFFFF
         if imm & (1 << 25):
             imm -= 1 << 26
-        return [enc_bl(pc, pc + imm * 4), enc_b(pc + 4, hook + 4)]
+        return [enc_bl(pc, hook + imm * 4), enc_b(pc + 4, hook + 4)]
     if (orig & 0x9F000000) == 0x90000000:                    # adrp
         rd = orig & 31
         immlo = (orig >> 29) & 0x3
@@ -288,6 +293,12 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     elif kind == 'arg1':
         # 第二个参数本来就在 x1，前面只 stp 保存、没破坏它，直接打就行。
         pass
+    elif kind == 'ns_code_lr':
+        # 打 (namespace, code, 返回地址)。返回地址能反查出到底是谁在报错，
+        # 因为 os_reason_create 的调用点很多，光看参数分不清是谁。
+        words.append(enc_mov_xd_xs(2, 1)); pc += 4     # x2 = 原 x1（code）
+        words.append(enc_mov_xd_xs(3, 30)); pc += 4    # x3 = x30（返回地址）
+        words.append(enc_mov_xd_xs(1, 0)); pc += 4     # x1 = 原 x0（namespace）
     elif kind == 'svc':
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
