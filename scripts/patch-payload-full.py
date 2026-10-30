@@ -155,6 +155,16 @@ def main() -> int:
     if run(['python3', SCRIPTS / 'patch-apfs-roothash.py', kernel]).returncode != 0:
         return 1
 
+    print('== 装"用户态到底有没有跑起来"的两个探针（thread_bootstrap_return / unix_syscall）')
+    # 默认装（诊断用）：A 打印"即将回 EL0"，B 打印每个 syscall 号。
+    # 不想要就加 --no-trace。
+    if '--no-trace' in sys.argv[1:]:
+        print('   跳过（--no-trace）')
+    else:
+        if run(['python3', SCRIPTS / 'patch-kernel-trace.py', kernel, kernel,
+                '--symbols', sym]).returncode != 0:
+            return 1
+
     print('== 写回 payload')
     if run(['mcopy', '-o', '-i', str(payload), str(kernel), got]).returncode != 0:
         return 1
