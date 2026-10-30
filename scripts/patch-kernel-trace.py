@@ -32,14 +32,16 @@ import sys
 from pathlib import Path
 
 MAGIC = b'R11TRACE'
-CAVE_SIZE = 1024
+CAVE_SIZE = 2048
 PREFER = ('__TEXT_EXEC', '__TEXT', '__PLK_TEXT_EXEC')
 
 SYM_KPRINTF = '_kprintf'
 
 # (符号, 类型, 文本)
 HOOKS = (
+    ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
     ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
+    ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
     ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
     ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 )
