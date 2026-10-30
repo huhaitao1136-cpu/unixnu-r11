@@ -53,7 +53,7 @@ PROBES = {
     'machfile': ('_load_machfile', 'plain', b'R11: load_machfile enter\n\0'),
     'act': ('_activate_exec_state', 'plain', b'R11: activate_exec_state enter\n\0'),
     'pagein': ('_vnode_pagein', 'plain', b'R11: vnode_pagein\n\0'),
-    'mfileexit': ('_load_machfile', 'lipexit', b'R11: load_machfile exit ret=%lx elr=%08lx spsr=%08lx\n\0'),
+    'mfileexit': ('_load_machfile', 'lipexit', b'R11: load_machfile exit ret=%x\n\0'),
     'getattr': ('_vnode_getattr', 'plain', b'R11: vnode_getattr\n\0'),
     'ubc': ('_ubc_getsize', 'plain', b'R11: ubc_getsize\n\0'),
     'upl': ('_ubc_create_upl', 'plain', b'R11: ubc_create_upl\n\0'),
@@ -65,9 +65,10 @@ PROBES = {
     'zre': ('_zone_userspace_reboot_checks', 'plain', b'R11: zone_userspace_reboot_checks\n\0'),
     'plat': ('_proc_setplatformdata', 'plain', b'R11: proc_setplatformdata\n\0'),
     'ovm': ('_vm_map_set_size_limit', 'plain', b'R11: vm_map_set_size_limit\n\0'),
+    'lerr': ('_load_return_to_errno', 'arg0', b'R11: load_return_to_errno lret=%x\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = ('lip,exec,machfile,mfileexit,extract,zre,plat,ovm,'
+DEFAULT_PROBES = ('lip,exec,machfile,mfileexit,lerr,extract,sugid,'
                   'act,lipexit,svc')
 
 
@@ -234,6 +235,11 @@ def replay_tail(orig, pc, hook):
     return [orig, enc_b(pc + 4, hook + 4)]
 
 
+def enc_mov_wd_ws(dst, src):
+    """`mov wD, wS`（ORR wD, wzr, wS），顺带把高位清零。"""
+    return 0x2A0003E0 | ((src & 31) << 16) | (dst & 31)
+
+
 def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     words = []
     pc = base
@@ -241,17 +247,13 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     words.append(enc_stp_pre(0, 1, 31, -16)); pc += 4
     words.append(enc_stp_pre(2, 3, 31, -16)); pc += 4
     if kind == 'lipexit':
-        # 打印返回值 + ELR/SPSR。注意：ENC_MRS_ELR_EL1 写的是 x1、ENC_MRS_SPSR_EL1 写的是 x2，
-        # 所以先把返回值挪到 x4，读完之后重排成 kprintf(fmt, ret, elr, spsr) = (x1, x2, x3)。
-        words.append(enc_mov_xd_xs(4, 0)); pc += 4      # x4 = w0（返回值）
-        words.append(ENC_MRS_ELR_EL1); pc += 4          # x1 = elr
-        words.append(ENC_MRS_SPSR_EL1); pc += 4         # x2 = spsr
-        words.append(enc_mov_xd_xs(3, 2)); pc += 4      # x3 = spsr
-        words.append(enc_mov_xd_xs(2, 1)); pc += 4      # x2 = elr
-        words.append(enc_mov_xd_xs(1, 4)); pc += 4      # x1 = ret
+        # 只打 32 位返回值：XNU kprintf 对 %lx 的 64 位宽度处理不对，会把高位截成乱码。
+        words.append(enc_mov_wd_ws(1, 0)); pc += 4      # x1 = (uint32_t) w0
     elif kind == 'elr':
         words.append(ENC_MRS_ELR_EL1); pc += 4
         words.append(ENC_MRS_SPSR_EL1); pc += 4
+    elif kind == 'arg0':
+        words.append(enc_mov_wd_ws(1, 0)); pc += 4      # x1 = (uint32_t) 第一个参数
     elif kind == 'svc':
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
