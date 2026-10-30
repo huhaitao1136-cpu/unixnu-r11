@@ -53,7 +53,7 @@ PROBES = {
     'machfile': ('_load_machfile', 'plain', b'R11: load_machfile enter\n\0'),
     'act': ('_activate_exec_state', 'plain', b'R11: activate_exec_state enter\n\0'),
     'pagein': ('_vnode_pagein', 'plain', b'R11: vnode_pagein\n\0'),
-    'mfileexit': ('_load_machfile', 'lipexit', b'R11: load_machfile exit elr=%08lx spsr=%08lx\n\0'),
+    'mfileexit': ('_load_machfile', 'lipexit', b'R11: load_machfile exit ret=%lx elr=%08lx spsr=%08lx\n\0'),
     'getattr': ('_vnode_getattr', 'plain', b'R11: vnode_getattr\n\0'),
     'ubc': ('_ubc_getsize', 'plain', b'R11: ubc_getsize\n\0'),
     'upl': ('_ubc_create_upl', 'plain', b'R11: ubc_create_upl\n\0'),
@@ -240,13 +240,24 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
     words.append(enc_stp_pre(29, 30, 31, -16)); pc += 4
     words.append(enc_stp_pre(0, 1, 31, -16)); pc += 4
     words.append(enc_stp_pre(2, 3, 31, -16)); pc += 4
-    if kind in ('elr', 'lipexit'):
+    if kind == 'lipexit':
+        # 打印返回值 + ELR/SPSR：三个变参 (w0, elr, spsr)
+        words.append(enc_mov_xd_xs(4, 0)); pc += 4
+        words.append(ENC_MRS_ELR_EL1); pc += 4          # x0 = elr   (临时)
+        words.append(enc_mov_xd_xs(5, 0)); pc += 4
+        words.append(ENC_MRS_SPSR_EL1); pc += 4         # x0 = spsr  (临时)
+        words.append(enc_mov_xd_xs(6, 0)); pc += 4
+    elif kind == 'elr':
         words.append(ENC_MRS_ELR_EL1); pc += 4
         words.append(ENC_MRS_SPSR_EL1); pc += 4
     elif kind == 'svc':
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
     words.append(enc_add_x0_imm(fmt_va & 0xFFF)); pc += 4
+    if kind == 'lipexit':
+        words.append(enc_mov_xd_xs(1, 4)); pc += 4
+        words.append(enc_mov_xd_xs(2, 5)); pc += 4
+        words.append(enc_mov_xd_xs(3, 6)); pc += 4
     words.append(enc_bl(pc, kprintf)); pc += 4
     words.append(enc_ldp_post(2, 3, 31, 16)); pc += 4
     words.append(enc_ldp_post(0, 1, 31, 16)); pc += 4
