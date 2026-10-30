@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 
 MAGIC = b'R11TRACE'
-CAVE_SIZE = 2048
+CAVE_SIZE = 4096
 PREFER = ('__TEXT_EXEC', '__TEXT', '__PLK_TEXT_EXEC')
 
 SYM_KPRINTF = '_kprintf'
@@ -53,9 +53,14 @@ PROBES = {
     'machfile': ('_load_machfile', 'plain', b'R11: load_machfile enter\n\0'),
     'act': ('_activate_exec_state', 'plain', b'R11: activate_exec_state enter\n\0'),
     'pagein': ('_vnode_pagein', 'plain', b'R11: vnode_pagein\n\0'),
+    'mfileexit': ('_load_machfile', 'lipexit', b'R11: load_machfile exit elr=%08lx spsr=%08lx\n\0'),
+    'getattr': ('_vnode_getattr', 'plain', b'R11: vnode_getattr\n\0'),
+    'ubc': ('_ubc_getsize', 'plain', b'R11: ubc_getsize\n\0'),
+    'upl': ('_ubc_create_upl', 'plain', b'R11: ubc_create_upl\n\0'),
+    'mmap': ('_VNOP_MMAP', 'plain', b'R11: VNOP_MMAP\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
-DEFAULT_PROBES = 'lip,exec,machfile,act,lipexit,svc'
+DEFAULT_PROBES = 'lip,exec,machfile,getattr,ubc,upl,mmap,mfileexit,svc'
 
 
 def select_probes(spec):

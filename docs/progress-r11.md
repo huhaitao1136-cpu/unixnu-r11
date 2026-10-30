@@ -6399,3 +6399,37 @@ load_init_program: attempting to load /usr/appleinternal/sbin/launchd.developmen
 - 停在 `exec_mach_imgact enter` → 卡在读 Mach-O 头/Vnode 读
 - 停在 `activate_exec_state enter` → 卡在提交 exec、改用户上下文
 - 出现 `LIP exit` 但没有 `svc` → 才回到"返回路径/调度"那类问题
+
+## 3.101 卡点收窄到 `load_machfile` 内部 —— 九探针（2026-10-30 18:2x）
+
+六探针（`lip,exec,machfile,act,lipexit,svc`）真机顺序：
+
+```
+R11: LIP enter
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+R11: exec_mach_imgact enter
+R11: load_machfile enter          <- 停在这里
+```
+
+`exec_mach_imgact` 已经通过了 magic/文件类型/掩码检查（所以 CMD 数据本身读得出来），
+`load_machfile` 是**建地址空间 + 建 pager + 映射可执行段**的地方，卡在这里。
+
+为了知道卡在它的哪一步，把探针扩到九个（默认 `lip,exec,machfile,getattr,ubc,upl,mmap,mfileexit,svc`）：
+
+| 探针 | 符号 / 地址 | 含义 |
+|---|---|---|
+| `lip` | `_load_init_program` `0xfffffff0076d997c` | 进函数 |
+| `exec` | `_exec_mach_imgact` `0xfffffff0076d48a4` | Mach-O 装载 |
+| `machfile` | `_load_machfile` `0xfffffff007762688` | 建地址空间 |
+| `getattr` | `_vnode_getattr` `0xfffffff0074990ac` | 取文件大小/属性 |
+| `ubc` | `_ubc_getsize` `0xfffffff007736318` | UBC 取文件尺寸 |
+| `upl` | `_ubc_create_upl` `0xfffffff007736c70` | 建 UPL（页入前置） |
+| `mmap` | `_VNOP_MMAP` `0xfffffff00749a618` | 走文件后端映射 |
+| `mfileexit` | `_load_machfile` 最后一个 `ret` `0xfffffff007762a8c` | 函数返回 |
+| `svc` | `_unix_syscall` `0xfffffff007829608` | EL0 发系统调用（硬证据） |
+
+`CAVE_SIZE` 提到 4096（空穴 `0xfffffff007a301b0` 有 15952 字节），九个跳板约 2.3 KB。
+
+判读：`mmap` 出现但 `mfileexit` 不出现 → 卡在文件后端映射/页入；
+`ubc`/`getattr` 之后就没有 → 卡在 Vnode 属性或 UBC 尺寸；
+`upl` 出现后没有 `mmap` → 卡在建 UPL。
