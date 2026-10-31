@@ -50,6 +50,8 @@ assert REASON_MSG[0x40:0x41] == b'R'[:1] and REASON_MSG[0x80:0x81] == b'R'[:1]
 # `load_init_program` 内部切成几段，定位 exec 到底卡在哪一步；
 # `svc` 是"EL0 真的跑起来了"的硬证据。
 PROBES = {    'lip': ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
+    'amfir': ('_amfi_interface_register', 'ptrs3',
+              b'R11: amfi ops=%x f0=%x f1=%x\n\0'),
     'boot': ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
     'ret': ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
     'to': ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
@@ -117,6 +119,8 @@ PROBES = {    'lip': ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
     # 顺序应为 load_segment → load_unixthread（正常 Mach-O 都会经过）。
     'seg': ('_load_segment', 'plain', b'R11: load_segment enter\n\0'),
     'unix': ('_load_unixthread', 'plain', b'R11: load_unixthread enter\n\0'),
+    # 直接读 _load_unixthread 自己的返回值（小整数枚举），不经过任何包装。
+    'unixr': ('_load_unixthread', 'lipexit', b'R11: load_unixthread ret=%x\n\0'),
     # 段映射阶段的打点：__PAGEZERO 是 4 GiB，vme 不出现就说明卡在映射之前。
     'vme': ('_vm_map_enter', 'plain', b'R11: vm_map_enter\n\0'),
     # load_machfile 的最后一个 ret：打它自己的返回值（lipexit 打 w0）。
@@ -290,6 +294,12 @@ def enc_mov_xd_xs(rd, rm):
     return 0xAA0003E0 | (rm << 16) | rd
 
 
+def enc_ldr_xd_xn(rt, rn, offset):
+    """ldr xt, [xn, #offset]（offset 必须是 8 的倍数）。"""
+    imm12 = (offset // 8) & 0xFFF
+    return 0xF9400000 | (imm12 << 10) | (rn << 5) | rt
+
+
 def enc_ldr_xd_sp(rt, offset):
     """ldr xt, [sp, #offset]（offset 必须是 8 的倍数）。"""
     imm12 = (offset // 8) & 0xFFF
@@ -423,6 +433,12 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
         words.append(enc_mov_wd_ws(2, 1)); pc += 4      # x2 = (uint32_t) w1
         words.append(enc_mov_wd_ws(3, 3)); pc += 4      # x3 = (uint32_t) w3
         words.append(enc_mov_wd_ws(1, 19)); pc += 4     # x1 = (uint32_t) w19
+    elif kind == 'ptrs3':
+        # 打 (x0, [x0], [x0+8])：用于把注册进来的函数表地址和头两个函数指针
+        # 直接变成屏幕上的数字，再拿数字去符号表里查，不靠猜。
+        words.append(enc_mov_xd_xs(1, 0)); pc += 4
+        words.append(enc_ldr_xd_xn(2, 0, 0)); pc += 4
+        words.append(enc_ldr_xd_xn(3, 0, 8)); pc += 4
     elif kind == 'svc':
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
