@@ -88,7 +88,9 @@ fi
 # ---- 附带动态库：launchd 是 MH_DYLDLINK|MH_PIE，内核需要 /usr/lib/dyld ----
 # seed/lib/ 下放什么就装到 /usr/lib 下（dyld、libSystem.B.dylib 等）。
 LIB_DIR="$(cd "$(dirname "$0")/.." && pwd)/seed/lib"
-if [ -d "$LIB_DIR" ]; then
+if [ "${R11_SEED_LIB:-1}" != "1" ]; then
+  echo "== R11_SEED_LIB=0：故意不装 /usr/lib（用于验证内核是否强制需要 dyld）"
+elif [ -d "$LIB_DIR" ]; then
   echo "== 安装 /usr/lib 动态库（R11_SEED_LIB）"
   mkdir -p "$MNT/usr/lib"
   chmod 755 "$MNT/usr" "$MNT/usr/lib" 2>/dev/null || true
