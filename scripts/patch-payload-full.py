@@ -14,6 +14,7 @@
 用法:
   python3 patch-payload-full.py <payload.img> [--symbols <kernel-symbols.txt>]
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -101,6 +102,7 @@ def main() -> int:
     payload = Path(argv[0])
     tmp = Path(tempfile.mkdtemp(prefix='r11k-'))
     kernel = tmp / 'kernel.macho'
+    raw_sha = None          # 从 payload 取出来的原始内核（未打任何补丁）
 
     # kernel 在 payload 卷的哪里？先列一下
     r = run(['mdir', '-i', str(payload), '-/'])
@@ -121,6 +123,10 @@ def main() -> int:
         print('!! 找不到 kernel.macho，请手工确认路径')
         return 1
     print(f'已取出 {got} ({kernel.stat().st_size} B)')
+    # 记下"铺进 payload 的那份内核"的哈希：flash-prep.sh 的基准闸门要拿它比对，
+    # 不能用 trace 阶段看到的 input_sha256（那是打完 PAN/上屏/roothash 之后的中内核）。
+    raw_sha = hashlib.sha256(kernel.read_bytes()).hexdigest()
+    print(f'   原始内核 sha256: {raw_sha}')
 
     print('== 找符号表')
     sym = find_symbols(symbols, payload)
@@ -164,6 +170,9 @@ def main() -> int:
     else:
         trace_args = ['python3', SCRIPTS / 'patch-kernel-trace.py', kernel, kernel,
                       '--symbols', sym]
+        # manifest 落到固定路径，供 flash-prep.sh 事后校验（不要让它自带第二份常量）
+        trace_manifest = os.environ.get('R11_MANIFEST', '/tmp/r11-trace-manifest.json')
+        trace_args += ['--manifest', trace_manifest]
         # 想换探针集合就设 R11_PROBES，例如：
         #   R11_PROBES=lip,exec,lret0,lerr,mexit19,pmach,svc python3 scripts/patch-payload-full.py …
         probes_env = os.environ.get('R11_PROBES')
@@ -171,6 +180,16 @@ def main() -> int:
             trace_args += ['--probes', probes_env]
         if run(trace_args).returncode != 0:
             return 1
+        # 把"基准内核哈希"补进 manifest，让 flash-prep.sh 第 1 步能验证干净内核
+        try:
+            import json
+            mp = Path(trace_manifest)
+            man = json.loads(mp.read_text())
+            man['raw_input_sha256'] = raw_sha
+            mp.write_text(json.dumps(man, indent=2) + '\n')
+            print(f'   manifest 基准内核哈希: {raw_sha}')
+        except Exception as e:                                  # noqa: BLE001
+            print(f'   !! 往上写 raw_input_sha256 失败: {e}')
 
     print('== 写回 payload')
     if run(['mcopy', '-o', '-i', str(payload), str(kernel), got]).returncode != 0:

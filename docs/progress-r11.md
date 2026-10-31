@@ -6466,3 +6466,90 @@ R11: load_machfile exit elr=fffffff0076d2f18 spsr=00000000
 | `copyout` | `_exec_copyout_strings` | `0xfffffff0076dbab8` |
 
 12 个跳板约 2.9 KB，仍在 4096 的空穴内。判读：屏幕最后一行就是卡点。
+
+## §3.101 静态 init 已过 `parse_machfile`：失败点压到 `load_machfile` 后段
+
+本轮把 PID 1 exec 的失败区间从「整个 exec」收敛到「`load_machfile` 解析成功之后的自己的后段」。
+关键是把探针挂到 `parse_machfile` 的**共享错误出口**，而不是它的返回值搬运点。
+
+### 3.101.1 为什么要换挂点
+
+历史上所有探针读到的 `lret` 都是指针状野值（`a0bb9660` / `9dad82e0` / `fa0d30c0` / `c4115700` / `7c2d86a0`），
+一度被误判成「内核返回了指针」。反汇编 `_parse_machfile` 后真因如下：
+
+```asm
+fffffff007763ae8: 1a810113  csel w19, w8, w1, eq      ; w19 = (w3==0 && w1==2) ? 11 : w1  ← 真·load_return_t
+fffffff007763aec: 90000000  adrp x0, ...
+fffffff007763b28: 52800120  mov  w0, #9               ; os_reason namespace
+fffffff007763b2c: aa1303e1  mov  x1, x19              ; 真值作为 reason code 传出去
+fffffff007763b30: 940049b2  bl   _os_reason_create
+fffffff007763b34: aa0003f3  mov  x19, x0              ; ← x19 被 os_reason_t 指针覆盖
+```
+
+`_parse_machfile` 的出口是 `0xfffffff007762c78: mov x0, x19` + `ret`，
+所以在出口读 `x19` 永远是指针。**返回值必须在 `csel` 之后读**，即 `0xfffffff007763aec`。
+
+新增探针 `err19`（kind `err19`，打 `w19/w1/w3`），跳板：
+
+```asm
+stp x29,x30,[sp,#-16]!   stp x0,x1,[sp,#-16]!   stp x2,x3,[sp,#-16]!
+mov w2,w1   mov w3,w3   mov w1,w19
+adrp x0,0xfffffff007a30000 ; add x0,x0,#0x5a5 ; bl _kprintf
+ldp x2,x3   ldp x0,x1   ldp x29,x30
+adrp x0,0xfffffff007167000        ; 原指令按新 PC 重新编码
+b 0xfffffff007763af0              ; hook+4
+```
+
+`0xfffffff007763aec` 的原始指令是 `0x90ffd020`（`adrp x0, 0xfffffff007167000`），
+已写入 `EXPECT` 做「地址 + 原始字节」双校验，不符即终止。
+
+### 3.101.2 真机结果（探针集 `lip,exec,err19,mexit,sig,svc`）
+
+```text
+R11: LIP enter
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+R11: exec_mach_imgact enter
+R11: err19 w19=0 w1=0 w3=2              ← LOAD_SUCCESS
+R11: load_machfile exit ret=7c2d86a0    ← 指针，不是枚举
+```
+
+按 `csel w19, w8, w1, eq` 的语义：`w3=2` → 条件不成立 → `w19 = w1 = 0` = `LOAD_SUCCESS`。
+
+### 3.101.3 已证实
+
+1. **`parse_machfile` 返回 `LOAD_SUCCESS`（`w19=0`）**，静态 init（`flags=0x0`、无 `MH_DYLDLINK`）
+   通过了 header / load commands / 段解析全过程 —— 「运维内核带 `CONFIG_REQUIRE_DYLD`，见 `MH_EXECUTE` 且无 `MH_DYLDLINK` 直接 `LOAD_FAILURE`」这条推断**排除**。
+2. **`load_machfile` 收尾探针读到指针值**。挂点 `0xfffffff007762a8c` 经反汇编确认是函数真正的收尾
+   （`ldp x19..x28` → `add sp,sp,#0x100` → `ret`），所以 `w0` 是返回值本身；它是指针说明
+   `_load_machfile` 也中了同一个坑（先 `mov w19, ret`，再被 `os_reason_create` 覆盖，最后 `mov x0,x19`）。
+   **不能把该指针解释成 `load_return_t`**。
+3. **`_load_code_signature` 与 `_unix_syscall` 探针均未触发** —— 既没走到签名加载入口，也没进入 EL0。
+4. **`vm_map_enter` 暂不适合作为探针挂点**。挂上去后整机停在启动早期
+   （`VM bootstrap: 51 maps, 153 entries and 128 holes available` 之后），
+   该函数在 `kprintf` 自己的分配路径上，探针极易递归/挂死，不能把这种副作用误判成原始故障。
+
+### 3.101.4 待验证
+
+- `load_machfile` 中究竟是哪一条错误分支调用了 `_os_reason_create`。
+- `ns_code_lr` 探针的参数搬运与返回地址采集是否正确（当前实测 `ns=8926d920 code=a0 lr=9`，
+  `lr` 打成了小整数，与「返回地址」不符，存在编码偏移）。
+- 修好 `ns_code_lr` 后，`reason` 的返回地址能否定位到具体校验路径。
+- `parse_machfile` 成功但 `_load_code_signature` 未被调用，需要单独确认这份内核里
+  `MH_EXECUTE` 的代码签名到底在哪个入口被加载（`parse` 尾部？`exec` 后段？）。
+
+### 3.101.5 顺带完成的工程化
+
+- `patch-kernel-trace.py` 增设 `EXPECT`：按字面地址挂的探针必须「地址 + 原始指令」双匹配。
+- 导出 manifest（基准哈希、钩子地址、原始指令、trampoline 地址、输出哈希），
+  新增 `--verify-base` / `--verify` 两个校验模式；`flash-prep.sh` 不再自带地址常量副本，
+  改由 manifest 驱动，打补丁前后各校验一次，任一不符 `exit 4` 即中止。
+- 修正 `patch-payload-full.py`：`raw_input_sha256`（铺进 payload 的未打补丁内核）
+  与 trace 阶段的 `input_sha256`（打完 PAN/上屏/roothash 的中间内核）分开记录。
+- `replay_tail()` 对 `b`/`bl` 重放改为按「空穴地址 + 绝对目标」重新编码，`adrp` 按新 PC 重编码
+  （此前照搬相对偏移，导致跳板里的 `bl` 跳到别处，差值 `0x126c8`）。
+
+### 3.101.6 下一步
+
+1. 修 `ns_code_lr` 跳板的编码偏移，让 `reason` 打印出真实的 `lr`（返回地址）。
+2. 用 `reason` 的 `lr` 反查 `load_machfile` / `exec_mach_imgact` 内的具体调用点。
+3. 拿到可靠 `lr` 之后，再决定是否新增观测探针；**在此之前不改动加载逻辑**。

@@ -198,7 +198,10 @@ def build_macho():
     seg = struct.pack('<II16sQQQQIIII', LC_SEGMENT_64, seg_cmd_size, b'__TEXT',
                       VMADDR, vmsize, 0, filesize, 5, 5, 1, 0)
 
-    th = struct.pack('<IIII', LC_UNIXTHREAD, th_cmd_size - 8,
+    # cmdsize 必须是整条命令的大小（cmd+cmdsize+flavor+count+34*8 = 288），
+    # 早先这里少写了 8 字节 → 内核按 count=68 读 34 个寄存器时越过命令末尾，
+    # load_unixthread 直接判失败，而外层只看到一个 reason 指针。
+    th = struct.pack('<IIII', LC_UNIXTHREAD, th_cmd_size,
                      ARM_THREAD_STATE64, ARM_THREAD_STATE64_COUNT)
     state = [0] * 34
     state[32] = entry

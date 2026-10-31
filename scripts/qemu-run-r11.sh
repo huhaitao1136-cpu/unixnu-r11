@@ -23,6 +23,22 @@ MACH_IMGACT_ADDR=0xfffffff0076cc9d0    # _exec_mach_imgact
 LOADMACH_ADDR=0xfffffff00775a8a8
 PSIGNAL_ADDR=0xfffffff0076ef7d0      # _psignal_internal
 
+# 上面这些是手抄的旧地址，内核一换就漂。能拿到符号表时以符号为准：
+#   R11_SYMS=<kernel-symbols.txt> 或默认 ../out/r11/kernel/kernel-symbols.txt
+R11_SYMS=${R11_SYMS:-/root/src/UniXNU/out/r11/kernel/kernel-symbols.txt}
+sym_addr() {
+  [ -f "$R11_SYMS" ] || return 1
+  awk -v s="$1" '$NF==s {print "0x"$1; exit}' "$R11_SYMS" | grep -q . || return 1
+  awk -v s="$1" '$NF==s {print "0x"$1; exit}' "$R11_SYMS"
+}
+A=$(sym_addr _load_machfile)      && [ -n "$A" ] && LOADMACH_ADDR=$A
+A=$(sym_addr _exec_mach_imgact)   && [ -n "$A" ] && MACH_IMGACT_ADDR=$A
+A=$(sym_addr _panic)              && [ -n "$A" ] && PANIC_ADDR=$A
+# 想在任意位置停下来看寄存器：R11_BP=0xfffffff0076d4b58（load_machfile 返回后第一条）
+R11_BP=${R11_BP:-}
+if [ -n "${R11_HBREAK:-}" ]; then R11_BPT=hbreak; else R11_BPT=break; fi
+R11_GDB_DELAY=${R11_GDB_DELAY:-20}
+
 fail() { echo "!! $*"; exit 1; }
 
 for f in "$APP" "$DB" "$KERNEL" "$ADT"; do
@@ -71,28 +87,40 @@ GB=$(command -v gdb-multiarch || command -v gdb)
 
 if [ -n "${CATCH_EXEC:-}" ]; then
   (
-    sleep 3
-    "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
-      -ex "target remote :1234" \
-      -ex "hbreak *$LOADMACH_ADDR" \
-      -ex "continue" \
-      -ex 'printf "=== 进入 load_machfile ===\n"' \
-      -ex 'info registers x0 x1 x30' \
-      -ex 'hbreak *$x30' \
-      -ex "continue" \
-      -ex 'printf "=== load_machfile 返回 ===\n"' \
-      -ex 'info registers x0' \
-      2>&1
+    sleep "${R11_GDB_DELAY}"
+    if [ -n "$R11_BP" ]; then
+      # 只停在指定地址，把 lo32 和全 64 位一起打出来，便于判断是不是指针状野值。
+      "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
+        -ex "target remote :1234" \
+        -ex "$R11_BPT *$R11_BP" \
+        -ex "continue" \
+        -ex 'printf "=== 停在 %s ===\n", '$R11_BP'' \
+        -ex 'info registers x0 x1 x2 x3 x19 x24 x29 x30' \
+        -ex 'x/2i $pc-8' \
+        2>&1
+    else
+      "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
+        -ex "target remote :1234" \
+        -ex "$R11_BPT *$LOADMACH_ADDR" \
+        -ex "continue" \
+        -ex 'printf "=== 进入 load_machfile ===\n"' \
+        -ex 'info registers x0 x1 x30' \
+        -ex "$R11_BPT *$x30" \
+        -ex "continue" \
+        -ex 'printf "=== load_machfile 返回 ===\n"' \
+        -ex 'info registers x0' \
+        2>&1
+    fi
   ) > "/tmp/${PREFIX}.exec.log" 2>&1 &
 fi
 
 # ---- CATCH_SIG：只抓发给 init 的 SIGKILL(9)，看是谁发的 ----
 if [ -n "${CATCH_SIG:-}" ]; then
   (
-    sleep 3
+    sleep "${R11_GDB_DELAY}"
     "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
       -ex "target remote :1234" \
-      -ex "hbreak *$PSIGNAL_ADDR" \
+      -ex "$R11_BPT *$PSIGNAL_ADDR" \
       -ex "condition 1 \$x4 == 9" \
       -ex "continue" \
       -ex 'printf "=== 捕获 SIGKILL 发送点 ===\n"' \
@@ -106,10 +134,10 @@ fi
 
 if [ -n "${CATCH_PANIC:-}" ]; then
   (
-    sleep 3
+    sleep "${R11_GDB_DELAY}"
     "$GB" -batch -nx -ex "set pagination off" -ex "set confirm off" \
       -ex "target remote :1234" \
-      -ex "hbreak *$PANIC_ADDR" -ex "continue" \
+      -ex "$R11_BPT *$PANIC_ADDR" -ex "continue" \
       -ex 'printf "=== hit _panic ===\n"' \
       -ex 'info registers x0 x1 x2 x3 x4' \
       -ex 'x/s $x0' \
@@ -119,8 +147,8 @@ if [ -n "${CATCH_PANIC:-}" ]; then
   ) > "/tmp/${PREFIX}.panic.log" 2>&1 &
 fi
 
-echo "== 等待内核启动（45 秒）"
-sleep 45
+echo "== 等待内核启动（${R11_WAIT:-45} 秒）"
+sleep "${R11_WAIT:-45}"
 
 echo
 echo "===== 串口日志尾部 ====="
@@ -128,7 +156,7 @@ tail -8 "$LOG" 2>/dev/null
 
 echo
 echo "===== 内核 debug 缓冲区 ====="
-python3 "$SELF/read-debug-buf.py" "$QMP" 2>&1 | head -20
+if [ -S "$QMP" ]; then python3 "$SELF/read-debug-buf.py" "$QMP" 2>&1 | head -20; else echo "(QMP socket 不在，跳过)"; fi
 
 if [ -n "${CATCH_PANIC:-}" ]; then
   echo

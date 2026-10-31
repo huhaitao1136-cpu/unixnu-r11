@@ -27,6 +27,7 @@
   python3 patch-kernel-trace.py <kernel> [<output>] --symbols <kernel-symbols.txt>
 """
 
+import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -39,11 +40,16 @@ SYM_KPRINTF = '_kprintf'
 
 SLOT = 60 * 4            # 每个跳板预留 60 条指令
 
+# `reason` 探针一行只打一个值，三个格式串分别落在 msg+0 / +0x40 / +0x80，
+# 所以这段缓冲必须按 0x40 对齐填满（纯单行三参数那版把值打串过位置）。
+_REASON_LINES = (b'R11: reason ns=%x\n\0', b'R11: reason code=%x\n\0', b'R11: reason lr=%x\n\0')
+REASON_MSG = b''.join(s + b'\0' * (0x40 - len(s)) for s in _REASON_LINES) + b'\0' * 8
+assert REASON_MSG[0x40:0x41] == b'R'[:1] and REASON_MSG[0x80:0x81] == b'R'[:1]
+
 # 探针表。`lip`/`lipexit`/`exec`/`machfile`/`act`/`pagein` 用来把
 # `load_init_program` 内部切成几段，定位 exec 到底卡在哪一步；
 # `svc` 是"EL0 真的跑起来了"的硬证据。
-PROBES = {
-    'lip': ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
+PROBES = {    'lip': ('_load_init_program', 'plain', b'R11: LIP enter\n\0'),
     'boot': ('_thread_bootstrap_return', 'plain', b'R11: bootstrap_return()\n\0'),
     'ret': ('_thread_exception_return', 'elr', b'R11: ret-to elr=%08lx spsr=%08lx\n\0'),
     'to': ('_arm64_thread_exception_return', 'elr', b'R11: to-user elr=%08lx spsr=%08lx\n\0'),
@@ -70,17 +76,96 @@ PROBES = {
     # parse_machfile 的统一收尾：0x7762c78 `mov x0, x19` → ret。
     # 成功和失败都从这里出去，打 x19 就是它的返回值。
     'pmret': ('0xfffffff007762c78', 'reg19', b'R11: parse_machfile -> x19=%x\n\0'),
+    'err19': ('0xfffffff007763aec', 'err19', b'R11: err19 w19=%x w1=%x w3=%x\n\0'),
     # 全内核 43 个 os_reason_create 调用点，只有把返回地址也打出来才能认出是谁在报错。
-    'reason': ('_os_reason_create', 'ns_code_lr',
-               b'R11: reason ns=%x code=%x lr=%x\n\0'),
+    'reason': ('_os_reason_create', 'ns_code_lr', REASON_MSG),
+    # 不要赌函数入口的寄存器意义，直接钉在 parse_machfile 自己的调用点上：
+    # 0x7763b2c `mov x1, x19` / 0x7763b30 `bl _os_reason_create`，
+    # 所以 bl 这一条上的 x1 就是它要上报的 reason code，x0 是 namespace。
+    'pcode': ('0xfffffff007763b30', 'arg1', b'R11: parse reason code=%x\n\0'),
+    # 反汇编证明：_load_machfile 的失败返回值就是 parse_machfile 的返回值，
+    # 而后者在 0x7763b34 被 os_reason_create 的返回值覆盖 → 真错误码只在
+    # 0x7763b2c `mov x1, x19` 这一瞬还活着。挂这里读 w19 是唯一干净的办法。
+    'rcode': ('0xfffffff007763b2c', 'reg19', b'R11: real lret=%x\n\0'),
     'pmach': ('_parse_machfile', 'plain', b'R11: parse_machfile enter\n\0'),
+    # parse_machfile 成功后，load_machfile 里下一道硬关：代码签名。
+    'sig': ('_load_code_signature', 'plain', b'R11: load_code_signature enter\n\0'),
+    # 单值版：只打 x1（reason code）。三个值一起搬那版真机打出三行同一个数，
+    # 说明「搬参数」这一步本身不可信；这里不做任何 shuffle，x1 原样打。
+    'reasonc': ('_os_reason_create', 'arg1', b'R11: reason code=%x\n\0'),
+    # parse/签名都过了 AMFI 才拦 → 说明我们的 init 是在某个 MACF 回调里被拒的。
+    'psig': ('_process_signature', 'plain', b'R11: process_signature enter\n\0'),
+    'psigr': ('_process_signature', 'lipexit', b'R11: process_signature exit ret=%x\n\0'),
+    # exec_mach_imgact 里 9 条 bl _os_reason_create 的调用点（反汇编实测），
+    # 每条传的 code 都是常量：0xc / 2 / 3 / 4 / 5 / 6 / 7 / 0x11。
+    # 打这些点就能知道"exec 自己有没有报错、报的是哪一条"，
+    # 不用再猜 reason 参数（实测那路打出来是野值）。
+    'x9c': ('0xfffffff0076d4b98', 'plain', b'R11: exec reason 0xc\n\0'),
+    'x9a': ('0xfffffff0076d4e3c', 'plain', b'R11: exec reason 2\n\0'),
+    'x9b': ('0xfffffff0076d4ed8', 'plain', b'R11: exec reason 3\n\0'),
+    'x9d': ('0xfffffff0076d4f6c', 'plain', b'R11: exec reason 4\n\0'),
+    'x9e': ('0xfffffff0076d5098', 'plain', b'R11: exec reason 5\n\0'),
+    'x9f': ('0xfffffff0076d5120', 'plain', b'R11: exec reason 6\n\0'),
+    'x9g': ('0xfffffff0076d51d0', 'plain', b'R11: exec reason 7\n\0'),
+    'x9h': ('0xfffffff0076d5244', 'plain', b'R11: exec reason 0x11\n\0'),
+    'x9i': ('0xfffffff0076d54ac', 'plain', b'R11: exec reason tail\n\0'),
+    # parse_machfile 自己只有三处返回小整数：BADARCH(1)@0x7762c74、BADMACHO(4)@0x7762c38、
+    # 以及 0x7763b34 那条被 reason 指针覆盖的路径。三个点一起打就能分清是哪一类。
+    'bad1': ('0xfffffff007762c74', 'plain', b'R11: parse -> LOAD_BADARCH(1)\n\0'),
+    'bad4': ('0xfffffff007762c38', 'plain', b'R11: parse -> LOAD_BADMACHO(4)\n\0'),
+    # 只靠常量打印的"进度探针"：不读任何寄存器，能可靠回答"parse 走到哪一步"。
+    # 顺序应为 load_segment → load_unixthread（正常 Mach-O 都会经过）。
+    'seg': ('_load_segment', 'plain', b'R11: load_segment enter\n\0'),
+    'unix': ('_load_unixthread', 'plain', b'R11: load_unixthread enter\n\0'),
+    # 段映射阶段的打点：__PAGEZERO 是 4 GiB，vme 不出现就说明卡在映射之前。
+    'vme': ('_vm_map_enter', 'plain', b'R11: vm_map_enter\n\0'),
+    # load_machfile 的最后一个 ret：打它自己的返回值（lipexit 打 w0）。
+    'mexit': ('_load_machfile', 'lipexit', b'R11: load_machfile exit ret=%x\n\0'),
     'pmexit': ('_parse_machfile', 'lipexit', b'R11: parse_machfile exit ret=%x\n\0'),
     'mexit19': ('0xfffffff007762a6c', 'reg19', b'R11: load_machfile returns w19=%x\n\0'),
     'mfilefail': ('0xfffffff0076d4b64', 'reg24', b'R11: load_machfile FAILED lret=%x\n\0'),
+    # _load_machfile 里紧跟 `bl _parse_machfile` 的那条 cbz：此刻 w0 还是
+    # parse_machfile 的原始返回值，没被 mov x19,x0 / os_reason 覆盖。
+    # 用它区分「parse 真的返回了错误码」还是「load 期间被覆盖」。
+    'preret': ('0xfffffff007762a5c', 'arg0', b'R11: parse raw return=%x\n\0'),
+    # parse_machfile 里 `bl _load_code_signature` 之后紧跟着 `cbz w0, 成功`，
+    # 这条 cbz 上的 w0 就是签名加载的结果：没有输出＝根本没走到签名这一步。
+    'sigret': ('0xfffffff007763494', 'arg0', b'R11: codesig ret=%x\n\0'),
+    # parse_machfile 全函数只有 0xfffffff007762c98 这一个 ret；
+    # 在 ret 之前打 w0，就能和调用方看到的 w0 逐值对照。
+    'pret': ('0xfffffff007762c98', 'arg0', b'R11: parse ret=%x\n\0'),
+    # parse_machfile 里给 x19 写小整数的错误出口：谁被打中就说明走到哪条判定。
+    'e1': ('0xfffffff007762c74', 'plain', b'R11: branch LOAD_BADARCH(1)\n\0'),
+    'e2': ('0xfffffff007762dd4', 'plain', b'R11: branch LOAD_BADMACHO(2)\n\0'),
+    'e2b': ('0xfffffff007762e5c', 'plain', b'R11: branch LOAD_BADMACHO(2) b\n\0'),
+    'e5': ('0xfffffff007762e4c', 'plain', b'R11: branch LOAD_NOSPACE(5)\n\0'),
+    'e9': ('0xfffffff007762e44', 'plain', b'R11: branch LOAD_IOERROR(9)\n\0'),
+    'e10': ('0xfffffff007763a44', 'plain', b'R11: branch LOAD_DECRYPTFAIL(10)\n\0'),
     'mfok': ('0xfffffff0076d4bb0', 'plain', b'R11: load_machfile OK\n\0'),
     'svc': ('_unix_syscall', 'svc', b'R11: svc=%lu\n\0'),
 }
 DEFAULT_PROBES = ('lip,exec,mfilefail,mfok,zre,sugid,act,lipexit,svc')
+
+# 按字面地址挂的探针必须额外核对：地址对 + 该地址的原始指令对，
+# 否则换内核后会静默地钩到别的指令上（历史教训，见 m07713）。
+# 值 = (钩子地址, 该处原始指令)
+EXPECT = {
+    # `adrp x0, 0xfffffff007167000`，是共享错误出口里 csel 之后的第一条
+    'err19': (0xfffffff007763aec, 0x90FFD020),
+    # `cbz w0, 0xfffffff007762a90`，_load_machfile 里 bl _parse_machfile 之后
+    'preret': (0xfffffff007762a5c, 0x340001A0),
+    # `cbz w0, 0xfffffff007763724`，`bl _load_code_signature` 之后
+    'sigret': (0xfffffff007763494, 0x34001480),
+    # `ret`，parse_machfile 唯一返回点
+    'pret': (0xfffffff007762c98, 0xD65F03C0),
+    # 各处 `mov w19, #N`（N = load_return_t）
+    'e1': (0xfffffff007762c74, 0x52800033),
+    'e2': (0xfffffff007762dd4, 0x52800053),
+    'e2b': (0xfffffff007762e5c, 0x52800053),
+    'e5': (0xfffffff007762e4c, 0x528000B3),
+    'e9': (0xfffffff007762e44, 0x52800133),
+    'e10': (0xfffffff007763a44, 0x52800153),
+}
 
 
 def select_probes(spec):
@@ -205,6 +290,12 @@ def enc_mov_xd_xs(rd, rm):
     return 0xAA0003E0 | (rm << 16) | rd
 
 
+def enc_ldr_xd_sp(rt, offset):
+    """ldr xt, [sp, #offset]（offset 必须是 8 的倍数）。"""
+    imm12 = (offset // 8) & 0xFFF
+    return 0xF9400000 | (imm12 << 10) | (31 << 5) | rt
+
+
 ENC_MRS_ELR_EL1 = 0xD5384021     # mrs x1, elr_el1
 ENC_MRS_SPSR_EL1 = 0xD5384002    # mrs x2, spsr_el1
 
@@ -296,11 +387,42 @@ def build_tramp(base, hook, kprintf, kind, fmt_va, orig, tail_words=None):
         # 第二个参数本来就在 x1，前面只 stp 保存、没破坏它，直接打就行。
         pass
     elif kind == 'ns_code_lr':
-        # 打 (namespace, code, 返回地址)。返回地址能反查出到底是谁在报错，
-        # 因为 os_reason_create 的调用点很多，光看参数分不清是谁。
-        words.append(enc_mov_xd_xs(2, 1)); pc += 4     # x2 = 原 x1（code）
-        words.append(enc_mov_xd_xs(3, 30)); pc += 4    # x3 = x30（返回地址）
-        words.append(enc_mov_xd_xs(1, 0)); pc += 4     # x1 = 原 x0（namespace）
+        # 分三行各打一个值，每个值一个独立的格式串。
+        # 原因：单行三参数那次打出 `ns=188638e0 code=a0 lr=9`，位置对不上，
+        # 分三行能把「搬错参数」和「值本身就是怪」彻底区分开。
+        # 栈布局：sp+0=(x2,x3) sp+16=(x0,x1) sp+32=(x29,x30)
+        L = base + 4 * len(words)
+        # 1) namespace = 原 x0
+        L = base + 4 * len(words)
+        words.append(enc_ldr_xd_sp(1, 16)); pc += 4
+        words.append(enc_adrp_x0(L, fmt_va)); pc += 4
+        words.append(enc_add_x0_imm(fmt_va & 0xFFF)); pc += 4
+        words.append(enc_bl(pc, kprintf)); pc += 4
+        # 2) code = 原 x1
+        words.append(enc_ldr_xd_sp(1, 24)); pc += 4
+        words.append(enc_adrp_x0(pc, fmt_va + 0x40)); pc += 4
+        words.append(enc_add_x0_imm((fmt_va + 0x40) & 0xFFF)); pc += 4
+        words.append(enc_bl(pc, kprintf)); pc += 4
+        # 3) 返回地址 = 原 x30
+        words.append(enc_ldr_xd_sp(1, 32)); pc += 4
+        words.append(enc_adrp_x0(pc, fmt_va + 0x80)); pc += 4
+        words.append(enc_add_x0_imm((fmt_va + 0x80) & 0xFFF)); pc += 4
+        words.append(enc_bl(pc, kprintf)); pc += 4
+        # 三个值都打完了，跳过下面统一的「一个格式串 + 一次 kprintf」路径
+        words.append(enc_ldp_post(2, 3, 31, 16)); pc += 4
+        words.append(enc_ldp_post(0, 1, 31, 16)); pc += 4
+        words.append(enc_ldp_post(29, 30, 31, 16)); pc += 4
+        for w in (tail_words if tail_words is not None else replay_tail(orig, pc, hook)):
+            words.append(w); pc += 4
+        return b''.join(struct.pack('<I', w) for w in words)
+    elif kind == 'err19':
+        # 打 (w19, w1, w3)。挂点 0xfffffff007763aec 紧跟在
+        # `csel w19, w8, w1, eq` 之后、`mov x0,#9 / bl _os_reason_create` 之前：
+        # 此时 w19 还是 csel 选出来的 load_return_t，没被 os_reason_t 覆盖。
+        # w1/w3 一起打，才能看出 csel 到底选了哪一路（见 m07729 的判读表）。
+        words.append(enc_mov_wd_ws(2, 1)); pc += 4      # x2 = (uint32_t) w1
+        words.append(enc_mov_wd_ws(3, 3)); pc += 4      # x3 = (uint32_t) w3
+        words.append(enc_mov_wd_ws(1, 19)); pc += 4     # x1 = (uint32_t) w19
     elif kind == 'svc':
         words.append(enc_mov_xd_xs(1, 16)); pc += 4
     words.append(enc_adrp_x0(pc, fmt_va)); pc += 4
@@ -333,18 +455,83 @@ def last_ret_in_function(data, segs, table, func_va):
     return hit
 
 
+def load_manifest(path):
+    import json
+    return json.loads(Path(path).read_text())
+
+
+def verify_kernel(kernel_path, manifest_path, mode):
+    """按 manifest 校验内核。mode='base' 查基准内核，mode='patched' 查打完的内核。
+
+    这样 flash-prep.sh 不需要自己维护第二份地址/指令常量，
+    所有常量只在补丁脚本里出现一次（避免两处配置漂移，见 m07787）。
+    """
+    man = load_manifest(manifest_path)
+    data = bytearray(Path(kernel_path).read_bytes())
+    digest = hashlib.sha256(data).hexdigest()
+    base = (mode == 'base')
+    # 'base' 模式优先用 raw_input_sha256（= 铺进 payload 的那份未打补丁内核），
+    # 因为 trace 阶段看到的 input_sha256 已经是打完 PAN/上屏/roothash 的中内核。
+    if base:
+        want = man.get('raw_input_sha256') or man['input_sha256']
+    else:
+        want = man['output_sha256']
+    label = '基准内核' if base else '已补丁内核'
+    if digest != want:
+        print(f'  !! {label} sha256 不符\n  !!   实际 {digest}\n  !!   期望 {want}')
+        return 4
+    print(f'  {label} sha256 ✓ {digest}')
+
+    segs, _ = parse_segments(data)
+    if base:
+        if MAGIC in data:
+            print('  !! 基准内核里已经有 R11TRACE 魔数 —— 这不是干净内核')
+            return 4
+        for p in man['probes']:
+            off = va_to_off(segs, p['hook_va'])
+            if off is None:
+                print(f'  !! {p["name"]} 的地址 {p["hook_va"]:#x} 不在文件里')
+                return 4
+            got = struct.unpack_from('<I', data, off)[0]
+            if got != p['orig_word']:
+                print(f'  !! {p["name"]} @ {p["hook_va"]:#x}: {got:#010x} != {p["orig_word"]:#010x}')
+                return 4
+            print(f'  {p["name"]} @ {p["hook_va"]:#x} 原始指令 ✓ {got:#010x}')
+        return 0
+
+    for p in man['probes']:
+        off = va_to_off(segs, p['hook_va'])
+        got = struct.unpack_from('<I', data, off)[0]
+        want_b = enc_b(p['hook_va'], p['tramp_va'])
+        if got != want_b:
+            print(f'  !! {p["name"]} @ {p["hook_va"]:#x}: {got:#010x} '
+                  f'不是 b {p["tramp_va"]:#x}（期望 {want_b:#010x}）')
+            return 4
+        toff = va_to_off(segs, p['tramp_va'])
+        head = struct.unpack_from('<I', data, toff)[0]
+        if head != 0xA9BF7BFD:
+            print(f'  !! {p["name"]} 的跳板 @ {p["tramp_va"]:#x} 开头不是 stp x29,x30')
+            return 4
+        print(f'  {p["name"]} 跳板 ✓ {p["hook_va"]:#x} -> {p["tramp_va"]:#x}')
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     symbols_path = None
     probes_spec = DEFAULT_PROBES
+    manifest_path = None
+    verify_mode = None
     positional = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ('--symbols', '--probes') and i + 1 < len(argv):
+        if a in ('--symbols', '--probes', '--manifest') and i + 1 < len(argv):
             value = argv[i + 1]
             if a == '--symbols':
                 symbols_path = value
+            elif a == '--manifest':
+                manifest_path = value
             else:
                 probes_spec = value
             i += 2
@@ -353,15 +540,27 @@ def main():
             symbols_path = a.split('=', 1)[1]
         elif a.startswith('--probes='):
             probes_spec = a.split('=', 1)[1]
+        elif a.startswith('--manifest='):
+            manifest_path = a.split('=', 1)[1]
+        elif a in ('--verify', '--verify-base'):
+            verify_mode = 'base' if a == '--verify-base' else 'patched'
         elif not a.startswith('--'):
             positional.append(a)
         i += 1
+    if verify_mode:
+        if not positional or not manifest_path:
+            print('!! --verify/--verify-base 需要 <kernel> 与 --manifest <path>')
+            return 2
+        return verify_kernel(positional[0], manifest_path, verify_mode)
     if not positional or not symbols_path:
         print(__doc__)
         return 2
     src = Path(positional[0])
     dst = Path(positional[1]) if len(positional) > 1 else src
     data = bytearray(src.read_bytes())
+    before = hashlib.sha256(data).hexdigest()
+    print(f'  输入: {src}')
+    print(f'  输入 sha256: {before}')
     segs, _ = parse_segments(data)
 
     if MAGIC in data:
@@ -394,6 +593,17 @@ def main():
             hook_va = last_ret_in_function(data, segs, table, va)
             tail = [0xD65F03C0]
         hooks.append(dict(name=name, kind=kind, msg=msg, va=hook_va, func=va, tail=tail))
+        if name in EXPECT:
+            want_va, want_word = EXPECT[name]
+            if hook_va != want_va:
+                raise SystemExit(f'!! {name} 的目标地址是 {hook_va:#x}，'
+                                 f'但期望 {want_va:#x} —— 内核版本不对，停止')
+            off = va_to_off(segs, hook_va)
+            got = struct.unpack_from('<I', data, off)[0]
+            if got != want_word:
+                raise SystemExit(f'!! {name} @ {hook_va:#x} 的原始指令是 {got:#010x}，'
+                                 f'期望 {want_word:#010x} —— 不是同一段代码，停止')
+            print(f'  校验 {name} @ {hook_va:#x}: 原始指令 {got:#010x} ✓')
     print(f'  探针集合: {probes_spec}')
     print('  符号: ' + ' '.join(f'{h["name"]}={h["func"]:#x}' for h in hooks)
           + f' {SYM_KPRINTF}={kprintf:#x}')
@@ -449,6 +659,25 @@ def main():
 
     dst.write_bytes(data)
     print(f'  输出: {dst}')
+    out_sha = hashlib.sha256(data).hexdigest()
+    print(f'  输出 sha256: {out_sha}（输入 {before}）')
+
+    # 导出本次构建的 manifest：后续 flash-prep.sh 只认它，不再自带常量副本。
+    import json
+    man = dict(
+        schema=1,
+        script='patch-kernel-trace.py',
+        probes_spec=probes_spec,
+        cave_va=cave_va,
+        input=str(src), input_sha256=before,
+        output=str(dst), output_sha256=out_sha,
+        probes=[dict(name=h['name'], kind=h['kind'], hook_va=h['va'],
+                     orig_word=h['orig'], tramp_va=h['tramp_va'], fmt_va=h['fmt_va'])
+                for h in hooks],
+    )
+    mpath = Path(manifest_path) if manifest_path else dst.with_name(dst.name + '.manifest.json')
+    mpath.write_text(json.dumps(man, indent=2) + '\n')
+    print(f'  manifest: {mpath}')
     print('  探针: ' + ' / '.join(f'{h["kind"]}@{h["tramp_va"]:#x}(msg {h["fmt_va"]:#x})'
                                  for h in hooks))
     return 0
